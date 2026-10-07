@@ -12,6 +12,7 @@ System cleanup, debloat and repair toolkit for Windows, with a WPF interface —
 | Startup     | Enable / disable startup entries (same `StartupApproved` switches Task Manager uses) |
 | Programs    | Installed software list with size, search and uninstall |
 | Debloat     | Remove preinstalled Store apps; turn off ads, suggestions, Bing in Start, Copilot, Recall, Widgets and more |
+| Rebloat     | Put back removed apps and set debloat tweaks back to Windows defaults |
 | Tools       | Quick fixes, repair and maintenance (see below), plus the activity log |
 
 ### Tools
@@ -25,6 +26,16 @@ System cleanup, debloat and repair toolkit for Windows, with a WPF interface —
 Apps are matched against a curated list; recommended removals are pre-checked and anything you might still use (Outlook, Teams for work, Phone Link, Xbox, Quick Assist...) is left unchecked with a note. **Show all apps** lists every removable Store app except a protected core set (Store, App Installer, Photos, Calculator, codecs, runtimes...). When running as admin, apps are removed for all users and, optionally, the provisioned copy is removed so new accounts don't get it.
 
 Tweaks show an **ON** badge when they're already applied and can be reverted.
+
+### Rebloat
+
+Changed your mind? **Rebloat** lists every catalog app that's missing for your account and puts it back:
+
+- **Windows copy** — if the app is still on disk (provisioned, or installed for another user), it's re-registered instantly with no download (needs admin to find these copies).
+- **Microsoft Store** — otherwise it's reinstalled with `winget` using the app's verified Store ID.
+- **Store search** — apps without a known ID open in the Microsoft Store so you can install them there. Apps Microsoft has retired (Cortana, People, Skype...) are only offered if a copy is still on disk.
+
+The right-hand panel lists the debloat tweaks currently in effect and sets the checked ones back to Windows defaults.
 
 ### Recovery
 

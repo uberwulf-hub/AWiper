@@ -14,6 +14,7 @@
       * Startup      - enable / disable startup entries (same StartupApproved switches Task Manager uses)
       * Programs     - installed software list with size, search and uninstall
       * Debloat      - remove preinstalled Store apps, turn off ads, suggestions, Copilot and other extras
+      * Rebloat      - reinstall removed apps (from the copy on disk or the Microsoft Store), restore default settings
       * Tools        - quick fixes (DNS, Group Policy, Explorer), repair (SFC, DISM, Windows Update reset,
                        ConfigMgr client), maintenance (component store, restore point, hibernation), activity log
 
@@ -46,7 +47,7 @@
 
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.2.0
+    Version : 1.3.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -59,7 +60,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.3.0'
 
 #region ---------------------------------------------------------------- Elevation / STA
 function Test-AWAdmin {
@@ -203,6 +204,9 @@ namespace AWiper
         public bool Recommended { get; set; }
         public bool Provisioned { get; set; }
         public bool IsChecked { get; set; }
+        public string Source { get; set; }
+        public string Manifest { get; set; }
+        public string StoreId { get; set; }
     }
 
     public class ExtStat
@@ -989,6 +993,27 @@ $script:BloatCatalog = @(
     A '*.ROBLOXCORPORATION.ROBLOX'              'Roblox'                    'Third-party' $false
 )
 
+# Microsoft Store product IDs used by Rebloat to reinstall catalog apps (checked with winget show, Oct 2026).
+$script:StoreIds = @{
+    'Microsoft.BingWeather' = '9WZDNCRFJ3Q2'; 'Microsoft.BingNews' = '9WZDNCRFHVFW'; 'Microsoft.BingSearch' = '9NZBF4GT040C'
+    'Microsoft.GetHelp' = '9PKDZBMV1H3T'; 'Microsoft.WindowsFeedbackHub' = '9NBLGGH4R32N'; 'Microsoft.Todos' = '9NBLGGH5R558'
+    'Microsoft.PowerAutomateDesktop' = '9NFTCH6J7FHV'; 'Clipchamp.Clipchamp' = '9P1J8S7CCWWT'; 'Microsoft.ZuneMusic' = '9WZDNCRFJ3PT'
+    'Microsoft.ZuneVideo' = '9WZDNCRFJ3P2'; 'Microsoft.YourPhone' = '9NMPJ99VJBWV'; 'Microsoft.WindowsSoundRecorder' = '9WZDNCRFHWKN'
+    'Microsoft.MicrosoftStickyNotes' = '9NBLGGH4QGHW'; 'Microsoft.WindowsAlarms' = '9WZDNCRFJ3PR'; 'MicrosoftCorporationII.QuickAssist' = '9P7BP5VNWKX5'
+    'Microsoft.GamingApp' = '9MV0B5HZVK9Z'; 'Microsoft.XboxGamingOverlay' = '9NZKPSTSNW4P'; 'Microsoft.OutlookForWindows' = '9NRX63209R7B'
+    'Microsoft.MicrosoftOfficeHub' = '9WZDNCRD29V9'; 'Microsoft.Copilot' = '9NHT9RB2F4HD'; 'MicrosoftCorporationII.MicrosoftFamily' = '9PDJDJS743XF'
+    'Microsoft.MicrosoftJournal' = '9N318R854RHH'; 'Microsoft.WindowsCommunicationsApps' = '9WZDNCRFHVQM'; 'MSTeams' = 'XP8BT8DW290MPQ'
+    'SpotifyAB.SpotifyMusic' = '9NCBCSZSJRSB'; '4DF9E0F8.Netflix' = '9WZDNCRFJ3TJ'; 'Disney.37853FC22B2CE' = '9NXQXXLFST89'
+    'AmazonVideo.PrimeVideo' = '9P6RC76MSMMJ'; 'BytedancePte.Ltd.TikTok' = '9NH2GPH4JZS4'; '*.Instagram' = '9NBLGGH5L9XT'
+    '7EE7776C.LinkedInforWindows' = '9WZDNCRFJ4Q7'
+}
+# Apps Microsoft has retired. Rebloat only offers them if a copy is still on disk.
+$script:RetiredApps = @(
+    'Microsoft.549981C3F5F10', 'Microsoft.People', 'Microsoft.SkypeApp', 'Microsoft.XboxApp', 'Microsoft.BingFinance',
+    'Microsoft.BingSports', 'Microsoft.BingTravel', 'Microsoft.3DBuilder', 'Microsoft.Print3D', 'Microsoft.MixedReality.Portal',
+    'Microsoft.Messaging', 'Microsoft.Wallet', 'MicrosoftTeams', 'Microsoft.Windows.DevHome'
+)
+
 # Packages never offered for removal, even with "Show all apps".
 $script:ProtectedApps = @(
     'Microsoft.WindowsStore', 'Microsoft.StorePurchaseApp', 'Microsoft.DesktopAppInstaller', 'Microsoft.SecHealthUI',
@@ -1661,6 +1686,7 @@ $script:Tweaks = @(
               <RadioButton x:Name="NavStartup"  Style="{StaticResource NavBtn}" Tag="&#xE7E8;" Content="Startup"/>
               <RadioButton x:Name="NavPrograms" Style="{StaticResource NavBtn}" Tag="&#xE71D;" Content="Programs"/>
               <RadioButton x:Name="NavDebloat"  Style="{StaticResource NavBtn}" Tag="&#xE71C;" Content="Debloat"/>
+              <RadioButton x:Name="NavRebloat"  Style="{StaticResource NavBtn}" Tag="&#xE896;" Content="Rebloat"/>
               <RadioButton x:Name="NavTools"    Style="{StaticResource NavBtn}" Tag="&#xE90F;" Content="Tools and Log"/>
             </StackPanel>
           </DockPanel>
@@ -2329,6 +2355,74 @@ $script:Tweaks = @(
             </Grid>
           </Grid>
 
+          <!-- ===== Rebloat ===== -->
+          <Grid x:Name="ViewRebloat" Visibility="Collapsed">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Border Style="{StaticResource Card}" Padding="20,16">
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel>
+                  <TextBlock Text="Rebloat Windows" Style="{StaticResource H2}"/>
+                  <TextBlock Text="Changed your mind? Put back removed apps and undo debloat tweaks. Apps come back from Windows' own copy when one is still on disk, otherwise from the Microsoft Store."
+                             Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                </StackPanel>
+                <Button x:Name="RebloatRefresh" Grid.Column="1" Content="Refresh" Style="{StaticResource BtnChip}" VerticalAlignment="Center" Margin="16,0,0,0"/>
+              </Grid>
+            </Border>
+            <Grid Grid.Row="1" Margin="0,16,0,16">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="400"/></Grid.ColumnDefinitions>
+              <Border Style="{StaticResource Card}" Padding="14,12">
+                <DockPanel>
+                  <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <TextBlock Text="Missing apps" Style="{StaticResource H2}" VerticalAlignment="Center"/>
+                    <TextBox x:Name="RebloatSearch" Grid.Column="1" Tag="Filter apps..." Margin="14,0,10,0"/>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                      <Button x:Name="RebloatAll" Content="All" Style="{StaticResource BtnChip}"/>
+                      <Button x:Name="RebloatNone" Content="None" Style="{StaticResource BtnChip}" Margin="0"/>
+                    </StackPanel>
+                  </Grid>
+                  <Grid DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                    <TextBlock x:Name="RebloatInfo" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="4,0,170,0"/>
+                    <Button x:Name="RebloatInstall" Content="Reinstall checked" Style="{StaticResource BtnAccent}" Padding="14,6" FontSize="12" HorizontalAlignment="Right"/>
+                  </Grid>
+                  <ListView x:Name="RebloatList">
+                    <ListView.View>
+                      <GridView>
+                        <GridViewColumn Header="" Width="44">
+                          <GridViewColumn.CellTemplate><DataTemplate><CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}" Margin="4,0,0,0"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="App" Width="210">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Package}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Category" Width="100" DisplayMemberBinding="{Binding Category}"/>
+                        <GridViewColumn Header="Comes back from" Width="140">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Source}" Foreground="#19C3B1"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Notes" Width="240">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                      </GridView>
+                    </ListView.View>
+                  </ListView>
+                </DockPanel>
+              </Border>
+              <Border Grid.Column="1" Style="{StaticResource Card}" Margin="16,0,0,0" Padding="16,14">
+                <DockPanel>
+                  <TextBlock DockPanel.Dock="Top" Text="Tweaks in effect" Style="{StaticResource H2}"/>
+                  <TextBlock DockPanel.Dock="Top" Text="Check the ones to set back to the Windows default." Style="{StaticResource Muted}" FontSize="12" Margin="0,4,0,4"/>
+                  <StackPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                    <CheckBox x:Name="RebloatRestartExplorer" Content="Restart Explorer to apply taskbar changes" IsChecked="True" Margin="0,0,0,10"/>
+                    <Button x:Name="RebloatRevert" Content="Restore Windows defaults" Style="{StaticResource BtnAccent}" Padding="16,7" FontSize="12" HorizontalAlignment="Left"/>
+                  </StackPanel>
+                  <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="0,6,0,0">
+                    <StackPanel x:Name="RebloatTweakItems" Margin="2,0,8,0"/>
+                  </ScrollViewer>
+                </DockPanel>
+              </Border>
+            </Grid>
+          </Grid>
+
           <!-- ===== Tools ===== -->
           <Grid x:Name="ViewTools" Visibility="Collapsed">
             <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="230"/></Grid.RowDefinitions>
@@ -2569,7 +2663,7 @@ $script:IdleStatus = 'Ready'
 #region ---------------------------------------------------------------- Navigation + title bar
 $script:ViewTitles = @{
     Home = 'Dashboard'; Cleaner = 'Cleaner'; Map = 'Space Map'; Large = 'Large Files'; Recovery = 'Recovery'
-    Startup = 'Startup'; Programs = 'Programs'; Debloat = 'Debloat'; Tools = 'Tools and Activity Log'
+    Startup = 'Startup'; Programs = 'Programs'; Debloat = 'Debloat'; Rebloat = 'Rebloat'; Tools = 'Tools and Activity Log'
 }
 $script:Loaded = @{}
 
@@ -2586,6 +2680,7 @@ foreach ($v in $script:ViewTitles.Keys) {
                 'Programs' { Update-AWProgramList }
                 'Debloat'  { Update-AWAppList; Update-AWTweakStatus }
                 'Recovery' { Initialize-AWRecovery }
+                'Rebloat'  { Initialize-AWRebloat }
             }
         }
         if ($name -eq 'Map') { Request-AWMapRedraw }
@@ -3633,6 +3728,7 @@ function Start-AWAppRemoval {
         param($r)
         $script:IdleStatus = 'App removal finished - see Activity log'
         Update-AWAppList
+        if ($script:Loaded['Rebloat']) { Update-AWRebloatList }
     }
 }
 
@@ -3679,15 +3775,17 @@ function Update-AWTweakStatus {
     }
 }
 
-function Start-AWTweaks([bool]$Apply) {
-    $sel = @($script:TweakChecks | Where-Object { $_.IsChecked -and $_.IsEnabled } | ForEach-Object { $_.Tag })
+# $Selected / $RestartExplorer let Rebloat reuse this with its own list and checkbox.
+function Start-AWTweaks([bool]$Apply, $Selected = $null, $RestartExplorer = $null) {
+    $sel = @(if ($null -ne $Selected) { $Selected } else { $script:TweakChecks | Where-Object { $_.IsChecked -and $_.IsEnabled } | ForEach-Object { $_.Tag } })
     if ($sel.Count -eq 0) { Show-AWMessage 'Check at least one tweak first.'; return }
+    if ($null -eq $RestartExplorer) { $RestartExplorer = [bool]$ui.TweaksRestartExplorer.IsChecked }
     $verb  = if ($Apply) { 'Apply' } else { 'Revert' }
     $where = if (Test-AWRemote) { " on $($script:Target.ComputerName)" } else { '' }
     $names = ($sel | ForEach-Object { "  - $($_.Name)" }) -join "`n"
     if (-not (Confirm-AW "$verb these tweaks$($where)?`n`n$names")) { return }
-    $script:PendingExplorerRestart = (-not (Test-AWRemote)) -and [bool]$ui.TweaksRestartExplorer.IsChecked -and @($sel | Where-Object { $_.Explorer }).Count -gt 0
-    $ui.TweaksApply.IsEnabled = $false; $ui.TweaksRevert.IsEnabled = $false
+    $script:PendingExplorerRestart = (-not (Test-AWRemote)) -and [bool]$RestartExplorer -and @($sel | Where-Object { $_.Explorer }).Count -gt 0
+    $ui.TweaksApply.IsEnabled = $false; $ui.TweaksRevert.IsEnabled = $false; $ui.RebloatRevert.IsEnabled = $false
     Start-AWTask -Name "$verb tweaks" -Arguments @{ Sel = $sel; Apply = $Apply } -Work {
         foreach ($t in $Sel) {
             $Sync.Status = "$($t.Name)..."
@@ -3696,11 +3794,12 @@ function Start-AWTweaks([bool]$Apply) {
         }
     } -OnComplete {
         param($r)
-        $ui.TweaksApply.IsEnabled = $true; $ui.TweaksRevert.IsEnabled = $true
+        $ui.TweaksApply.IsEnabled = $true; $ui.TweaksRevert.IsEnabled = $true; $ui.RebloatRevert.IsEnabled = $true
         if ($script:PendingExplorerRestart) { Restart-AWExplorer }
         $script:PendingExplorerRestart = $false
         $script:IdleStatus = 'Tweaks updated - some changes take effect after signing out'
         Update-AWTweakStatus
+        if ($script:Loaded['Rebloat']) { Update-AWRebloatTweaks }
     }
 }
 
@@ -3716,6 +3815,175 @@ $ui.TweaksDefault.Add_Click({ foreach ($cb in $script:TweakChecks) { $cb.IsCheck
 $ui.TweaksNone.Add_Click({ foreach ($cb in $script:TweakChecks) { $cb.IsChecked = $false } })
 $ui.TweaksApply.Add_Click({ Start-AWTweaks $true })
 $ui.TweaksRevert.Add_Click({ Start-AWTweaks $false })
+#endregion
+
+#region ---------------------------------------------------------------- Rebloat
+$script:RebloatApps = @()
+$script:RebloatTweakChecks = New-Object System.Collections.Generic.List[object]
+
+function Update-AWRebloatView {
+    $q = $ui.RebloatSearch.Text.Trim()
+    $items = @(if ($q) { $script:RebloatApps | Where-Object { $_.Name -like "*$q*" -or $_.Package -like "*$q*" } } else { $script:RebloatApps })
+    $ui.RebloatList.ItemsSource = $items
+    $ui.RebloatInfo.Text = if ($script:RebloatApps.Count) { '{0} app(s) can be put back' -f $items.Count } else { 'Every app AWiper knows about is installed.' }
+}
+
+# Catalog apps missing for the signed-in user, with where each one can come back from:
+# a copy still on disk (installed for another user or provisioned), the Store by product ID, or a Store search.
+function Update-AWRebloatList {
+    if (Test-AWRemote) {
+        $script:RebloatApps = @(); $ui.RebloatList.ItemsSource = $null
+        $ui.RebloatInfo.Text = 'Reinstalling apps is only available on this PC - Store apps install per user.'
+        $ui.RebloatInstall.IsEnabled = $false
+        return
+    }
+    $ui.RebloatInfo.Text = 'Looking for removed apps...'
+    $ui.RebloatInstall.IsEnabled = $false
+    Start-AWTask -Name 'Find removed apps' -Arguments @{
+        Catalog = $script:BloatCatalog; StoreIds = $script:StoreIds; Retired = $script:RetiredApps; Admin = [bool]$script:IsAdmin
+    } -Work {
+        if ($PSVersionTable.PSVersion.Major -ge 7) { Import-Module Appx -UseWindowsPowerShell -WarningAction SilentlyContinue -ErrorAction SilentlyContinue }
+        $mine = @(Get-AppxPackage | ForEach-Object { $_.Name })
+        $disk = @{}
+        if ($Admin) {
+            foreach ($p in @(Get-AppxPackage -AllUsers)) {
+                if (-not $disk.ContainsKey($p.Name) -and $p.InstallLocation) {
+                    $m = Join-Path $p.InstallLocation 'AppxManifest.xml'
+                    if (Test-Path -LiteralPath $m) { $disk[$p.Name] = $m }
+                }
+            }
+            try {
+                foreach ($p in @(Get-AppxProvisionedPackage -Online -ErrorAction Stop)) {
+                    if (-not $disk.ContainsKey($p.DisplayName) -and $p.InstallLocation) {
+                        $m = [Environment]::ExpandEnvironmentVariables($p.InstallLocation)
+                        if (Test-Path -LiteralPath $m) { $disk[$p.DisplayName] = $m }
+                    }
+                }
+            } catch { Write-WLog "Could not read provisioned apps: $($_.Exception.Message)" 'WARN' }
+        }
+        $seen = @{}
+        foreach ($c in $Catalog) {
+            if ($seen[$c.Name]) { continue }
+            $seen[$c.Name] = $true
+            if (@($mine | Where-Object { $_ -like $c.Pattern }).Count) { continue }
+            $pkg = @($disk.Keys | Where-Object { $_ -like $c.Pattern }) | Select-Object -First 1
+            $sid = $StoreIds[$c.Pattern]
+            if (-not $pkg -and $Retired -contains $c.Pattern) { continue }
+            $e = New-Object AWiper.AppEntry
+            $e.Name = $c.Name; $e.Category = $c.Category; $e.Note = $c.Note; $e.StoreId = $sid
+            $e.Package = if ($pkg) { $pkg } else { $c.Pattern }
+            if ($pkg) { $e.Manifest = $disk[$pkg]; $e.Source = 'Windows copy'; if (-not $e.Note) { $e.Note = 'Quick - no download needed' } }
+            elseif ($sid) { $e.Source = 'Microsoft Store' }
+            else { $e.Source = 'Store search'; if (-not $e.Note) { $e.Note = 'Opens the Microsoft Store so you can pick it' } }
+            $e
+        }
+    } -OnComplete {
+        param($Result)
+        $script:RebloatApps = @($Result | Where-Object { $_ -is [AWiper.AppEntry] } | Sort-Object Category, Name)
+        $ui.RebloatInstall.IsEnabled = $true
+        Update-AWRebloatView
+        if (-not $script:IsAdmin -and $script:RebloatApps.Count) { $ui.RebloatInfo.Text += ' - run as admin to also use copies already on disk' }
+    }
+}
+
+function Start-AWRebloat {
+    $sel = @($script:RebloatApps | Where-Object { $_.IsChecked })
+    if ($sel.Count -eq 0) { Show-AWMessage 'Check the apps you want back first.'; return }
+    $search = @($sel | Where-Object { $_.Source -eq 'Store search' })
+    $work = @($sel | Where-Object { $_.Source -ne 'Store search' } | ForEach-Object { @{ Name = $_.Name; Manifest = $_.Manifest; StoreId = $_.StoreId } })
+    $list = ($sel | Select-Object -First 20 | ForEach-Object { "  - $($_.Name)  ($($_.Source))" }) -join "`n"
+    if ($sel.Count -gt 20) { $list += "`n  ...and $($sel.Count - 20) more" }
+    $extra = if ($search.Count) { "`n`nApps marked Store search open in the Microsoft Store so you can install them there." } else { '' }
+    if (-not (Confirm-AW "Reinstall $($sel.Count) app(s) for your account?`n`n$list$extra")) { return }
+
+    foreach ($s in ($search | Select-Object -First 5)) {
+        Start-Process ('ms-windows-store://search/?query=' + [uri]::EscapeDataString($s.Name))
+    }
+    if ($search.Count -gt 5) { Write-AWLog "Opened the Store for the first 5 of $($search.Count) apps - run Reinstall again for the rest" 'WARN' }
+    if ($work.Count -eq 0) { return }
+
+    $ui.RebloatInstall.IsEnabled = $false
+    Start-AWTask -Name 'Reinstall apps' -Arguments @{ Work = $work } -Work {
+        if ($PSVersionTable.PSVersion.Major -ge 7) { Import-Module Appx -UseWindowsPowerShell -WarningAction SilentlyContinue -ErrorAction SilentlyContinue }
+        $i = 0; $ok = 0
+        foreach ($a in $Work) {
+            $Sync.Status = "Reinstalling $($a.Name)..."; $Sync.Progress = [int]($i * 100 / $Work.Count); $i++
+            if ($a.Manifest) {
+                try {
+                    Add-AppxPackage -Register $a.Manifest -DisableDevelopmentMode -ErrorAction Stop
+                    Write-WLog "Reinstalled $($a.Name) from the copy on disk"; $ok++; continue
+                } catch { Write-WLog "$($a.Name): re-registering the copy on disk failed ($($_.Exception.Message))" 'WARN' }
+            }
+            if (-not $a.StoreId) { Write-WLog "$($a.Name): no Microsoft Store ID - install it from the Store" 'ERROR'; continue }
+            & winget.exe install --id $a.StoreId --source msstore --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | ForEach-Object {
+                $l = ("$_" -replace "`0", '').Trim()
+                if ($l -and $l -notmatch '^[\s\-\\|/]+$' -and $l -notmatch '[▀-▟]') { Write-WLog "winget: $l" }
+            }
+            # -1978335189 = already installed / no applicable upgrade
+            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) { Write-WLog "Reinstalled $($a.Name) from the Microsoft Store"; $ok++ }
+            else { Write-WLog "$($a.Name): winget exit code $LASTEXITCODE" 'ERROR' }
+        }
+        "Reinstalled $ok of $($Work.Count) app(s)"
+    } -OnComplete {
+        param($r)
+        $msg = @($r | Where-Object { $_ -is [string] }) | Select-Object -Last 1
+        $script:IdleStatus = if ($msg) { "$msg - see Activity log" } else { 'Reinstall finished - see Activity log' }
+        Update-AWRebloatList
+        if ($script:Loaded['Debloat']) { Update-AWAppList }
+    }
+}
+
+# Lists the debloat tweaks currently in effect so they can be set back to Windows defaults.
+function Update-AWRebloatTweaks {
+    $list = @($script:Tweaks | Where-Object { Test-AWTweakAllowed $_ })
+    Start-AWTask -Name 'Read tweak status' -Arguments @{ Tw = $list } -Work {
+        Invoke-WTarget { param($Items) foreach ($t in $Items) { [pscustomobject]@{ Id = $t.Id; On = [bool](Test-WTweak $t) } } } -ArgumentList @(, $Tw)
+    } -OnComplete {
+        param($Result)
+        $on = @{}; foreach ($r in $Result) { if ($r -and $r.On) { $on[[string]$r.Id] = $true } }
+        $ui.RebloatTweakItems.Children.Clear(); $script:RebloatTweakChecks.Clear()
+        $lastGroup = ''
+        foreach ($tw in $script:Tweaks) {
+            if (-not $on[$tw.Id]) { continue }
+            if ($tw.Group -ne $lastGroup) {
+                $h = New-AWText $tw.Group.ToUpper() 11 $script:Res.Dim 'Bold'
+                $h.Margin = if ($lastGroup) { '0,16,0,6' } else { '0,8,0,6' }
+                [void]$ui.RebloatTweakItems.Children.Add($h)
+                $lastGroup = $tw.Group
+            }
+            $cb = New-Object System.Windows.Controls.CheckBox
+            $cb.Margin = '0,5'; $cb.Tag = $tw; $cb.IsChecked = $true; $cb.ToolTip = $tw.Desc
+            $sp = New-Object System.Windows.Controls.StackPanel; $sp.Orientation = 'Horizontal'
+            [void]$sp.Children.Add((New-AWText $tw.Name 13))
+            if ($tw.Admin) { [void]$sp.Children.Add((New-AWPill 'ADMIN' (Test-AWCanAdmin))) }
+            $cb.Content = $sp
+            $cb.IsEnabled = $script:IsAdmin -or (Test-AWRemote) -or -not $tw.Admin
+            [void]$ui.RebloatTweakItems.Children.Add($cb)
+            $script:RebloatTweakChecks.Add($cb)
+        }
+        if ($script:RebloatTweakChecks.Count -eq 0) {
+            $t = New-AWText 'Nothing to restore - no debloat tweaks are in effect.' 12.5 $script:Res.Muted
+            $t.TextWrapping = 'Wrap'; $t.Margin = '0,10,0,0'
+            [void]$ui.RebloatTweakItems.Children.Add($t)
+        }
+        $ui.RebloatRevert.IsEnabled = $script:RebloatTweakChecks.Count -gt 0
+    }
+}
+
+function Initialize-AWRebloat {
+    Update-AWRebloatList
+    Update-AWRebloatTweaks
+}
+
+$ui.RebloatRefresh.Add_Click({ Initialize-AWRebloat })
+$ui.RebloatSearch.Add_TextChanged({ Update-AWRebloatView })
+$ui.RebloatAll.Add_Click({ foreach ($a in $script:RebloatApps) { $a.IsChecked = $true }; $ui.RebloatList.Items.Refresh() })
+$ui.RebloatNone.Add_Click({ foreach ($a in $script:RebloatApps) { $a.IsChecked = $false }; $ui.RebloatList.Items.Refresh() })
+$ui.RebloatInstall.Add_Click({ Start-AWRebloat })
+$ui.RebloatRevert.Add_Click({
+    $sel = @($script:RebloatTweakChecks | Where-Object { $_.IsChecked -and $_.IsEnabled } | ForEach-Object { $_.Tag })
+    Start-AWTweaks $false $sel ([bool]$ui.RebloatRestartExplorer.IsChecked)
+})
 #endregion
 
 #region ---------------------------------------------------------------- Remote target
@@ -3831,12 +4099,13 @@ function Set-AWTarget($NewTarget) {
     $ui.CleanSubtext.Text = if (Test-AWRemote) { "Machine-wide rules run on $($NewTarget.ComputerName). Per-user rules are only available on this PC." } else { 'Pick the rules on the left, then Analyze to see what can be removed.' }
     $ui.CleanProgress.Value = 0
     $script:AllApps = @(); $ui.AppList.ItemsSource = $null; $script:Programs = @(); $ui.ProgList.ItemsSource = $null
-    [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat'); [void]$script:Loaded.Remove('Recovery')
+    [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat'); [void]$script:Loaded.Remove('Recovery'); [void]$script:Loaded.Remove('Rebloat')
     $cur = Get-AWCurrentView
     Update-AWViewTitle $cur
     if ($cur -eq 'Programs') { $script:Loaded['Programs'] = $true; Update-AWProgramList }
     if ($cur -eq 'Debloat')  { $script:Loaded['Debloat'] = $true; Update-AWAppList; Update-AWTweakStatus }
     if ($cur -eq 'Recovery') { $script:Loaded['Recovery'] = $true; Initialize-AWRecovery }
+    if ($cur -eq 'Rebloat')  { $script:Loaded['Rebloat'] = $true; Initialize-AWRebloat }
     if (Test-AWRemote) {
         Write-AWLog "Target is now $($NewTarget.ComputerName) ($($NewTarget.Host)) - $($NewTarget.OS), signed in as $($NewTarget.User)"
         $script:IdleStatus = "Connected to $($NewTarget.ComputerName)"
@@ -4687,7 +4956,8 @@ Enable-AWSort $ui.ProgList     @{ Name = 'Name'; Publisher = 'Publisher'; Versio
 Enable-AWSort $ui.StartupList  @{ Name = 'Name'; Scope = 'Scope'; Source = 'Location'; Status = 'Enabled' }
 Enable-AWSort $ui.CleanResults @{ Item = 'Name'; Group = 'Group'; Size = 'Bytes' }
 Enable-AWSort $ui.AppList      @{ App = 'Name'; Category = 'Category'; Notes = 'Note' }
-Enable-AWSort $ui.BinList      @{ Name = 'Name'; Type = 'Kind'; Size = 'Size'; Deleted = 'Deleted'; 'Deleted by' = 'Owner'; 'Original location' = 'Folder' }
+Enable-AWSort $ui.RebloatList  @{ App = 'Name'; Category = 'Category'; 'Comes back from' = 'Source'; Notes = 'Note' }
+Enable-AWSort $ui.BinList     @{ Name = 'Name'; Type = 'Kind'; Size = 'Size'; Deleted = 'Deleted'; 'Deleted by' = 'Owner'; 'Original location' = 'Folder' }
 Enable-AWSort $ui.ShadowResults @{ Name = 'Name'; Status = 'Status'; Size = 'Size'; Modified = 'Modified'; Folder = 'Folder' }
 #endregion
 
