@@ -1,0 +1,10 @@
+# OS / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+*.swp
+
+# Local output
+*.log
+*.csv
