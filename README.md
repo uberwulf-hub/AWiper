@@ -8,6 +8,7 @@ System cleanup, debloat and repair toolkit for Windows, with a WPF interface —
 | Cleaner     | Analyze / clean temp files, caches, error reports, crash dumps, update and Delivery Optimization caches, Recycle Bin |
 | Space Map   | SpaceMonger-style nested treemap of any drive or folder (drill down, recycle) |
 | Large Files | The 1,000 largest files from the last scan — searchable, recycle or export |
+| Recovery    | Restore from the Recycle Bin, find deleted files in previous versions, deep scan with Windows File Recovery |
 | Startup     | Enable / disable startup entries (same `StartupApproved` switches Task Manager uses) |
 | Programs    | Installed software list with size, search and uninstall |
 | Debloat     | Remove preinstalled Store apps; turn off ads, suggestions, Bing in Start, Copilot, Recall, Widgets and more |
@@ -24,6 +25,13 @@ System cleanup, debloat and repair toolkit for Windows, with a WPF interface —
 Apps are matched against a curated list; recommended removals are pre-checked and anything you might still use (Outlook, Teams for work, Phone Link, Xbox, Quick Assist...) is left unchecked with a note. **Show all apps** lists every removable Store app except a protected core set (Store, App Installer, Photos, Calculator, codecs, runtimes...). When running as admin, apps are removed for all users and, optionally, the provisioned copy is removed so new accounts don't get it.
 
 Tweaks show an **ON** badge when they're already applied and can be reverted.
+
+### Recovery
+
+- **Drive check** — every drive gets a recoverability rating from its media type, bus and TRIM setting. Internal SSDs with TRIM (the Windows default) usually erase deleted data within minutes; USB sticks, SD cards and hard disks are good candidates.
+- **Recycle Bin** — reads the `$Recycle.Bin` folders directly, so it shows every user's deleted items (as admin) and works on remote PCs. Restore to the original location or another folder; nothing is ever overwritten.
+- **Previous versions** — lists Volume Shadow Copy snapshots (System Protection / restore points), opens one in Explorer, or compares a folder against a snapshot to list files that have since been deleted or changed, then restores them.
+- **Deep scan** — a front-end for Microsoft's free [Windows File Recovery](https://apps.microsoft.com/detail/9N26S50LN705) (`winfr`): installs it if needed, builds the command, refuses to save to the drive being scanned, and streams progress to the activity log.
 
 ## Remote computers
 

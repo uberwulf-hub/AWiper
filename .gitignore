@@ -8,3 +8,7 @@ desktop.ini
 # Local output
 *.log
 *.csv
+
+# Research notes and reports
+research_notes/
+reports/

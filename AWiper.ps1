@@ -9,6 +9,8 @@
       * Cleaner      - analyze / clean temp files, caches, update leftovers, dumps, recycle bin
       * Space Map    - SpaceMonger-style nested treemap of any drive or folder (drill down, recycle)
       * Large Files  - the 1,000 largest files from the last scan, searchable, recycle or export
+      * Recovery     - restore from any user's Recycle Bin, find deleted files in shadow-copy snapshots,
+                       deep scan with Windows File Recovery, per-drive recoverability (SSD/TRIM) check
       * Startup      - enable / disable startup entries (same StartupApproved switches Task Manager uses)
       * Programs     - installed software list with size, search and uninstall
       * Debloat      - remove preinstalled Store apps, turn off ads, suggestions, Copilot and other extras
@@ -44,7 +46,7 @@
 
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.1.0
+    Version : 1.2.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -57,7 +59,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.1.0'
+$script:AppVersion = '1.2.0'
 
 #region ---------------------------------------------------------------- Elevation / STA
 function Test-AWAdmin {
@@ -167,8 +169,26 @@ namespace AWiper
         public long Size { get; set; }
         public DateTime Modified { get; set; }
         public bool IsChecked { get; set; }
+        public string Status { get; set; }
         public string SizeText { get { return Fmt.Size(Size); } }
         public string ModifiedText { get { return Modified == DateTime.MinValue ? "" : Modified.ToString("yyyy-MM-dd HH:mm"); } }
+    }
+
+    public class RecycleEntry
+    {
+        public bool IsChecked { get; set; }
+        public string Name { get; set; }
+        public string OriginalPath { get; set; }
+        public string Folder { get; set; }
+        public string Owner { get; set; }
+        public string IPath { get; set; }
+        public string RPath { get; set; }
+        public bool IsDir { get; set; }
+        public long Size { get; set; }
+        public DateTime Deleted { get; set; }
+        public string SizeText { get { return Fmt.Size(Size); } }
+        public string DeletedText { get { return Deleted == DateTime.MinValue ? "" : Deleted.ToString("yyyy-MM-dd HH:mm"); } }
+        public string Kind { get { return IsDir ? "Folder" : "File"; } }
     }
 
     public class AppEntry
@@ -483,6 +503,22 @@ namespace AWiper
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SHEmptyRecycleBin(IntPtr hwnd, string root, uint flags);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool GetVolumePathName(string fileName, System.Text.StringBuilder volumePath, uint length);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool GetVolumeNameForVolumeMountPoint(string mountPoint, System.Text.StringBuilder volumeName, uint length);
+
+        // Stable identity of the volume holding a path (\\?\Volume{GUID}\), so two drive letters or a
+        // mounted folder pointing at the same volume are still detected as the same disk.
+        public static string VolumeId(string path)
+        {
+            var root = new System.Text.StringBuilder(1024);
+            if (!GetVolumePathName(path, root, 1024)) return null;
+            var name = new System.Text.StringBuilder(1024);
+            if (!GetVolumeNameForVolumeMountPoint(root.ToString(), name, 1024)) return root.ToString().ToUpperInvariant();
+            return name.ToString().ToUpperInvariant();
+        }
+
         public static bool OwnsConsole()
         {
             try { var l = new uint[8]; return GetConsoleProcessList(l, 8) <= 1; } catch { return false; }
@@ -568,6 +604,103 @@ function Invoke-WTarget {
     Invoke-Command @p 6>&1 | ForEach-Object {
         if ($_ -is [System.Management.Automation.InformationRecord]) { $Sync.Log.Enqueue(('{0}  [{1}]' -f $_.MessageData, $Target.Host)) }
         else { $_ }
+    }
+}
+
+# Every user's Recycle Bin on every local drive. Each deleted item is a $I file (metadata) plus a
+# $R file or folder (content). $I v1 (Vista-8.1): fixed 520-byte path at offset 24. $I v2 (Win10+):
+# path length in characters (including the null) at offset 24, path at 28.
+function Get-WRecycleItems {
+    $names = @{}
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
+        if (-not $d.IsReady -or ($d.DriveType -ne 'Fixed' -and $d.DriveType -ne 'Removable')) { continue }
+        $root = Join-Path $d.RootDirectory.FullName '$Recycle.Bin'
+        $bins = @()
+        try { $bins = @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction Stop) } catch { continue }
+        foreach ($bin in $bins) {
+            $ifiles = @()
+            try { $ifiles = @(Get-ChildItem -LiteralPath $bin.FullName -Force -File -Filter '$I*' -ErrorAction Stop) }
+            catch {
+                # Other users' bins are expected to be off-limits without admin rights.
+                if ($admin) { Write-WLog "Recycle Bin of $($bin.Name) on $($d.Name) is not readable: $($_.Exception.Message)" 'WARN' }
+                continue
+            }
+            if (-not $names.ContainsKey($bin.Name)) {
+                $names[$bin.Name] = try { (New-Object System.Security.Principal.SecurityIdentifier $bin.Name).Translate([System.Security.Principal.NTAccount]).Value } catch { $bin.Name }
+            }
+            foreach ($i in $ifiles) {
+                try {
+                    $b = [System.IO.File]::ReadAllBytes($i.FullName)
+                    if ($b.Length -lt 28) { continue }
+                    $ver = [BitConverter]::ToInt64($b, 0)
+                    if ($ver -eq 1) { $path = [System.Text.Encoding]::Unicode.GetString($b, 24, [Math]::Min(520, $b.Length - 24)) }
+                    elseif ($ver -eq 2) {
+                        $n = [BitConverter]::ToInt32($b, 24)
+                        $path = [System.Text.Encoding]::Unicode.GetString($b, 28, [Math]::Max(0, [Math]::Min($n * 2, $b.Length - 28)))
+                    }
+                    else { continue }
+                    $path = $path.Split([char]0)[0]
+                    $r = Join-Path $bin.FullName ('$R' + $i.Name.Substring(2))
+                    if (-not $path -or -not (Test-Path -LiteralPath $r)) { continue }
+                    $del = try { [DateTime]::FromFileTime([BitConverter]::ToInt64($b, 16)) } catch { [DateTime]::MinValue }
+                    [pscustomobject]@{
+                        IPath = $i.FullName; RPath = $r; OriginalPath = $path; Size = [BitConverter]::ToInt64($b, 8); Deleted = $del
+                        IsDir = (Test-Path -LiteralPath $r -PathType Container); Owner = $names[$bin.Name]
+                    }
+                } catch { Write-WLog "Skipped $($i.FullName): $($_.Exception.Message)" 'WARN' }
+            }
+        }
+    }
+}
+
+# Moves a recycled item back out. Never overwrites: a name clash gets " (restored)", " (restored 2)"...
+function Restore-WRecycleItem([string]$IPath, [string]$RPath, [string]$Destination) {
+    $dest = $Destination
+    if (Test-Path -LiteralPath $dest) {
+        $dir = Split-Path $Destination -Parent
+        $isDir = Test-Path -LiteralPath $RPath -PathType Container
+        $base = if ($isDir) { Split-Path $Destination -Leaf } else { [System.IO.Path]::GetFileNameWithoutExtension($Destination) }
+        $ext  = if ($isDir) { '' } else { [System.IO.Path]::GetExtension($Destination) }
+        $n = 1
+        do {
+            $suffix = if ($n -eq 1) { ' (restored)' } else { " (restored $n)" }
+            $dest = Join-Path $dir ($base + $suffix + $ext); $n++
+        } while (Test-Path -LiteralPath $dest)
+    }
+    $parent = Split-Path $dest -Parent
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $sameVolume = [System.IO.Path]::GetPathRoot($RPath) -eq [System.IO.Path]::GetPathRoot($dest)
+    if (Test-Path -LiteralPath $RPath -PathType Container) {
+        if ($sameVolume) { [System.IO.Directory]::Move($RPath, $dest) }
+        else { Copy-Item -LiteralPath $RPath -Destination $dest -Recurse -ErrorAction Stop; Remove-Item -LiteralPath $RPath -Recurse -Force }
+    } else {
+        if ($sameVolume) { [System.IO.File]::Move($RPath, $dest) }
+        else { Copy-Item -LiteralPath $RPath -Destination $dest -ErrorAction Stop; Remove-Item -LiteralPath $RPath -Force }
+    }
+    Remove-Item -LiteralPath $IPath -Force -ErrorAction SilentlyContinue
+    Write-WLog "Restored $dest"
+    $dest
+}
+
+# Drive facts that decide whether deleted data can still be on the disk.
+function Get-WRecoveryDrives {
+    $trim = $null
+    try {
+        $o = (& fsutil.exe behavior query DisableDeleteNotify 2>&1) -join "`n"
+        if ($o -match 'NTFS DisableDeleteNotify\s*=\s*(\d)') { $trim = $Matches[1] -eq '0' }
+    } catch { }
+    $phys = @{}
+    try { foreach ($p in (Get-PhysicalDisk -ErrorAction Stop)) { $phys[[string]$p.DeviceId] = $p } } catch { }
+    foreach ($v in @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and "$($_.DriveType)" -in 'Fixed', 'Removable' } | Sort-Object DriveLetter)) {
+        $p = $null
+        try { $p = $phys[[string](Get-Partition -DriveLetter $v.DriveLetter -ErrorAction Stop).DiskNumber] } catch { }
+        [pscustomobject]@{
+            Drive = "$($v.DriveLetter):"; Label = [string]$v.FileSystemLabel; FS = [string]$(if ($v.FileSystem) { $v.FileSystem } else { $v.FileSystemType })
+            Size = [long]$v.Size; Free = [long]$v.SizeRemaining; Type = [string]$v.DriveType
+            Media = [string]$(if ($p) { $p.MediaType } else { '' }); Bus = [string]$(if ($p) { $p.BusType } else { '' })
+            Model = [string]$(if ($p) { $p.FriendlyName } else { '' }); Trim = $trim
+        }
     }
 }
 
@@ -1523,6 +1656,7 @@ $script:Tweaks = @(
               <RadioButton x:Name="NavCleaner"  Style="{StaticResource NavBtn}" Tag="&#xE74D;" Content="Cleaner"/>
               <RadioButton x:Name="NavMap"      Style="{StaticResource NavBtn}" Tag="&#xEB05;" Content="Space Map"/>
               <RadioButton x:Name="NavLarge"    Style="{StaticResource NavBtn}" Tag="&#xE7C3;" Content="Large Files"/>
+              <RadioButton x:Name="NavRecovery" Style="{StaticResource NavBtn}" Tag="&#xE81C;" Content="Recovery"/>
               <TextBlock Text="SYSTEM" Style="{StaticResource Caps}" Margin="8,16,0,6"/>
               <RadioButton x:Name="NavStartup"  Style="{StaticResource NavBtn}" Tag="&#xE7E8;" Content="Startup"/>
               <RadioButton x:Name="NavPrograms" Style="{StaticResource NavBtn}" Tag="&#xE71D;" Content="Programs"/>
@@ -1814,6 +1948,221 @@ $script:Tweaks = @(
                 </ListView.View>
               </ListView>
             </Border>
+          </Grid>
+
+          <!-- ===== Recovery ===== -->
+          <Grid x:Name="ViewRecovery" Visibility="Collapsed">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Border Style="{StaticResource Card}" Padding="20,16">
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel>
+                  <TextBlock Text="Recover deleted files" Style="{StaticResource H2}"/>
+                  <TextBlock Text="Check the Recycle Bin and previous versions first. For a deep scan, stop using the drive and save what you recover to a different drive."
+                             Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                </StackPanel>
+                <Border Grid.Column="1" Background="{StaticResource FieldBrush}" CornerRadius="10" Padding="3" Margin="16,0,0,0"
+                        BorderBrush="{StaticResource LineBrush}" BorderThickness="1" VerticalAlignment="Center">
+                  <StackPanel Orientation="Horizontal">
+                    <RadioButton x:Name="RecTabBin"    Style="{StaticResource SegBtn}" GroupName="RecTab" IsChecked="True" Content="Recycle Bin"/>
+                    <RadioButton x:Name="RecTabShadow" Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Previous versions"/>
+                    <RadioButton x:Name="RecTabDeep"   Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Deep scan"/>
+                  </StackPanel>
+                </Border>
+              </Grid>
+            </Border>
+
+            <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled" Margin="0,14,0,0">
+              <StackPanel x:Name="RecDrives" Orientation="Horizontal"/>
+            </ScrollViewer>
+
+            <Grid Grid.Row="2" Margin="0,14,0,16">
+              <!-- Recycle Bin -->
+              <Border x:Name="RecPanelBin" Style="{StaticResource Card}" Padding="14,12">
+                <DockPanel>
+                  <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="300"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <TextBox x:Name="BinSearch" Tag="Search by name or original location..."/>
+                    <TextBlock x:Name="BinInfo" Grid.Column="1" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0"/>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                      <Button x:Name="BinRefresh" Content="Refresh" Style="{StaticResource BtnChip}"/>
+                      <Button x:Name="BinOpen" Content="Open original folder" Style="{StaticResource BtnChip}"/>
+                      <Button x:Name="BinRestoreTo" Content="Restore to..." Style="{StaticResource BtnChip}"/>
+                      <Button x:Name="BinRestore" Content="Restore checked" Style="{StaticResource BtnAccent}" Padding="14,6" FontSize="12"/>
+                    </StackPanel>
+                  </Grid>
+                  <TextBlock DockPanel.Dock="Bottom" Style="{StaticResource Muted}" FontSize="11.5" Margin="8,8,8,2"
+                             Text="Items go back to where they were deleted from. If something already exists there, the restored copy gets &quot;(restored)&quot; added to its name - nothing is overwritten."/>
+                  <ListView x:Name="BinList">
+                    <ListView.View>
+                      <GridView>
+                        <GridViewColumn Header="" Width="44">
+                          <GridViewColumn.CellTemplate><DataTemplate><CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}" Margin="4,0,0,0"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Name" Width="230">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding OriginalPath}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Type" Width="64" DisplayMemberBinding="{Binding Kind}"/>
+                        <GridViewColumn Header="Size" Width="90">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#19C3B1" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Deleted" Width="130" DisplayMemberBinding="{Binding DeletedText}"/>
+                        <GridViewColumn Header="Deleted by" Width="150">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Owner}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Original location" Width="420">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Folder}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                      </GridView>
+                    </ListView.View>
+                  </ListView>
+                </DockPanel>
+              </Border>
+
+              <!-- Previous versions (shadow copies) -->
+              <Grid x:Name="RecPanelShadow" Visibility="Collapsed">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="320"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                <Border Style="{StaticResource Card}" Padding="14,12">
+                  <DockPanel>
+                    <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                      <TextBlock Text="Snapshots" Style="{StaticResource H2}" VerticalAlignment="Center"/>
+                      <Button x:Name="ShadowRefresh" Content="Refresh" Style="{StaticResource BtnChip}" HorizontalAlignment="Right" Margin="0"/>
+                    </Grid>
+                    <StackPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                      <TextBlock x:Name="ShadowNote" Text="" Style="{StaticResource Muted}" FontSize="11.5" Margin="0,0,0,10"/>
+                      <WrapPanel>
+                        <Button x:Name="ShadowExplore" Content="Open in Explorer" Style="{StaticResource BtnChip}"/>
+                        <Button x:Name="ShadowProtect" Content="System Protection settings" Style="{StaticResource BtnChip}" Margin="0"/>
+                      </WrapPanel>
+                    </StackPanel>
+                    <ListBox x:Name="ShadowList">
+                      <ListBox.ItemTemplate>
+                        <DataTemplate>
+                          <StackPanel Margin="2,3">
+                            <StackPanel Orientation="Horizontal">
+                              <TextBlock Text="{Binding Drive}" FontWeight="Bold" Foreground="#19C3B1" Width="30"/>
+                              <TextBlock Text="{Binding CreatedText}" FontWeight="SemiBold"/>
+                            </StackPanel>
+                            <TextBlock Text="{Binding Age}" Foreground="#8C95BD" FontSize="11.5" Margin="30,2,0,0"/>
+                          </StackPanel>
+                        </DataTemplate>
+                      </ListBox.ItemTemplate>
+                    </ListBox>
+                  </DockPanel>
+                </Border>
+                <Border Grid.Column="1" Style="{StaticResource Card}" Margin="16,0,0,0" Padding="14,12">
+                  <DockPanel>
+                    <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <TextBox x:Name="ShadowFolder" Tag="Folder to check, e.g. C:\Users\you\Documents"/>
+                      <CheckBox x:Name="ShadowChanged" Grid.Column="1" Content="Include changed files" Margin="12,0"/>
+                      <Button x:Name="ShadowFind" Grid.Column="2" Content="Find deleted files" Style="{StaticResource BtnAccent}" Padding="14,6" FontSize="12"/>
+                    </Grid>
+                    <Grid DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                      <TextBlock x:Name="ShadowInfo" Text="Pick a snapshot, enter a folder, and AWiper lists files that existed then but are gone now."
+                                 Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="4,0,280,0"/>
+                      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button x:Name="ShadowCopyTo" Content="Copy checked to..." Style="{StaticResource BtnChip}"/>
+                        <Button x:Name="ShadowRestore" Content="Restore checked" Style="{StaticResource BtnAccent}" Padding="14,6" FontSize="12"/>
+                      </StackPanel>
+                    </Grid>
+                    <ListView x:Name="ShadowResults">
+                      <ListView.View>
+                        <GridView>
+                          <GridViewColumn Header="" Width="44">
+                            <GridViewColumn.CellTemplate><DataTemplate><CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}" Margin="4,0,0,0"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                          <GridViewColumn Header="Name" Width="220">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                          <GridViewColumn Header="Status" Width="80" DisplayMemberBinding="{Binding Status}"/>
+                          <GridViewColumn Header="Size" Width="90">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#19C3B1"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                          <GridViewColumn Header="Modified" Width="130" DisplayMemberBinding="{Binding ModifiedText}"/>
+                          <GridViewColumn Header="Folder" Width="380">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Folder}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                        </GridView>
+                      </ListView.View>
+                    </ListView>
+                  </DockPanel>
+                </Border>
+              </Grid>
+
+              <!-- Deep scan (Windows File Recovery) -->
+              <Grid x:Name="RecPanelDeep" Visibility="Collapsed">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="330"/></Grid.ColumnDefinitions>
+                <Border Style="{StaticResource Card}" Padding="18,14">
+                  <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="0,0,8,0">
+                      <Border x:Name="WinfrBox" CornerRadius="8" Padding="12,9" Background="#163A44" BorderBrush="#2E8F86" BorderThickness="1">
+                        <Grid>
+                          <TextBlock x:Name="WinfrStatus" Text="Checking for Windows File Recovery..." TextWrapping="Wrap" FontSize="12.5" VerticalAlignment="Center" Margin="0,0,200,0"/>
+                          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <Button x:Name="WinfrInstall" Content="Install" Style="{StaticResource BtnChip}" Visibility="Collapsed"/>
+                            <Button x:Name="WinfrStore" Content="Microsoft Store" Style="{StaticResource BtnChip}" Margin="0" Visibility="Collapsed"/>
+                          </StackPanel>
+                        </Grid>
+                      </Border>
+
+                      <TextBlock Text="SCAN THIS DRIVE" Style="{StaticResource Caps}"/>
+                      <WrapPanel x:Name="DeepSources"/>
+
+                      <TextBlock Text="SAVE RECOVERED FILES TO" Style="{StaticResource Caps}"/>
+                      <Grid>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <TextBox x:Name="DeepDest" Tag="A folder on a different drive, e.g. E:\Recovered"/>
+                        <Button x:Name="DeepBrowse" Grid.Column="1" Style="{StaticResource BtnIcon}" Content="&#xE838;" ToolTip="Browse" Margin="8,0,0,0"/>
+                      </Grid>
+                      <TextBlock x:Name="DeepDestMsg" Text="" FontSize="12" Margin="2,6,0,0" TextWrapping="Wrap" Visibility="Collapsed"/>
+
+                      <TextBlock Text="MODE" Style="{StaticResource Caps}"/>
+                      <Border Background="{StaticResource FieldBrush}" CornerRadius="10" Padding="3" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" HorizontalAlignment="Left">
+                        <StackPanel Orientation="Horizontal">
+                          <RadioButton x:Name="DeepRegular"   Style="{StaticResource SegBtn}" GroupName="DeepMode" IsChecked="True" Content="Regular" MinWidth="110"/>
+                          <RadioButton x:Name="DeepExtensive" Style="{StaticResource SegBtn}" GroupName="DeepMode" Content="Extensive" MinWidth="110"/>
+                        </StackPanel>
+                      </Border>
+                      <TextBlock x:Name="DeepModeHint" Text="" Style="{StaticResource Muted}" FontSize="12" Margin="2,6,0,0"/>
+
+                      <TextBlock Text="WHAT TO LOOK FOR" Style="{StaticResource Caps}"/>
+                      <TextBox x:Name="DeepFilter" Tag="e.g.  \Users\andre\Documents\ ;  *.jpg ;  budget*.xlsx"/>
+                      <TextBlock Text="Folders end with \ and are relative to the drive. Separate several with ;. Leave empty to recover everything found (can be a lot)."
+                                 Style="{StaticResource Muted}" FontSize="12" Margin="2,6,0,0"/>
+
+                      <TextBlock Text="COMMAND" Style="{StaticResource Caps}"/>
+                      <TextBox x:Name="DeepCmd" IsReadOnly="True" FontFamily="Cascadia Mono, Consolas" FontSize="12" TextWrapping="Wrap"/>
+
+                      <StackPanel Orientation="Horizontal" Margin="0,16,0,4">
+                        <Button x:Name="DeepStart" Style="{StaticResource BtnAccent}" Margin="0,0,10,0">
+                          <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE81C;" Style="{StaticResource Icon}" Margin="0,0,8,0"/><TextBlock Text="Start recovery"/></StackPanel>
+                        </Button>
+                        <Button x:Name="DeepStop" Content="Stop" IsEnabled="False" Margin="0,0,10,0"/>
+                        <Button x:Name="DeepOpenDest" Content="Open destination"/>
+                      </StackPanel>
+                    </StackPanel>
+                  </ScrollViewer>
+                </Border>
+                <Border Grid.Column="1" Style="{StaticResource Card}" Margin="16,0,0,0" Padding="18,14">
+                  <StackPanel>
+                    <TextBlock Text="Before you start" Style="{StaticResource H2}"/>
+                    <Border x:Name="DeepVerdictBox" CornerRadius="8" Padding="12,9" Margin="0,12,0,4" BorderThickness="1" Visibility="Collapsed">
+                      <TextBlock x:Name="DeepVerdict" TextWrapping="Wrap" FontSize="12.5"/>
+                    </Border>
+                    <TextBlock Style="{StaticResource Muted}" FontSize="12.5" Margin="0,10,0,0" LineHeight="20">
+                      <Run Text="1.  Stop using the drive. Every file written can overwrite what you want back."/><LineBreak/>
+                      <Run Text="2.  Save recovered files to a different drive - AWiper will not let you pick the same one."/><LineBreak/>
+                      <Run Text="3.  Try Regular mode first for files deleted recently from an NTFS drive. Use Extensive for USB sticks, SD cards, formatted drives or older deletions."/><LineBreak/>
+                      <Run Text="4.  Internal SSDs usually erase deleted data within minutes (TRIM), so deep scans there rarely find anything. Check the Recycle Bin and previous versions first."/><LineBreak/>
+                      <Run Text="5.  If the drive clicks, disconnects or shows read errors, stop and have it imaged before trying again."/>
+                    </TextBlock>
+                    <TextBlock Text="Deep scan uses Microsoft's free Windows File Recovery tool. Results land in a Recovery_date folder inside the destination."
+                               Style="{StaticResource Muted}" FontSize="11.5" Margin="0,14,0,0"/>
+                  </StackPanel>
+                </Border>
+              </Grid>
+            </Grid>
           </Grid>
 
           <!-- ===== Startup ===== -->
@@ -2219,7 +2568,7 @@ $script:IdleStatus = 'Ready'
 
 #region ---------------------------------------------------------------- Navigation + title bar
 $script:ViewTitles = @{
-    Home = 'Dashboard'; Cleaner = 'Cleaner'; Map = 'Space Map'; Large = 'Large Files'
+    Home = 'Dashboard'; Cleaner = 'Cleaner'; Map = 'Space Map'; Large = 'Large Files'; Recovery = 'Recovery'
     Startup = 'Startup'; Programs = 'Programs'; Debloat = 'Debloat'; Tools = 'Tools and Activity Log'
 }
 $script:Loaded = @{}
@@ -2236,6 +2585,7 @@ foreach ($v in $script:ViewTitles.Keys) {
                 'Startup'  { Update-AWStartupList }
                 'Programs' { Update-AWProgramList }
                 'Debloat'  { Update-AWAppList; Update-AWTweakStatus }
+                'Recovery' { Initialize-AWRecovery }
             }
         }
         if ($name -eq 'Map') { Request-AWMapRedraw }
@@ -2876,9 +3226,9 @@ function Update-AWLargeList {
     if (-not $script:Scanner -or -not $script:Scanner.TopFiles) { return }
     $all = $script:Scanner.TopFiles
     $q = $ui.LargeSearch.Text.Trim()
-    $items = if ($q) {
-        @($all | Where-Object { $_.Name -like "*$q*" -or $_.Folder -like "*$q*" -or $_.Extension -like "*$q*" })
-    } else { @($all) }
+    $items = @(if ($q) {
+        $all | Where-Object { $_.Name -like "*$q*" -or $_.Folder -like "*$q*" -or $_.Extension -like "*$q*" }
+    } else { $all })
     $ui.LargeList.ItemsSource = $items
     [long]$sum = 0; foreach ($f in $items) { $sum += $f.Size }
     $ui.LargeInfo.Text = '{0:N0} files - {1} total - from scan of {2}' -f $items.Count, (Format-AWSize $sum), $script:Scanner.Root.FullPath
@@ -3044,7 +3394,7 @@ $script:Programs = @()
 
 function Update-AWProgramView {
     $q = $ui.ProgSearch.Text.Trim()
-    $items = if ($q) { @($script:Programs | Where-Object { $_.Name -like "*$q*" -or $_.Publisher -like "*$q*" }) } else { @($script:Programs) }
+    $items = @(if ($q) { $script:Programs | Where-Object { $_.Name -like "*$q*" -or $_.Publisher -like "*$q*" } } else { $script:Programs })
     $ui.ProgList.ItemsSource = $items
     [long]$sum = 0; foreach ($p in $items) { $sum += $p.SizeBytes }
     $ui.ProgInfo.Text = '{0:N0} programs - {1} reported size' -f $items.Count, (Format-AWSize $sum)
@@ -3481,11 +3831,12 @@ function Set-AWTarget($NewTarget) {
     $ui.CleanSubtext.Text = if (Test-AWRemote) { "Machine-wide rules run on $($NewTarget.ComputerName). Per-user rules are only available on this PC." } else { 'Pick the rules on the left, then Analyze to see what can be removed.' }
     $ui.CleanProgress.Value = 0
     $script:AllApps = @(); $ui.AppList.ItemsSource = $null; $script:Programs = @(); $ui.ProgList.ItemsSource = $null
-    [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat')
+    [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat'); [void]$script:Loaded.Remove('Recovery')
     $cur = Get-AWCurrentView
     Update-AWViewTitle $cur
     if ($cur -eq 'Programs') { $script:Loaded['Programs'] = $true; Update-AWProgramList }
     if ($cur -eq 'Debloat')  { $script:Loaded['Debloat'] = $true; Update-AWAppList; Update-AWTweakStatus }
+    if ($cur -eq 'Recovery') { $script:Loaded['Recovery'] = $true; Initialize-AWRecovery }
     if (Test-AWRemote) {
         Write-AWLog "Target is now $($NewTarget.ComputerName) ($($NewTarget.Host)) - $($NewTarget.OS), signed in as $($NewTarget.User)"
         $script:IdleStatus = "Connected to $($NewTarget.ComputerName)"
@@ -3784,6 +4135,533 @@ $ui.LogClear.Add_Click({ $ui.LogBox.Clear() })
 $ui.LogOpen.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$script:DataDir`"" })
 #endregion
 
+#region ---------------------------------------------------------------- Recovery
+$script:BinItems = @()
+$script:RecDrives = @()
+$script:RecLoadedTabs = @{}
+$script:SnapRoot = Join-Path $script:DataDir 'Snapshots'
+$script:ShadowLiveRoot = ''
+$script:DeepSource = $null
+$script:WinfrPath = $null
+$script:DeepRunning = $false
+$Sync.WinfrPid = 0
+
+# How likely a deep scan is to find anything on this drive, in plain words.
+function Get-AWDriveVerdict($d) {
+    if ($d.FS -eq 'ReFS') { return @{ Level = 'Bad'; Short = 'Not supported'; Text = "$($d.Drive) uses ReFS, which recovery tools don't support." } }
+    # USB enclosures often hide the media type, so fall back to the model name.
+    $isSsd = $d.Media -eq 'SSD' -or ($d.Media -ne 'HDD' -and $d.Model -match '\bSSD\b|NVMe')
+    if ($d.Bus -in 'USB', 'SD', 'MMC') {
+        if ($isSsd) { return @{ Level = 'Fair'; Short = 'Possible'; Text = "$($d.Drive) is an external SSD. Many of these pass TRIM through, so deleted data may already be erased - but it's worth a try." } }
+        return @{ Level = 'Good'; Short = 'Good chance'; Text = "$($d.Drive) is removable media (USB stick, SD card or external disk), which normally isn't trimmed. Deleted files usually stay recoverable until the space is reused, so stop writing to it." }
+    }
+    if ($isSsd) {
+        if ($d.Trim -eq $false) { return @{ Level = 'Fair'; Short = 'Possible'; Text = "$($d.Drive) is an SSD with TRIM turned off, so deleted data may still be on it." } }
+        $trimNote = if ($d.Trim) { ' with TRIM on' } else { '' }
+        return @{ Level = 'Bad'; Short = 'Unlikely'; Text = "$($d.Drive) is an SSD$trimNote. Windows tells the drive to erase deleted data, usually within minutes, so a deep scan rarely finds anything. Check the Recycle Bin and previous versions first." }
+    }
+    if ($d.Media -eq 'HDD') { return @{ Level = 'Good'; Short = 'Good chance'; Text = "$($d.Drive) is a hard disk. Deleted files stay recoverable until their space is reused, so stop writing to it." } }
+    @{ Level = 'Fair'; Short = 'Unknown'; Text = "AWiper couldn't tell what kind of disk $($d.Drive) is, so recovery may or may not work." }
+}
+
+function Get-AWVerdictColors([string]$Level) {
+    switch ($Level) {
+        'Good'  { @{ Bg = '#163A44'; Border = '#2E8F86'; Fg = $script:Res.Teal } }
+        'Bad'   { @{ Bg = '#3A1E28'; Border = '#8C3A4A'; Fg = $script:Res.Danger } }
+        default { @{ Bg = '#3A2F1E'; Border = '#8C6A2E'; Fg = $script:Res.Amber } }
+    }
+}
+
+function New-AWRecDriveCard($d) {
+    $v = Get-AWDriveVerdict $d
+    $c = Get-AWVerdictColors $v.Level
+    $card = New-Object System.Windows.Controls.Border
+    $card.Style = $window.FindResource('Card'); $card.Padding = '14,10'; $card.Margin = '0,0,12,0'; $card.MinWidth = 230
+    $card.ToolTip = $v.Text
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $head = New-Object System.Windows.Controls.StackPanel; $head.Orientation = 'Horizontal'
+    [void]$head.Children.Add((New-AWText $d.Drive 16 $null 'Bold'))
+    $lbl = New-AWText $(if ($d.Label) { $d.Label } else { 'Local Disk' }) 12.5 $script:Res.Muted; $lbl.Margin = '8,0,0,0'; $lbl.VerticalAlignment = 'Center'
+    $lbl.MaxWidth = 120; $lbl.TextTrimming = 'CharacterEllipsis'
+    [void]$head.Children.Add($lbl)
+    $pill = New-Object System.Windows.Controls.Border
+    $pill.Style = $window.FindResource('Pill'); $pill.Background = New-Brush $c.Bg; $pill.BorderBrush = New-Brush $c.Border
+    $pill.Child = New-AWText $v.Short.ToUpper() 9 $c.Fg 'Bold'
+    [void]$head.Children.Add($pill)
+    [void]$sp.Children.Add($head)
+    $kind = @($d.Media, $d.Bus | Where-Object { $_ -and $_ -ne 'Unspecified' }) -join ' / '
+    if (-not $kind) { $kind = $d.Type }
+    $meta = New-AWText ('{0} - {1} - {2}' -f $d.FS, (Format-AWSize $d.Size), $kind) 11.5 $script:Res.Dim
+    $meta.Margin = '0,4,0,0'
+    [void]$sp.Children.Add($meta)
+    $card.Child = $sp
+    $card
+}
+
+function Update-AWRecoveryDrives {
+    Start-AWTask -Name 'Check drives for recovery' -Work {
+        Invoke-WTarget { Get-WRecoveryDrives }
+    } -OnComplete {
+        param($Result)
+        $script:RecDrives = @($Result | Where-Object { $_ })
+        $ui.RecDrives.Children.Clear()
+        foreach ($d in $script:RecDrives) { [void]$ui.RecDrives.Children.Add((New-AWRecDriveCard $d)) }
+        Initialize-AWDeepSources
+    }
+}
+
+# ---------------- Recycle Bin
+function Update-AWBinView {
+    $q = $ui.BinSearch.Text.Trim()
+    $items = @(if ($q) { $script:BinItems | Where-Object { $_.Name -like "*$q*" -or $_.OriginalPath -like "*$q*" } } else { $script:BinItems })
+    $ui.BinList.ItemsSource = $items
+    [long]$sum = 0; foreach ($i in $items) { $sum += $i.Size }
+    $ui.BinInfo.Text = '{0:N0} item(s) - {1}' -f $items.Count, (Format-AWSize $sum)
+}
+
+function Update-AWBinList {
+    $ui.BinInfo.Text = 'Reading Recycle Bins...'
+    Start-AWTask -Name 'Read Recycle Bin' -Work {
+        foreach ($r in (Invoke-WTarget { Get-WRecycleItems })) {
+            $e = New-Object AWiper.RecycleEntry
+            $e.OriginalPath = [string]$r.OriginalPath; $e.IPath = [string]$r.IPath; $e.RPath = [string]$r.RPath
+            $e.Name = Split-Path $e.OriginalPath -Leaf; $e.Folder = Split-Path $e.OriginalPath -Parent
+            $e.Size = [long]$r.Size; $e.Deleted = [datetime]$r.Deleted; $e.IsDir = [bool]$r.IsDir; $e.Owner = [string]$r.Owner
+            $e
+        }
+    } -OnComplete {
+        param($Result)
+        $script:BinItems = @($Result | Where-Object { $_ } | Sort-Object Deleted -Descending)
+        Update-AWBinView
+        if (-not $script:IsAdmin -and -not (Test-AWRemote)) { $ui.BinInfo.Text += ' - your items only (run as admin to see every user)' }
+    }
+}
+
+function Start-AWBinRestore([string]$ToFolder) {
+    $items = @($script:BinItems | Where-Object { $_.IsChecked })
+    if ($items.Count -eq 0) { Show-AWMessage 'Check the items you want to restore first.'; return }
+    $where = if ($ToFolder) { "to`n$ToFolder" } else { 'to their original locations' }
+    $list = ($items | Select-Object -First 15 | ForEach-Object { "  - $($_.Name)" }) -join "`n"
+    if ($items.Count -gt 15) { $list += "`n  ...and $($items.Count - 15) more" }
+    if (-not (Confirm-AW "Restore $($items.Count) item(s) $where$(Get-AWWhere)?`n`n$list")) { return }
+    $jobs = @($items | ForEach-Object {
+        @{ IPath = $_.IPath; RPath = $_.RPath; Name = $_.Name; Dest = $(if ($ToFolder) { Join-Path $ToFolder $_.Name } else { $_.OriginalPath }) }
+    })
+    $ui.BinRestore.IsEnabled = $false; $ui.BinRestoreTo.IsEnabled = $false
+    Start-AWTask -Name 'Restore from Recycle Bin' -Arguments @{ Jobs = $jobs } -Work {
+        $i = 0; $ok = 0
+        foreach ($j in $Jobs) {
+            $Sync.Status = "Restoring $($j.Name)..."; $Sync.Progress = [int]($i * 100 / $Jobs.Count); $i++
+            try {
+                [void](Invoke-WTarget { param($a, $b, $c) Restore-WRecycleItem $a $b $c } -ArgumentList @($j.IPath, $j.RPath, $j.Dest))
+                $ok++
+            } catch { Write-WLog "Could not restore $($j.Name): $($_.Exception.Message)" 'ERROR' }
+        }
+        "Restored $ok of $($Jobs.Count) item(s)"
+    } -OnComplete {
+        param($r)
+        $msg = @($r | Where-Object { $_ }) | Select-Object -Last 1
+        $script:IdleStatus = if ($msg) { "$msg - see Activity log for details" } else { 'Restore finished - see Activity log' }
+        Update-AWRecoveryButtons
+        Update-AWBinList
+    }
+}
+
+# ---------------- Previous versions (Volume Shadow Copies)
+function Get-AWUniquePath([string]$Path, [string]$Suffix = 'restored') {
+    if (-not (Test-Path -LiteralPath $Path)) { return $Path }
+    $dir = Split-Path $Path -Parent; $base = [System.IO.Path]::GetFileNameWithoutExtension($Path); $ext = [System.IO.Path]::GetExtension($Path)
+    $n = 1
+    do { $p = Join-Path $dir ('{0} ({1}{2}){3}' -f $base, $Suffix, $(if ($n -gt 1) { " $n" } else { '' }), $ext); $n++ } while (Test-Path -LiteralPath $p)
+    $p
+}
+
+# Snapshots are opened through directory symlinks under %LOCALAPPDATA%\AWiper\Snapshots.
+# Only the links are ever removed (non-recursive delete of a reparse point), never their contents.
+function Dismount-AWShadows {
+    if (-not (Test-Path -LiteralPath $script:SnapRoot)) { return }
+    foreach ($d in @(Get-ChildItem -LiteralPath $script:SnapRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+        if ($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            try { [System.IO.Directory]::Delete($d.FullName) } catch { Write-AWLog "Could not close snapshot link $($d.Name): $($_.Exception.Message)" 'WARN' }
+        }
+    }
+}
+
+function Mount-AWShadow($Shadow) {
+    if (-not (Test-Path -LiteralPath $script:SnapRoot)) { New-Item -ItemType Directory -Path $script:SnapRoot -Force | Out-Null }
+    $link = Join-Path $script:SnapRoot ('{0}_{1:yyyyMMdd-HHmmss}' -f $Shadow.Drive.TrimEnd(':'), $Shadow.Created)
+    if (Test-Path -LiteralPath $link) { return $link }
+    $out = & cmd.exe /c mklink /d "$link" "$($Shadow.Device)\" 2>&1
+    if (-not (Test-Path -LiteralPath $link)) { throw "Could not open the snapshot: $out" }
+    Write-AWLog "Opened snapshot of $($Shadow.Drive) from $($Shadow.CreatedText)"
+    $link
+}
+
+function Update-AWShadowList {
+    if (-not $script:IsAdmin) {
+        $ui.ShadowNote.Text = 'Listing previous versions needs administrator rights. Use "Restart as admin" in the title bar.'
+        $ui.ShadowList.ItemsSource = $null
+        return
+    }
+    $ui.ShadowNote.Text = 'Looking for snapshots...'
+    Start-AWTask -Name 'Read shadow copies' -Work {
+        $vols = @{}
+        foreach ($v in @(Get-CimInstance Win32_Volume -ErrorAction SilentlyContinue)) { if ($v.DriveLetter) { $vols[[string]$v.DeviceID] = [string]$v.DriveLetter } }
+        foreach ($s in @(Get-CimInstance Win32_ShadowCopy -ErrorAction Stop)) {
+            [pscustomobject]@{ Id = [string]$s.ID; Device = [string]$s.DeviceObject; Drive = [string]$vols[[string]$s.VolumeName]; Created = [datetime]$s.InstallDate }
+        }
+    } -OnComplete {
+        param($Result)
+        $now = Get-Date
+        $list = @($Result | Where-Object { $_ -and $_.Drive } | Sort-Object Created -Descending | ForEach-Object {
+            $days = [int]($now - $_.Created).TotalDays
+            [pscustomobject]@{
+                Id = $_.Id; Device = $_.Device; Drive = $_.Drive; Created = $_.Created
+                CreatedText = $_.Created.ToString('ddd MMM d yyyy, h:mm tt')
+                Age = if ($days -le 0) { 'Today' } elseif ($days -eq 1) { 'Yesterday' } else { "$days days ago" }
+            }
+        })
+        $ui.ShadowList.ItemsSource = $list
+        $ui.ShadowNote.Text = if ($list.Count) {
+            "$($list.Count) snapshot(s). Windows makes them with restore points and big updates. Pick one, then open it or search it for deleted files."
+        } else {
+            'No snapshots found. Windows only keeps them when System Protection is turned on for a drive (usually just C:). Turn it on now so future deletions can be undone.'
+        }
+        if ($list.Count) { $ui.ShadowList.SelectedIndex = 0 }
+    }
+}
+
+function Start-AWShadowFind {
+    $s = $ui.ShadowList.SelectedItem
+    if (-not $s) { Show-AWMessage 'Pick a snapshot on the left first.'; return }
+    $folder = $ui.ShadowFolder.Text.Trim().TrimEnd('\')
+    if ($folder -notmatch '^[A-Za-z]:') { Show-AWMessage 'Enter a full folder path, like C:\Users\you\Documents.'; return }
+    if ($folder.Substring(0, 2) -ne $s.Drive) { Show-AWMessage "That folder is on $($folder.Substring(0, 2)), but the snapshot is of $($s.Drive). Pick a snapshot of the same drive."; return }
+    try { $link = Mount-AWShadow $s } catch { Show-AWMessage $_.Exception.Message 'Error'; return }
+    $rel = $folder.Substring(2).TrimStart('\')
+    $snapFolder = if ($rel) { Join-Path $link $rel } else { $link }
+    if (-not (Test-Path -LiteralPath $snapFolder)) { Show-AWMessage "$folder did not exist yet when this snapshot was taken."; return }
+    $script:ShadowLiveRoot = $folder
+    $ui.ShadowFind.IsEnabled = $false
+    $ui.ShadowInfo.Text = 'Comparing the snapshot with the folder as it is now...'
+    Start-AWTask -Name 'Find deleted files in snapshot' -Arguments @{ SnapFolder = $snapFolder; LiveFolder = $folder; Changed = [bool]$ui.ShadowChanged.IsChecked } -Work {
+        $found = 0; $seen = 0
+        foreach ($f in @(Get-ChildItem -LiteralPath $SnapFolder -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+            $seen++
+            if ($seen % 500 -eq 0) { $Sync.Status = "Compared $seen files, $found found..." }
+            $live = Join-Path $LiveFolder $f.FullName.Substring($SnapFolder.Length).TrimStart('\')
+            $status = $null
+            if (-not [System.IO.File]::Exists($live)) { $status = 'Deleted' }
+            elseif ($Changed -and [System.IO.File]::GetLastWriteTimeUtc($live) -ne $f.LastWriteTimeUtc) { $status = 'Changed' }
+            if (-not $status) { continue }
+            $e = New-Object AWiper.FileEntry
+            $e.Name = $f.Name; $e.FullPath = $f.FullName; $e.Folder = Split-Path $live -Parent; $e.Size = $f.Length
+            $e.Modified = $f.LastWriteTime; $e.Extension = $f.Extension; $e.Status = $status; $e.IsChecked = ($status -eq 'Deleted')
+            $e
+            $found++
+            if ($found -ge 20000) { Write-WLog 'Stopped at 20,000 results - narrow the folder to see more' 'WARN'; break }
+        }
+        Write-WLog "Snapshot compare: $seen file(s) checked, $found difference(s)"
+    } -OnComplete {
+        param($Result)
+        $items = @($Result | Where-Object { $_ -is [AWiper.FileEntry] } | Sort-Object Folder, Name)
+        $ui.ShadowResults.ItemsSource = $items
+        $del = @($items | Where-Object { $_.Status -eq 'Deleted' }).Count
+        $ui.ShadowInfo.Text = if ($items.Count) { "$del deleted, $($items.Count - $del) changed since the snapshot." } else { 'Nothing is missing - every file in the snapshot still exists here.' }
+        $ui.ShadowFind.IsEnabled = $true
+    }
+}
+
+function Start-AWShadowCopy([string]$ToFolder) {
+    $items = @(@($ui.ShadowResults.ItemsSource) | Where-Object { $_ -and $_.IsChecked })
+    if ($items.Count -eq 0) { Show-AWMessage 'Check the files you want back first.'; return }
+    $s = $ui.ShadowList.SelectedItem
+    $stamp = if ($s) { $s.Created.ToString('yyyy-MM-dd') } else { 'snapshot' }
+    $jobs = @($items | ForEach-Object {
+        if ($ToFolder) {
+            $rel = $_.Folder.Substring([Math]::Min($script:ShadowLiveRoot.Length, $_.Folder.Length)).TrimStart('\')
+            $dest = Join-Path (Join-Path $ToFolder $rel) $_.Name
+        } elseif ($_.Status -eq 'Changed') {
+            $dest = Join-Path $_.Folder ('{0} ({1}){2}' -f [System.IO.Path]::GetFileNameWithoutExtension($_.Name), $stamp, [System.IO.Path]::GetExtension($_.Name))
+        } else { $dest = Join-Path $_.Folder $_.Name }
+        @{ Src = $_.FullPath; Dest = $dest }
+    })
+    $where = if ($ToFolder) { "to`n$ToFolder" } else { 'back to their folders (older versions of changed files are saved next to the current file with the snapshot date in the name)' }
+    if (-not (Confirm-AW "Copy $($items.Count) file(s) $where?`n`nNothing is overwritten.")) { return }
+    Start-AWTask -Name 'Restore from snapshot' -Arguments @{ Jobs = $jobs } -Work {
+        $i = 0; $ok = 0
+        foreach ($j in $Jobs) {
+            $Sync.Progress = [int]($i * 100 / $Jobs.Count); $i++
+            try {
+                $dest = $j.Dest
+                if (Test-Path -LiteralPath $dest) {
+                    $dir = Split-Path $dest -Parent; $b = [System.IO.Path]::GetFileNameWithoutExtension($dest); $x = [System.IO.Path]::GetExtension($dest); $n = 1
+                    do { $dest = Join-Path $dir ('{0} (restored{1}){2}' -f $b, $(if ($n -gt 1) { " $n" } else { '' }), $x); $n++ } while (Test-Path -LiteralPath $dest)
+                }
+                $dir = Split-Path $dest -Parent
+                if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                [System.IO.File]::Copy($j.Src, $dest, $false)
+                Write-WLog "Restored $dest"; $ok++
+            } catch { Write-WLog "Could not restore $($j.Src): $($_.Exception.Message)" 'ERROR' }
+        }
+        "Restored $ok of $($Jobs.Count) file(s) from the snapshot"
+    } -OnComplete {
+        param($r)
+        $msg = @($r | Where-Object { $_ }) | Select-Object -Last 1
+        $script:IdleStatus = if ($msg) { "$msg - see Activity log" } else { 'Restore finished - see Activity log' }
+    }
+}
+
+# ---------------- Deep scan (Windows File Recovery front-end)
+function Update-AWWinfrStatus {
+    $cmd = Get-Command winfr.exe -ErrorAction SilentlyContinue
+    $script:WinfrPath = if ($cmd) { $cmd.Source } else { $null }
+    if ($script:WinfrPath) {
+        $ui.WinfrStatus.Text = 'Windows File Recovery is installed and ready.'
+        $ui.WinfrBox.Background = New-Brush '#163A44'; $ui.WinfrBox.BorderBrush = New-Brush '#2E8F86'
+        $ui.WinfrInstall.Visibility = 'Collapsed'; $ui.WinfrStore.Visibility = 'Collapsed'
+    } else {
+        $ui.WinfrStatus.Text = "Deep scan uses Windows File Recovery, Microsoft's free recovery tool. It isn't installed yet. Install it to a drive other than the one you want to recover from if you can."
+        $ui.WinfrBox.Background = New-Brush '#3A2F1E'; $ui.WinfrBox.BorderBrush = New-Brush '#8C6A2E'
+        $ui.WinfrInstall.Visibility = 'Visible'; $ui.WinfrStore.Visibility = 'Visible'
+    }
+    Update-AWDeep
+}
+
+function Initialize-AWDeepSources {
+    $ui.DeepSources.Children.Clear()
+    $prev = if ($script:DeepSource) { $script:DeepSource.Drive } else { $null }
+    $script:DeepSource = $null
+    foreach ($d in $script:RecDrives) {
+        $rb = New-Object System.Windows.Controls.RadioButton
+        $rb.Style = $window.FindResource('SegBtn'); $rb.GroupName = 'DeepSrc'; $rb.Margin = '0,0,8,8'; $rb.Tag = $d
+        $rb.BorderBrush = $window.FindResource('LineBrush')
+        $rb.Content = '{0}  {1}' -f $d.Drive, $(if ($d.Label) { $d.Label } else { $d.FS })
+        $rb.ToolTip = (Get-AWDriveVerdict $d).Text
+        $rb.Add_Checked({ param($s, $e) $script:DeepSource = $s.Tag; Update-AWDeep })
+        $wrap = New-Object System.Windows.Controls.Border
+        $wrap.Background = $window.FindResource('FieldBrush'); $wrap.BorderBrush = $window.FindResource('LineBrush')
+        $wrap.BorderThickness = 1; $wrap.CornerRadius = 10; $wrap.Padding = 3; $wrap.Margin = '0,0,8,8'
+        $rb.Margin = 0; $wrap.Child = $rb
+        [void]$ui.DeepSources.Children.Add($wrap)
+        if ($d.Drive -eq $prev) { $rb.IsChecked = $true }
+    }
+    Update-AWDeep
+}
+
+# Quote one argument for a Windows command line (backslashes before a closing quote are doubled).
+function Format-AWArg([string]$Value) {
+    if ($Value -notmatch '[\s"]') { return $Value }
+    '"' + ($Value -replace '(\\+)$', '$1$1') + '"'
+}
+
+function Get-AWDeepArgs {
+    $src = $script:DeepSource
+    $dest = $ui.DeepDest.Text.Trim()
+    if (-not $src) { return $null }
+    $d = if ($dest -match '^[A-Za-z]:\\?$') { $dest.Substring(0, 2) } else { $dest.TrimEnd('\') }
+    $a = @($src.Drive, (Format-AWArg $(if ($d) { $d } else { 'X:\Recovered' })), $(if ($ui.DeepExtensive.IsChecked) { '/extensive' } else { '/regular' }))
+    foreach ($f in @($ui.DeepFilter.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) { $a += '/n'; $a += (Format-AWArg $f) }
+    $a + '/a'
+}
+
+function Update-AWDeep {
+    if (-not $ui.DeepCmd) { return }
+    $src = $script:DeepSource
+    $ext = [bool]$ui.DeepExtensive.IsChecked
+    $hint = if ($ext) { 'Thorough scan for USB sticks, SD cards (FAT/exFAT), formatted or damaged drives and older deletions. Slower.' }
+            else { 'Fast scan for files deleted recently from an NTFS drive.' }
+    if ($src -and -not $ext -and $src.FS -ne 'NTFS') { $hint += " $($src.Drive) is $($src.FS) - use Extensive for it." }
+    $ui.DeepModeHint.Text = $hint
+
+    $ok = [bool]$src
+    $dest = $ui.DeepDest.Text.Trim()
+    $msg = ''
+    if ($dest) {
+        if ($dest -notmatch '^[A-Za-z]:\\?' -and $dest -notmatch '^\\\\') { $msg = 'Enter a full path, like E:\Recovered.'; $ok = $false }
+        elseif ($src) {
+            $sv = [AWiper.Native]::VolumeId("$($src.Drive)\")
+            $dv = [AWiper.Native]::VolumeId($dest)
+            if ($sv -and $dv -and $sv -eq $dv) { $msg = "That folder is on $($src.Drive), the drive you're scanning. Saving there could overwrite the files you're trying to get back. Pick a folder on a different drive."; $ok = $false }
+        }
+    } else { $ok = $false }
+    $ui.DeepDestMsg.Text = $msg
+    $ui.DeepDestMsg.Foreground = $script:Res.Danger
+    $ui.DeepDestMsg.Visibility = if ($msg) { 'Visible' } else { 'Collapsed' }
+
+    $argv = Get-AWDeepArgs
+    $ui.DeepCmd.Text = if ($argv) { 'winfr ' + ($argv -join ' ') } else { 'Pick a drive to scan.' }
+
+    if ($src) {
+        $v = Get-AWDriveVerdict $src; $c = Get-AWVerdictColors $v.Level
+        $ui.DeepVerdict.Text = $v.Text; $ui.DeepVerdict.Foreground = $c.Fg
+        $ui.DeepVerdictBox.Background = New-Brush $c.Bg; $ui.DeepVerdictBox.BorderBrush = New-Brush $c.Border
+        $ui.DeepVerdictBox.Visibility = 'Visible'
+    } else { $ui.DeepVerdictBox.Visibility = 'Collapsed' }
+
+    $ui.DeepStart.IsEnabled = $ok -and [bool]$script:WinfrPath -and $script:IsAdmin -and -not $script:DeepRunning -and -not (Test-AWRemote)
+    $ui.DeepStart.ToolTip = if (-not $script:IsAdmin) { 'Deep scan needs administrator rights.' } elseif (-not $script:WinfrPath) { 'Install Windows File Recovery first.' } else { $null }
+    [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($ui.DeepStart, $true)
+}
+
+function Start-AWDeepScan {
+    $src = $script:DeepSource
+    $argv = Get-AWDeepArgs
+    if (-not $src -or -not $argv) { return }
+    $dest = $ui.DeepDest.Text.Trim()
+    $v = Get-AWDriveVerdict $src
+    $warn = if ($v.Level -eq 'Bad') { "`n`nHeads up: $($v.Text)" } else { '' }
+    $filters = @($ui.DeepFilter.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $what = if ($filters.Count) { $filters -join ', ' } else { 'everything it can find' }
+    if (-not (Confirm-AW "Scan $($src.Drive) for $what and save results to $dest?$warn`n`nAvoid using $($src.Drive) until this finishes.")) { return }
+    if (-not (Test-Path -LiteralPath $dest)) { try { New-Item -ItemType Directory -Path $dest -Force | Out-Null } catch { Show-AWMessage "Could not create $($dest): $($_.Exception.Message)" 'Error'; return } }
+
+    $script:DeepRunning = $true
+    $ui.DeepStop.IsEnabled = $true
+    Update-AWDeep
+    Start-AWTask -Name 'Windows File Recovery' -Arguments @{ Exe = $script:WinfrPath; ArgLine = ($argv -join ' ') } -Work {
+        Write-WLog "winfr $ArgLine"
+        $psi = New-Object System.Diagnostics.ProcessStartInfo($Exe, $ArgLine)
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $Sync.WinfrPid = $p.Id
+        $p.StandardInput.Close()
+        $errText = $p.StandardError.ReadToEndAsync()
+        while ($null -ne ($line = $p.StandardOutput.ReadLine())) {
+            $l = ($line -replace "`0", '').Trim()
+            if (-not $l) { continue }
+            if ($l -match '(\d+(\.\d+)?)\s*%') { $Sync.Progress = [int][double]$Matches[1]; $Sync.Status = "Windows File Recovery - $l"; continue }
+            Write-WLog "winfr: $l"
+        }
+        $p.WaitForExit()
+        $e = ($errText.Result -replace "`0", '').Trim()
+        if ($e) { foreach ($x in ($e -split "`r?`n" | Where-Object { $_.Trim() })) { Write-WLog "winfr: $x" 'WARN' } }
+        $Sync.WinfrPid = 0
+        "Windows File Recovery finished (exit code $($p.ExitCode))"
+    } -OnComplete {
+        param($r)
+        $script:DeepRunning = $false
+        $ui.DeepStop.IsEnabled = $false
+        Update-AWDeep
+        $msg = @($r | Where-Object { $_ }) | Select-Object -Last 1
+        $script:IdleStatus = if ($msg) { "$msg - see Activity log" } else { 'Windows File Recovery stopped - see Activity log' }
+        if (Confirm-AW "Recovery finished. Open the destination folder?`n`nRecovered files are in a Recovery_<date> folder there.") { Open-AWExplorer $ui.DeepDest.Text.Trim() }
+    }
+}
+
+# ---------------- Tabs, remote handling, wiring
+function Update-AWRecoveryButtons {
+    $remote = Test-AWRemote
+    $ui.BinRestore.IsEnabled = $true
+    $ui.BinRestoreTo.IsEnabled = -not $remote
+    $ui.BinOpen.IsEnabled = -not $remote
+    $ui.RecTabShadow.IsEnabled = -not $remote
+    $ui.RecTabDeep.IsEnabled = -not $remote
+    $tip = if ($remote) { 'Only available on this PC' } else { $null }
+    foreach ($c in @($ui.RecTabShadow, $ui.RecTabDeep, $ui.BinRestoreTo, $ui.BinOpen)) {
+        $c.ToolTip = $tip; [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($c, $true)
+    }
+    if ($remote -and -not $ui.RecTabBin.IsChecked) { $ui.RecTabBin.IsChecked = $true }
+}
+
+function Show-AWRecoveryTab([string]$Tab) {
+    $ui.RecPanelBin.Visibility    = if ($Tab -eq 'Bin')    { 'Visible' } else { 'Collapsed' }
+    $ui.RecPanelShadow.Visibility = if ($Tab -eq 'Shadow') { 'Visible' } else { 'Collapsed' }
+    $ui.RecPanelDeep.Visibility   = if ($Tab -eq 'Deep')   { 'Visible' } else { 'Collapsed' }
+    if (-not $script:RecLoadedTabs[$Tab]) {
+        $script:RecLoadedTabs[$Tab] = $true
+        if ($Tab -eq 'Shadow') { Update-AWShadowList }
+        if ($Tab -eq 'Deep')   { Update-AWWinfrStatus }
+    }
+}
+
+function Initialize-AWRecovery {
+    $script:RecLoadedTabs = @{ Bin = $true }
+    $script:BinItems = @(); $ui.BinList.ItemsSource = $null
+    if (-not $ui.ShadowFolder.Text) { $ui.ShadowFolder.Text = [Environment]::GetFolderPath('MyDocuments') }
+    Update-AWRecoveryButtons
+    Update-AWRecoveryDrives
+    Update-AWBinList
+    if ($ui.RecTabShadow.IsChecked) { Show-AWRecoveryTab 'Shadow' } elseif ($ui.RecTabDeep.IsChecked) { Show-AWRecoveryTab 'Deep' }
+}
+
+$ui.RecTabBin.Add_Checked({ Show-AWRecoveryTab 'Bin' })
+$ui.RecTabShadow.Add_Checked({ Show-AWRecoveryTab 'Shadow' })
+$ui.RecTabDeep.Add_Checked({ Show-AWRecoveryTab 'Deep' })
+
+$ui.BinSearch.Add_TextChanged({ Update-AWBinView })
+$ui.BinRefresh.Add_Click({ Update-AWBinList })
+$ui.BinRestore.Add_Click({ Start-AWBinRestore '' })
+$ui.BinRestoreTo.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Restore the checked items into this folder'
+    if ($dlg.ShowDialog() -eq 'OK') { Start-AWBinRestore $dlg.SelectedPath }
+})
+$ui.BinOpen.Add_Click({
+    $i = $ui.BinList.SelectedItem
+    if (-not $i) { Show-AWMessage 'Select an item first.'; return }
+    if (Test-Path -LiteralPath $i.Folder) { Open-AWExplorer $i.Folder } else { Show-AWMessage "$($i.Folder) no longer exists. Restoring the item will recreate it." }
+})
+
+$ui.ShadowRefresh.Add_Click({ Update-AWShadowList })
+$ui.ShadowFind.Add_Click({ Start-AWShadowFind })
+$ui.ShadowFolder.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return') { $e.Handled = $true; Start-AWShadowFind } })
+$ui.ShadowRestore.Add_Click({ Start-AWShadowCopy '' })
+$ui.ShadowCopyTo.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Copy the checked files into this folder (subfolders are kept)'
+    if ($dlg.ShowDialog() -eq 'OK') { Start-AWShadowCopy $dlg.SelectedPath }
+})
+$ui.ShadowExplore.Add_Click({
+    $s = $ui.ShadowList.SelectedItem
+    if (-not $s) { Show-AWMessage 'Pick a snapshot first.'; return }
+    try { Open-AWExplorer (Mount-AWShadow $s) } catch { Show-AWMessage $_.Exception.Message 'Error' }
+})
+$ui.ShadowProtect.Add_Click({ Start-Process SystemPropertiesProtection.exe })
+
+$ui.WinfrInstall.Add_Click({
+    $ui.WinfrInstall.IsEnabled = $false
+    $ui.WinfrStatus.Text = 'Installing Windows File Recovery from the Microsoft Store...'
+    Start-AWTask -Name 'Install Windows File Recovery' -Work {
+        & winget.exe install --id 9N26S50LN705 --source msstore --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | ForEach-Object {
+            $l = ("$_" -replace "`0", '').Trim()
+            if ($l -and $l -notmatch '^[\s\-\\|/]+$' -and $l -notmatch '[\u2580-\u259F]') { Write-WLog "winget: $l" }
+        }
+        "winget exit code $LASTEXITCODE"
+    } -OnComplete {
+        param($r)
+        $ui.WinfrInstall.IsEnabled = $true
+        Update-AWWinfrStatus
+        if (-not $script:WinfrPath) {
+            if (Confirm-AW "Windows File Recovery didn't install automatically (see the Activity log). Open its Microsoft Store page instead?") { Start-Process 'ms-windows-store://pdp/?productid=9N26S50LN705' }
+        }
+    }
+})
+$ui.WinfrStore.Add_Click({ Start-Process 'ms-windows-store://pdp/?productid=9N26S50LN705' })
+$ui.DeepBrowse.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Save recovered files here (must be on a different drive)'
+    $dlg.ShowNewFolderButton = $true
+    if ($dlg.ShowDialog() -eq 'OK') { $ui.DeepDest.Text = $dlg.SelectedPath }
+})
+$ui.DeepDest.Add_TextChanged({ Update-AWDeep })
+$ui.DeepFilter.Add_TextChanged({ Update-AWDeep })
+$ui.DeepRegular.Add_Checked({ Update-AWDeep })
+$ui.DeepExtensive.Add_Checked({ Update-AWDeep })
+$ui.DeepStart.Add_Click({ Start-AWDeepScan })
+$ui.DeepStop.Add_Click({
+    if ($Sync.WinfrPid -and (Confirm-AW 'Stop Windows File Recovery? Files recovered so far stay in the destination folder.')) {
+        Stop-Process -Id $Sync.WinfrPid -Force -ErrorAction SilentlyContinue
+        Write-AWLog 'Windows File Recovery stopped by user' 'WARN'
+    }
+})
+$ui.DeepOpenDest.Add_Click({
+    $d = $ui.DeepDest.Text.Trim()
+    if ($d -and (Test-Path -LiteralPath $d)) { Open-AWExplorer $d } else { Show-AWMessage 'The destination folder does not exist yet.' }
+})
+#endregion
+
 #region ---------------------------------------------------------------- Column sorting
 function Enable-AWSort($ListView, [hashtable]$Map) {
     $ListView.Tag = $Map
@@ -3809,6 +4687,8 @@ Enable-AWSort $ui.ProgList     @{ Name = 'Name'; Publisher = 'Publisher'; Versio
 Enable-AWSort $ui.StartupList  @{ Name = 'Name'; Scope = 'Scope'; Source = 'Location'; Status = 'Enabled' }
 Enable-AWSort $ui.CleanResults @{ Item = 'Name'; Group = 'Group'; Size = 'Bytes' }
 Enable-AWSort $ui.AppList      @{ App = 'Name'; Category = 'Category'; Notes = 'Note' }
+Enable-AWSort $ui.BinList      @{ Name = 'Name'; Type = 'Kind'; Size = 'Size'; Deleted = 'Deleted'; 'Deleted by' = 'Owner'; 'Original location' = 'Folder' }
+Enable-AWSort $ui.ShadowResults @{ Name = 'Name'; Status = 'Status'; Size = 'Size'; Modified = 'Modified'; Folder = 'Folder' }
 #endregion
 
 #region ---------------------------------------------------------------- Startup + run
@@ -3819,6 +4699,7 @@ $window.Add_Loaded({
         Initialize-AWMapDrives
         Initialize-AWTools
         Initialize-AWTweaks
+        Dismount-AWShadows   # links left behind by a previous session that didn't close cleanly
     } catch { Write-AWLog "Startup: $($_.Exception.Message)" 'ERROR' }
     $script:Timer.Start()
     Write-AWLog ("AWiper {0} started - {1} - PowerShell {2}" -f $script:AppVersion, $(if ($script:IsAdmin) { 'administrator' } else { 'standard user' }), $PSVersionTable.PSVersion)
@@ -3829,6 +4710,8 @@ $window.Add_Loaded({
 
 $window.Add_Closing({
     if ($script:Scanner) { $script:Scanner.Cancel = $true }
+    if ($Sync.WinfrPid) { Stop-Process -Id $Sync.WinfrPid -Force -ErrorAction SilentlyContinue }
+    Dismount-AWShadows
     $script:Timer.Stop()
     Update-AWLogView
     foreach ($j in $script:Jobs) { try { $j.PS.Stop(); $j.PS.Dispose(); $j.Runspace.Dispose() } catch { } }
