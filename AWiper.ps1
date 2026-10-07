@@ -11,7 +11,12 @@
       * Large Files  - the 1,000 largest files from the last scan, searchable, recycle or export
       * Startup      - enable / disable startup entries (same StartupApproved switches Task Manager uses)
       * Programs     - installed software list with size, search and uninstall
-      * Tools        - DNS flush, component store cleanup, restore point, Explorer restart, activity log
+      * Debloat      - remove preinstalled Store apps, turn off ads, suggestions, Copilot and other extras
+      * Tools        - quick fixes (DNS, Group Policy, Explorer), repair (SFC, DISM, Windows Update reset,
+                       ConfigMgr client), maintenance (component store, restore point, hibernation), activity log
+
+    AWiper can also work on another computer over PowerShell remoting (WinRM). Pick the target from
+    the button in the title bar; credentials can be saved to Windows Credential Manager.
 
     On launch AWiper asks for administrator rights (UAC). If the prompt is declined or
     elevation is not possible, it keeps running with standard permissions and simply
@@ -39,7 +44,7 @@
 
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.0.0
+    Version : 1.1.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -52,7 +57,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.0.0'
+$script:AppVersion = '1.1.0'
 
 #region ---------------------------------------------------------------- Elevation / STA
 function Test-AWAdmin {
@@ -164,6 +169,20 @@ namespace AWiper
         public bool IsChecked { get; set; }
         public string SizeText { get { return Fmt.Size(Size); } }
         public string ModifiedText { get { return Modified == DateTime.MinValue ? "" : Modified.ToString("yyyy-MM-dd HH:mm"); } }
+    }
+
+    public class AppEntry
+    {
+        public string Name { get; set; }
+        public string Package { get; set; }
+        public string FullName { get; set; }
+        public string Version { get; set; }
+        public string Publisher { get; set; }
+        public string Category { get; set; }
+        public string Note { get; set; }
+        public bool Recommended { get; set; }
+        public bool Provisioned { get; set; }
+        public bool IsChecked { get; set; }
     }
 
     public class ExtStat
@@ -383,6 +402,80 @@ namespace AWiper
         }
     }
 
+    // Windows Credential Manager (generic credentials), used for saved remote connections.
+    public static class CredMan
+    {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct CREDENTIAL
+        {
+            public uint Flags; public uint Type; public string TargetName; public string Comment;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+            public uint CredentialBlobSize; public IntPtr CredentialBlob; public uint Persist;
+            public uint AttributeCount; public IntPtr Attributes; public string TargetAlias; public string UserName;
+        }
+        [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredWrite(ref CREDENTIAL cred, uint flags);
+        [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredRead(string target, uint type, uint flags, out IntPtr cred);
+        [DllImport("advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredDelete(string target, uint type, uint flags);
+        [DllImport("advapi32.dll", EntryPoint = "CredEnumerateW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredEnumerate(string filter, uint flags, out uint count, out IntPtr creds);
+        [DllImport("advapi32.dll")] private static extern void CredFree(IntPtr buffer);
+
+        private const uint Generic = 1, PersistLocalMachine = 2;
+
+        public static void Write(string target, string user, string password)
+        {
+            byte[] blob = System.Text.Encoding.Unicode.GetBytes(password ?? "");
+            var c = new CREDENTIAL();
+            c.Type = Generic; c.TargetName = target; c.UserName = user; c.Persist = PersistLocalMachine;
+            c.Comment = "Saved by AWiper for remote connections";
+            c.CredentialBlobSize = (uint)blob.Length;
+            c.CredentialBlob = Marshal.AllocHGlobal(Math.Max(1, blob.Length));
+            try
+            {
+                Marshal.Copy(blob, 0, c.CredentialBlob, blob.Length);
+                if (!CredWrite(ref c, 0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            }
+            finally { Marshal.FreeHGlobal(c.CredentialBlob); }
+        }
+
+        // Returns { user, password } or null.
+        public static string[] Read(string target)
+        {
+            IntPtr p;
+            if (!CredRead(target, Generic, 0, out p)) return null;
+            try
+            {
+                var c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));
+                string pw = c.CredentialBlobSize > 0 ? Marshal.PtrToStringUni(c.CredentialBlob, (int)c.CredentialBlobSize / 2) : "";
+                return new string[] { c.UserName, pw };
+            }
+            finally { CredFree(p); }
+        }
+
+        public static bool Delete(string target) { return CredDelete(target, Generic, 0); }
+
+        public static string[] List(string filter)
+        {
+            uint n; IntPtr arr;
+            var names = new List<string>();
+            if (!CredEnumerate(filter, 0, out n, out arr)) return names.ToArray();
+            try
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    IntPtr cp = Marshal.ReadIntPtr(arr, i * IntPtr.Size);
+                    var c = (CREDENTIAL)Marshal.PtrToStructure(cp, typeof(CREDENTIAL));
+                    names.Add(c.TargetName);
+                }
+            }
+            finally { CredFree(arr); }
+            return names.ToArray();
+        }
+    }
+
     public static class Native
     {
         [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
@@ -412,13 +505,14 @@ $script:LogFile   = Join-Path $script:DataDir 'AWiper.log'
 $script:StateFile = Join-Path $script:DataDir 'state.json'
 if (-not (Test-Path -LiteralPath $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
 
-$script:State = @{ TotalFreed = [long]0; Cleans = 0; LastClean = '' }
+$script:State = @{ TotalFreed = [long]0; Cleans = 0; LastClean = ''; RecentTargets = @() }
 try {
     if (Test-Path -LiteralPath $script:StateFile) {
         $j = Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json
         $script:State.TotalFreed = [long]$j.TotalFreed
         $script:State.Cleans     = [int]$j.Cleans
         $script:State.LastClean  = if ($j.LastClean -is [datetime]) { $j.LastClean.ToString('o') } else { [string]$j.LastClean }
+        if ($j.RecentTargets) { $script:State.RecentTargets = @($j.RecentTargets | ForEach-Object { [string]$_ }) }
     }
 } catch { }
 
@@ -444,7 +538,70 @@ function Format-AWSize([long]$Bytes) { [AWiper.Fmt]::Size($Bytes) }
 $Sync.WorkerLib = @'
 function Write-WLog {
     param([string]$Message, [string]$Level = 'INFO')
-    $Sync.Log.Enqueue(('{0:HH:mm:ss}  {1,-5}  {2}' -f (Get-Date), $Level, $Message))
+    $line = '{0:HH:mm:ss}  {1,-5}  {2}' -f (Get-Date), $Level, $Message
+    # On a remote machine the line travels back on the information stream (see Invoke-WTarget).
+    if ($Sync.Remote) { Write-Information -MessageData $line -InformationAction SilentlyContinue }
+    else { $Sync.Log.Enqueue($line) }
+}
+
+function Format-WSize([long]$Bytes) {
+    if ($Bytes -lt 1024) { return "$Bytes B" }
+    $u = 'KB', 'MB', 'GB', 'TB', 'PB'; $d = $Bytes / 1024.0; $i = 0
+    while ($d -ge 1024 -and $i -lt $u.Count - 1) { $d /= 1024; $i++ }
+    $f = if ($d -ge 100) { '0' } elseif ($d -ge 10) { '0.0' } else { '0.00' }
+    $d.ToString($f, [Globalization.CultureInfo]::InvariantCulture) + ' ' + $u[$i]
+}
+
+# Runs a script block on the current target: locally, or over WinRM when $Target is set.
+# Remotely, this worker library is loaded first so the same helper functions are available.
+function Invoke-WTarget {
+    param([scriptblock]$Script, [object[]]$ArgumentList = @())
+    if (-not $Target) { return & $Script @ArgumentList }
+    $wrapper = {
+        param($Lib, $Body, $Argz)
+        $Sync = @{ Remote = $true }
+        . ([scriptblock]::Create($Lib))
+        & ([scriptblock]::Create($Body)) @Argz
+    }
+    $p = @{ ComputerName = $Target.Host; ScriptBlock = $wrapper; ArgumentList = @($Sync.WorkerLib, $Script.ToString(), $ArgumentList); ErrorAction = 'Stop' }
+    if ($Target.Credential) { $p.Credential = $Target.Credential }
+    Invoke-Command @p 6>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.InformationRecord]) { $Sync.Log.Enqueue(('{0}  [{1}]' -f $_.MessageData, $Target.Host)) }
+        else { $_ }
+    }
+}
+
+function Get-WRegValue([string]$Path, [string]$Name) {
+    try {
+        $k = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $k.GetValue($(if ($Name -eq '(default)') { '' } else { $Name }), $null)
+    } catch { $null }
+}
+
+function Test-WTweak($Tweak) {
+    foreach ($v in $Tweak.Values) {
+        $cur = Get-WRegValue $v.Path $v.Name
+        if ($null -eq $cur -or "$cur" -ne "$($v.Value)") { return $false }
+    }
+    $true
+}
+
+function Set-WTweak($Tweak, [bool]$Apply) {
+    foreach ($v in $Tweak.Values) {
+        if ($Apply -or $null -ne $v.Revert) {
+            $val = if ($Apply) { $v.Value } else { $v.Revert }
+            if (-not (Test-Path -LiteralPath $v.Path)) { New-Item -Path $v.Path -Force | Out-Null }
+            if ($v.Name -eq '(default)') { Set-Item -LiteralPath $v.Path -Value $val }
+            else { New-ItemProperty -LiteralPath $v.Path -Name $v.Name -PropertyType $v.Type -Value $val -Force | Out-Null }
+        }
+        elseif ($v.Name -ne '(default)') {
+            Remove-ItemProperty -LiteralPath $v.Path -Name $v.Name -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not $Apply) {
+        foreach ($k in $Tweak.RemoveKeys) { if ($k -like 'HK*:\Software\Classes\CLSID\{*}') { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction SilentlyContinue } }
+    }
+    Write-WLog ('{0} tweak: {1}' -f $(if ($Apply) { 'Applied' } else { 'Reverted' }), $Tweak.Name)
 }
 
 function Resolve-WTarget([string]$Path) {
@@ -574,7 +731,7 @@ function Invoke-WClean($Item) {
     }
 
     if ($res.Failed -gt 0 -and -not $res.Note) { $res.Note = "$($res.Failed) file(s) in use or locked - skipped" }
-    Write-WLog ("{0}: removed {1} file(s), {2}" -f $Item.Name, $res.Files, [AWiper.Fmt]::Size($res.Bytes))
+    Write-WLog ("{0}: removed {1} file(s), {2}" -f $Item.Name, $res.Files, (Format-WSize $res.Bytes))
     $res
 }
 '@
@@ -620,6 +777,153 @@ $script:CleanerRules = @(
     New-AWRule 'Recent'     'Privacy' 'Recent items list'       'Shortcuts in the Recent Items list (the files themselves are untouched).' -Targets (T '%APPDATA%\Microsoft\Windows\Recent' '*.lnk' $false) -Default $false
     New-AWRule 'Clipboard'  'Privacy' 'Clipboard'               'Clears the current clipboard contents.' -Kind 'Action' -Action 'Clipboard' -Default $false
     New-AWRule 'Dns'        'Privacy' 'DNS resolver cache'      'Flushes cached DNS lookups (ipconfig /flushdns).' -Kind 'Action' -Action 'FlushDns' -Default $false
+)
+#endregion
+
+#region ---------------------------------------------------------------- Debloat catalog
+# Store apps AWiper knows about. Pattern is matched against the package Name with -like.
+# Recommended = pre-checked. Anything not listed only appears with "Show all apps".
+function A([string]$Pattern, [string]$Name, [string]$Category, [bool]$Recommended = $true, [string]$Note = '') {
+    @{ Pattern = $Pattern; Name = $Name; Category = $Category; Recommended = $Recommended; Note = $Note }
+}
+$script:BloatCatalog = @(
+    A 'Microsoft.BingNews'                      'Microsoft News'            'Microsoft'
+    A 'Microsoft.BingWeather'                   'Weather'                   'Microsoft'
+    A 'Microsoft.BingFinance'                   'Money'                     'Microsoft'
+    A 'Microsoft.BingSports'                    'Sports'                    'Microsoft'
+    A 'Microsoft.BingSearch'                    'Bing Search'               'Microsoft'
+    A 'Microsoft.BingTravel'                    'Travel'                    'Microsoft'
+    A 'Microsoft.News'                          'News'                      'Microsoft'
+    A 'Microsoft.GetHelp'                       'Get Help'                  'Microsoft'
+    A 'Microsoft.Getstarted'                    'Tips'                      'Microsoft'
+    A 'Microsoft.MicrosoftOfficeHub'            'Microsoft 365 (Office hub)' 'Microsoft'
+    A 'Microsoft.MicrosoftSolitaireCollection'  'Solitaire Collection'      'Microsoft'
+    A 'Microsoft.People'                        'People'                    'Microsoft'
+    A 'Microsoft.PowerAutomateDesktop'          'Power Automate'            'Microsoft'
+    A 'Microsoft.Todos'                         'Microsoft To Do'           'Microsoft'
+    A 'Microsoft.WindowsFeedbackHub'            'Feedback Hub'              'Microsoft'
+    A 'Microsoft.WindowsMaps'                   'Maps'                      'Microsoft'
+    A 'Microsoft.549981C3F5F10'                 'Cortana'                   'Microsoft'
+    A 'Microsoft.MixedReality.Portal'           'Mixed Reality Portal'      'Microsoft'
+    A 'Microsoft.SkypeApp'                      'Skype'                     'Microsoft'
+    A 'Microsoft.Office.OneNote'                'OneNote for Windows 10'    'Microsoft'
+    A 'Microsoft.Office.Sway'                   'Sway'                      'Microsoft'
+    A 'Microsoft.3DBuilder'                     '3D Builder'                'Microsoft'
+    A 'Microsoft.Microsoft3DViewer'             '3D Viewer'                 'Microsoft'
+    A 'Microsoft.Print3D'                       'Print 3D'                  'Microsoft'
+    A 'Microsoft.Messaging'                     'Messaging'                 'Microsoft'
+    A 'Microsoft.Wallet'                        'Wallet'                    'Microsoft'
+    A 'Microsoft.NetworkSpeedTest'              'Network Speed Test'        'Microsoft'
+    A 'Microsoft.MicrosoftJournal'              'Journal'                   'Microsoft'
+    A 'Microsoft.ZuneVideo'                     'Movies and TV'             'Microsoft'
+    A 'Microsoft.Copilot'                       'Copilot'                   'Microsoft'
+    A 'Microsoft.Windows.DevHome'               'Dev Home'                  'Microsoft'
+    A 'Microsoft.WindowsCommunicationsApps'     'Mail and Calendar'         'Microsoft'
+    A 'Clipchamp.Clipchamp'                     'Clipchamp'                 'Microsoft'
+    A 'MicrosoftCorporationII.MicrosoftFamily'  'Family Safety'             'Microsoft'
+    A 'MicrosoftTeams'                          'Teams (personal)'          'Microsoft'
+    A 'Microsoft.OutlookForWindows'             'Outlook (new)'             'Microsoft' $false 'Keep if you use it for mail'
+    A 'MSTeams'                                 'Teams (work or school)'    'Microsoft' $false 'Keep if your organization uses Teams'
+    A 'Microsoft.ZuneMusic'                     'Media Player'              'Microsoft' $false 'Default music and video player'
+    A 'Microsoft.YourPhone'                     'Phone Link'                'Microsoft' $false
+    A 'Microsoft.WindowsSoundRecorder'          'Sound Recorder'            'Microsoft' $false
+    A 'Microsoft.MicrosoftStickyNotes'          'Sticky Notes'              'Microsoft' $false
+    A 'Microsoft.WindowsAlarms'                 'Clock'                     'Microsoft' $false
+    A 'MicrosoftCorporationII.QuickAssist'      'Quick Assist'              'Microsoft' $false 'Used for remote support'
+    A 'Microsoft.GamingApp'                     'Xbox app'                  'Gaming'    $false 'Needed for Game Pass PC games'
+    A 'Microsoft.XboxApp'                       'Xbox Console Companion'    'Gaming'
+    A 'Microsoft.XboxGamingOverlay'             'Xbox Game Bar'             'Gaming'    $false 'Win+G overlay and screen capture'
+
+    A 'SpotifyAB.SpotifyMusic'                  'Spotify'                   'Third-party'
+    A 'Disney.37853FC22B2CE'                    'Disney+'                   'Third-party'
+    A '4DF9E0F8.Netflix'                        'Netflix'                   'Third-party'
+    A 'AmazonVideo.PrimeVideo'                  'Prime Video'               'Third-party'
+    A '*.AmazonAlexa'                           'Alexa'                     'Third-party'
+    A 'king.com.*'                              'King games (Candy Crush)'  'Third-party'
+    A 'Facebook.*'                              'Facebook'                  'Third-party'
+    A 'FACEBOOK.*'                              'Facebook'                  'Third-party'
+    A '*.Instagram'                             'Instagram'                 'Third-party'
+    A 'BytedancePte.Ltd.TikTok'                 'TikTok'                    'Third-party'
+    A '*.Twitter'                               'X (Twitter)'               'Third-party'
+    A '7EE7776C.LinkedInforWindows'             'LinkedIn'                  'Third-party'
+    A '*.Duolingo-LearnLanguagesforFree'        'Duolingo'                  'Third-party'
+    A '*.PicsArt-PhotoStudio'                   'PicsArt'                   'Third-party'
+    A '*.Flipboard'                             'Flipboard'                 'Third-party'
+    A '*.HiddenCity*'                           'Hidden City'               'Third-party'
+    A '*.MarchofEmpires'                        'March of Empires'          'Third-party'
+    A '*.Asphalt*'                              'Asphalt'                   'Third-party'
+    A '*.CaesarsSlotsFreeCasino'                'Caesars Slots'             'Third-party'
+    A '*.ROBLOXCORPORATION.ROBLOX'              'Roblox'                    'Third-party' $false
+)
+
+# Packages never offered for removal, even with "Show all apps".
+$script:ProtectedApps = @(
+    'Microsoft.WindowsStore', 'Microsoft.StorePurchaseApp', 'Microsoft.DesktopAppInstaller', 'Microsoft.SecHealthUI',
+    'Microsoft.Windows.Photos', 'Microsoft.WindowsCalculator', 'Microsoft.WindowsNotepad', 'Microsoft.WindowsTerminal',
+    'Microsoft.Paint', 'Microsoft.ScreenSketch', 'Microsoft.WindowsCamera', 'Microsoft.HEIFImageExtension',
+    'Microsoft.HEVCVideoExtension', 'Microsoft.VP9VideoExtensions', 'Microsoft.WebMediaExtensions', 'Microsoft.WebpImageExtension',
+    'Microsoft.RawImageExtension', 'Microsoft.AV1VideoExtension', 'Microsoft.AVCEncoderVideoExtension', 'Microsoft.MPEG2VideoExtension',
+    'Microsoft.Xbox.TCUI', 'Microsoft.XboxIdentityProvider', 'Microsoft.XboxSpeechToTextOverlay', 'Microsoft.XboxGameOverlay',
+    'Microsoft.WindowsAppRuntime*', 'Microsoft.VCLibs*', 'Microsoft.UI.Xaml*', 'Microsoft.NET.*', 'Microsoft.Services.Store.Engagement',
+    'Microsoft.MicrosoftEdge*', 'Microsoft.Windows.*', 'Microsoft.AAD.BrokerPlugin', 'Microsoft.AccountsControl', 'Microsoft.LockApp',
+    'Microsoft.ApplicationCompatibilityEnhancements', 'Microsoft.OneDriveSync', 'MicrosoftWindows.*', 'windows.*', 'Windows.*',
+    'Microsoft.Winget.*', 'Microsoft.LanguageExperiencePack*', 'Microsoft.WidgetsPlatformRuntime', 'Microsoft.StartExperiencesApp'
+)
+
+# Registry tweaks. Each value: Path / Name / Type / Value / Revert ($null = delete the value on revert).
+# RemoveKeys are deleted on revert (used where the tweak creates a key whose presence is the setting).
+function New-AWTweak {
+    param($Id, $Group, $Name, $Desc, $Values, [bool]$Admin = $false, [bool]$Default = $true, [bool]$Explorer = $false, $RemoveKeys = @())
+    @{ Id = $Id; Group = $Group; Name = $Name; Desc = $Desc; Values = @($Values); Admin = $Admin; Default = $Default; Explorer = $Explorer; RemoveKeys = @($RemoveKeys) }
+}
+function RegV([string]$Path, [string]$Name, $Value, $Revert = $null, [string]$Type = 'DWord') {
+    @{ Path = $Path; Name = $Name; Type = $Type; Value = $Value; Revert = $Revert }
+}
+$cdm = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
+$adv = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+$classicMenu = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+
+$script:Tweaks = @(
+    New-AWTweak 'Telemetry' 'Privacy' 'Limit telemetry' 'Sets diagnostic data to the lowest level this edition allows (machine policy).' -Admin $true -Values @(
+        (RegV 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' 0))
+    New-AWTweak 'AdId' 'Privacy' 'Disable advertising ID' 'Stops apps from using your advertising ID and diagnostic data for personalized ads and tips.' -Values @(
+        (RegV 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0 1)
+        (RegV 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy' 'TailoredExperiencesWithDiagnosticDataEnabled' 0 1))
+    New-AWTweak 'Suggestions' 'Privacy' 'Disable tips, ads and suggestions' 'Removes suggested apps in Start, tips on the lock screen and in Settings, and silent app installs.' -Values @(
+        (RegV $cdm 'SubscribedContent-338388Enabled' 0 1), (RegV $cdm 'SubscribedContent-338389Enabled' 0 1),
+        (RegV $cdm 'SubscribedContent-353694Enabled' 0 1), (RegV $cdm 'SubscribedContent-353696Enabled' 0 1),
+        (RegV $cdm 'SubscribedContent-310093Enabled' 0 1), (RegV $cdm 'SystemPaneSuggestionsEnabled' 0 1),
+        (RegV $cdm 'SilentInstalledAppsEnabled' 0 1), (RegV $cdm 'SoftLandingEnabled' 0 1),
+        (RegV $cdm 'RotatingLockScreenOverlayEnabled' 0 1),
+        (RegV 'HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement' 'ScoobeSystemSettingEnabled' 0 1))
+    New-AWTweak 'StartRecs' 'Privacy' 'Hide Start menu recommendations' 'Stops promoted apps and websites in the Recommended section of Start.' -Values @(
+        (RegV $adv 'Start_IrisRecommendations' 0 1))
+
+    New-AWTweak 'BingSearch' 'Search and AI' 'Disable Bing in Start search' 'Start search only looks at your PC instead of sending queries to Bing.' -Admin $true -Values @(
+        (RegV 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0 1)
+        (RegV 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1))
+    New-AWTweak 'Copilot' 'Search and AI' 'Turn off Copilot' 'Disables Windows Copilot and hides its taskbar button.' -Admin $true -Explorer $true -Values @(
+        (RegV 'HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1)
+        (RegV $adv 'ShowCopilotButton' 0 1))
+    New-AWTweak 'Recall' 'Search and AI' 'Turn off Recall snapshots' 'Stops Windows Recall from saving snapshots on Copilot+ PCs.' -Admin $true -Values @(
+        (RegV 'HKCU:\Software\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1))
+
+    New-AWTweak 'Widgets' 'Taskbar and Explorer' 'Remove Widgets' 'Hides the Widgets (news and weather) board and its taskbar button.' -Admin $true -Explorer $true -Values @(
+        (RegV 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0))
+    New-AWTweak 'Chat' 'Taskbar and Explorer' 'Hide Chat button' 'Removes the Teams Chat button from the taskbar.' -Explorer $true -Values @(
+        (RegV $adv 'TaskbarMn' 0 1))
+    New-AWTweak 'TaskView' 'Taskbar and Explorer' 'Hide Task View button' 'Removes the Task View button. Win+Tab still works.' -Default $false -Explorer $true -Values @(
+        (RegV $adv 'ShowTaskViewButton' 0 1))
+    New-AWTweak 'SearchIcon' 'Taskbar and Explorer' 'Search as icon only' 'Shrinks the taskbar search box to an icon.' -Default $false -Explorer $true -Values @(
+        (RegV 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 1 2))
+    New-AWTweak 'AlignLeft' 'Taskbar and Explorer' 'Align taskbar to the left' 'Moves the Start button and taskbar icons back to the left edge.' -Default $false -Explorer $true -Values @(
+        (RegV $adv 'TaskbarAl' 0 1))
+    New-AWTweak 'ClassicMenu' 'Taskbar and Explorer' 'Classic right-click menu' 'Shows the full Windows 10 context menu without "Show more options".' -Default $false -Explorer $true -Values @(
+        (RegV "$classicMenu\InprocServer32" '(default)' '' $null 'String')) -RemoveKeys @($classicMenu)
+    New-AWTweak 'FileExt' 'Taskbar and Explorer' 'Show file extensions' 'Shows extensions like .exe and .pdf in File Explorer.' -Explorer $true -Values @(
+        (RegV $adv 'HideFileExt' 0 1))
+    New-AWTweak 'Hidden' 'Taskbar and Explorer' 'Show hidden files' 'Shows hidden files and folders in File Explorer.' -Default $false -Explorer $true -Values @(
+        (RegV $adv 'Hidden' 1 2))
 )
 #endregion
 
@@ -925,6 +1229,67 @@ $script:CleanerRules = @(
       </Setter>
     </Style>
 
+    <Style TargetType="PasswordBox">
+      <Setter Property="Background" Value="{StaticResource FieldBrush}"/>
+      <Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource LineBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="10,7"/>
+      <Setter Property="CaretBrush" Value="White"/>
+      <Setter Property="SelectionBrush" Value="#8B5CF6"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="PasswordBox">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8">
+              <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#19C3B1"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- Segmented choice (radio buttons that look like tabs) -->
+    <Style x:Key="SegBtn" TargetType="RadioButton">
+      <Setter Property="Foreground" Value="{StaticResource MutedBrush}"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RadioButton">
+            <Border x:Name="Bd" CornerRadius="8" Padding="12,8" Background="Transparent">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="Background" Value="#2C3556"/></Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{StaticResource TealGrad}"/>
+                <Setter Property="Foreground" Value="White"/><Setter Property="FontWeight" Value="SemiBold"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="LinkBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="{StaticResource TealBrush}"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <TextBlock x:Name="T" Text="{TemplateBinding Content}" Foreground="{TemplateBinding Foreground}"/>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="T" Property="TextDecorations" Value="Underline"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <!-- Slim scrollbars -->
     <Style TargetType="ScrollBar">
       <Setter Property="Width" Value="10"/><Setter Property="MinWidth" Value="10"/>
@@ -1113,6 +1478,14 @@ $script:CleanerRules = @(
         <TextBlock x:Name="ViewTitle" Grid.Column="1" Text="Dashboard" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"
                    VerticalAlignment="Center" Margin="14,0,0,0"/>
         <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,0">
+          <Button x:Name="TargetBtn" Margin="0,0,10,0" Padding="11,5" FontSize="12" WindowChrome.IsHitTestVisibleInChrome="True"
+                  ToolTip="Choose which computer AWiper works on">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock x:Name="TargetIcon" Text="&#xE7F4;" Style="{StaticResource Icon}" FontSize="12" Foreground="{StaticResource TealBrush}"/>
+              <TextBlock x:Name="TargetText" Text="This PC" Margin="7,0,0,0"/>
+              <TextBlock Text="&#xE70D;" Style="{StaticResource Icon}" FontSize="9" Margin="8,1,0,0" Foreground="{StaticResource MutedBrush}"/>
+            </StackPanel>
+          </Button>
           <Border x:Name="AdminBadge" CornerRadius="13" Padding="11,5" BorderThickness="1" BorderBrush="#2E8F86" Background="#163A44">
             <StackPanel Orientation="Horizontal">
               <TextBlock x:Name="AdminIcon" Text="&#xEA18;" Style="{StaticResource Icon}" FontSize="12" Foreground="{StaticResource TealBrush}"/>
@@ -1153,6 +1526,7 @@ $script:CleanerRules = @(
               <TextBlock Text="SYSTEM" Style="{StaticResource Caps}" Margin="8,16,0,6"/>
               <RadioButton x:Name="NavStartup"  Style="{StaticResource NavBtn}" Tag="&#xE7E8;" Content="Startup"/>
               <RadioButton x:Name="NavPrograms" Style="{StaticResource NavBtn}" Tag="&#xE71D;" Content="Programs"/>
+              <RadioButton x:Name="NavDebloat"  Style="{StaticResource NavBtn}" Tag="&#xE71C;" Content="Debloat"/>
               <RadioButton x:Name="NavTools"    Style="{StaticResource NavBtn}" Tag="&#xE90F;" Content="Tools and Log"/>
             </StackPanel>
           </DockPanel>
@@ -1523,10 +1897,95 @@ $script:CleanerRules = @(
             </Border>
           </Grid>
 
+          <!-- ===== Debloat ===== -->
+          <Grid x:Name="ViewDebloat" Visibility="Collapsed">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Border Style="{StaticResource Card}" Padding="20,16">
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel>
+                  <TextBlock Text="Debloat Windows" Style="{StaticResource H2}"/>
+                  <TextBlock Text="Remove preinstalled Store apps and turn off ads, suggestions and AI features. Create a restore point first if you are making a lot of changes." Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                  <Button x:Name="DebloatRestore" Content="Create restore point" Style="{StaticResource BtnChip}"/>
+                  <Button x:Name="DebloatRefresh" Content="Refresh" Style="{StaticResource BtnChip}" Margin="0"/>
+                </StackPanel>
+              </Grid>
+            </Border>
+            <Grid Grid.Row="1" Margin="0,16,0,16">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="400"/></Grid.ColumnDefinitions>
+              <Border Style="{StaticResource Card}" Padding="14,12">
+                <DockPanel>
+                  <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <TextBlock Text="Store apps" Style="{StaticResource H2}" VerticalAlignment="Center"/>
+                    <TextBox x:Name="AppSearch" Grid.Column="1" Tag="Filter apps..." Margin="14,0,10,0"/>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                      <Button x:Name="AppsRecommended" Content="Recommended" Style="{StaticResource BtnChip}"/>
+                      <Button x:Name="AppsNone" Content="None" Style="{StaticResource BtnChip}" Margin="0"/>
+                    </StackPanel>
+                  </Grid>
+                  <Grid DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                      <CheckBox x:Name="AppsShowAll" Content="Show all apps" Margin="0,0,18,0"/>
+                      <CheckBox x:Name="AppsProvisioned" Content="Also remove for new users" IsChecked="True"
+                                ToolTip="Removes the provisioned copy so Windows does not reinstall the app for new accounts. Needs admin."/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                      <TextBlock x:Name="AppsInfo" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                      <Button x:Name="AppsRemove" Content="Remove checked" Style="{StaticResource BtnPurple}" Padding="14,6" FontSize="12"/>
+                    </StackPanel>
+                  </Grid>
+                  <ListView x:Name="AppList">
+                    <ListView.View>
+                      <GridView>
+                        <GridViewColumn Header="" Width="44">
+                          <GridViewColumn.CellTemplate><DataTemplate><CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}" Margin="4,0,0,0"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="App" Width="210">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Package}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Category" Width="100" DisplayMemberBinding="{Binding Category}"/>
+                        <GridViewColumn Header="Notes" Width="260">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                      </GridView>
+                    </ListView.View>
+                  </ListView>
+                </DockPanel>
+              </Border>
+              <Border Grid.Column="1" Style="{StaticResource Card}" Margin="16,0,0,0" Padding="16,14">
+                <DockPanel>
+                  <Grid DockPanel.Dock="Top">
+                    <TextBlock Text="Tweaks" Style="{StaticResource H2}" VerticalAlignment="Center"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                      <Button x:Name="TweaksDefault" Content="Defaults" Style="{StaticResource BtnChip}"/>
+                      <Button x:Name="TweaksNone" Content="None" Style="{StaticResource BtnChip}" Margin="0"/>
+                    </StackPanel>
+                  </Grid>
+                  <StackPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                    <CheckBox x:Name="TweaksRestartExplorer" Content="Restart Explorer to apply taskbar changes" IsChecked="True" Margin="0,0,0,10"/>
+                    <StackPanel Orientation="Horizontal">
+                      <Button x:Name="TweaksApply" Content="Apply checked" Style="{StaticResource BtnAccent}" Padding="16,7" FontSize="12" Margin="0,0,8,0"/>
+                      <Button x:Name="TweaksRevert" Content="Revert checked" Padding="16,7" FontSize="12"/>
+                    </StackPanel>
+                  </StackPanel>
+                  <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="0,6,0,0">
+                    <StackPanel x:Name="TweakItems" Margin="2,0,8,0"/>
+                  </ScrollViewer>
+                </DockPanel>
+              </Border>
+            </Grid>
+          </Grid>
+
           <!-- ===== Tools ===== -->
           <Grid x:Name="ViewTools" Visibility="Collapsed">
-            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-            <WrapPanel x:Name="ToolCards"/>
+            <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="230"/></Grid.RowDefinitions>
+            <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="0,0,0,2">
+              <StackPanel x:Name="ToolCards"/>
+            </ScrollViewer>
             <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,2,0,16" Padding="16,12">
               <DockPanel>
                 <Grid DockPanel.Dock="Top" Margin="0,0,0,10">
@@ -1549,6 +2008,78 @@ $script:CleanerRules = @(
         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="260"/></Grid.ColumnDefinitions>
         <TextBlock x:Name="StatusText" Text="Ready" Foreground="{StaticResource MutedBrush}" FontSize="12" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
         <ProgressBar x:Name="StatusProgress" Grid.Column="1" Height="5" Maximum="100" Value="0" VerticalAlignment="Center" Visibility="Hidden"/>
+      </Grid>
+
+      <!-- ================= Connect dialog (overlay) ================= -->
+      <Grid x:Name="ConnectOverlay" Grid.RowSpan="3" Visibility="Collapsed" Background="#B30B0E1C">
+        <Border Style="{StaticResource Card}" Width="500" VerticalAlignment="Center" HorizontalAlignment="Center" Padding="26,22">
+          <Border.Effect><DropShadowEffect Color="Black" BlurRadius="40" ShadowDepth="0" Opacity="0.6"/></Border.Effect>
+          <StackPanel>
+            <Grid>
+              <StackPanel Orientation="Horizontal">
+                <Border Width="34" Height="34" CornerRadius="10" Background="{StaticResource PurpleGrad}">
+                  <TextBlock Text="&#xE7F4;" Style="{StaticResource Icon}" FontSize="15" Foreground="White" HorizontalAlignment="Center"/>
+                </Border>
+                <TextBlock Text="Connect to a computer" Style="{StaticResource H2}" FontSize="18" Margin="12,0,0,0" VerticalAlignment="Center"/>
+              </StackPanel>
+              <Button x:Name="ConnClose" Style="{StaticResource CapBtn}" Content="&#xE8BB;" HorizontalAlignment="Right" Width="34" Height="30"/>
+            </Grid>
+            <TextBlock Text="Uses PowerShell remoting (WinRM). You need admin rights on the remote PC, and remoting must be enabled there."
+                       Style="{StaticResource Muted}" FontSize="12" Margin="0,10,0,4"/>
+
+            <TextBlock Text="COMPUTER" Style="{StaticResource Caps}"/>
+            <TextBox x:Name="ConnHost" Tag="Hostname, FQDN or IP address"/>
+            <WrapPanel x:Name="ConnRecent" Margin="0,8,0,0"/>
+
+            <TextBlock Text="DOMAIN (OPTIONAL)" Style="{StaticResource Caps}"/>
+            <TextBox x:Name="ConnDomain" Tag="e.g. corp.contoso.com - added to short names and usernames"/>
+            <TextBlock x:Name="ConnResolved" Text="" Foreground="{StaticResource DimBrush}" FontSize="11.5" Margin="2,5,0,0"/>
+
+            <TextBlock Text="SIGN IN AS" Style="{StaticResource Caps}"/>
+            <Border Background="{StaticResource FieldBrush}" CornerRadius="10" Padding="3" BorderBrush="{StaticResource LineBrush}" BorderThickness="1">
+              <UniformGrid Columns="2">
+                <RadioButton x:Name="ConnUseCurrent" Style="{StaticResource SegBtn}" GroupName="ConnCred" IsChecked="True">
+                  <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE77B;" Style="{StaticResource Icon}" Margin="0,0,7,0"/><TextBlock x:Name="ConnCurrentText" Text="Current credentials"/></StackPanel>
+                </RadioButton>
+                <RadioButton x:Name="ConnUseOther" Style="{StaticResource SegBtn}" GroupName="ConnCred">
+                  <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE8D7;" Style="{StaticResource Icon}" Margin="0,0,7,0"/><TextBlock Text="Other credentials"/></StackPanel>
+                </RadioButton>
+              </UniformGrid>
+            </Border>
+
+            <StackPanel x:Name="ConnOtherPanel" Visibility="Collapsed" Margin="0,10,0,0">
+              <TextBox x:Name="ConnUser" Tag="DOMAIN\user or user@domain"/>
+              <Grid Margin="0,8,0,0">
+                <PasswordBox x:Name="ConnPass"/>
+                <TextBlock x:Name="ConnPassHint" Text="Password" Foreground="{StaticResource DimBrush}" Margin="11,0,0,0"
+                           VerticalAlignment="Center" IsHitTestVisible="False"/>
+              </Grid>
+              <Grid Margin="0,10,0,0">
+                <CheckBox x:Name="ConnSave" Content="Save to Windows Credential Manager"/>
+                <Button x:Name="ConnForget" Style="{StaticResource LinkBtn}" Content="Forget saved credentials" HorizontalAlignment="Right" Visibility="Collapsed"/>
+              </Grid>
+              <TextBlock x:Name="ConnSavedNote" Text="" Foreground="{StaticResource TealBrush}" FontSize="11.5" Margin="0,6,0,0" Visibility="Collapsed"/>
+            </StackPanel>
+
+            <Border x:Name="ConnMsgBox" CornerRadius="8" Padding="12,9" Margin="0,16,0,0" Background="#3A2F1E" BorderBrush="#8C6A2E" BorderThickness="1" Visibility="Collapsed">
+              <StackPanel>
+                <TextBlock x:Name="ConnMsg" Text="" TextWrapping="Wrap" FontSize="12" Foreground="#F5D9A8"/>
+                <Button x:Name="ConnTrust" Style="{StaticResource LinkBtn}" Content="Add this computer to TrustedHosts" Margin="0,8,0,0" HorizontalAlignment="Left" Visibility="Collapsed"/>
+              </StackPanel>
+            </Border>
+            <ProgressBar x:Name="ConnProgress" IsIndeterminate="True" Height="4" Margin="0,14,0,0" Visibility="Collapsed"/>
+
+            <Grid Margin="0,20,0,0">
+              <Button x:Name="ConnLocal" Content="Use this PC" Style="{StaticResource BtnChip}" HorizontalAlignment="Left" Margin="0"/>
+              <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button x:Name="ConnCancel" Content="Cancel" Margin="0,0,10,0"/>
+                <Button x:Name="ConnGo" Style="{StaticResource BtnAccent}">
+                  <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE703;" Style="{StaticResource Icon}" Margin="0,0,8,0"/><TextBlock Text="Connect"/></StackPanel>
+                </Button>
+              </StackPanel>
+            </Grid>
+          </StackPanel>
+        </Border>
       </Grid>
     </Grid>
   </Border>
@@ -1590,6 +2121,12 @@ function Open-AWExplorer([string]$Path) {
     elseif (Test-Path -LiteralPath $Path) { Start-Process explorer.exe -ArgumentList "`"$Path`"" }
 }
 function Set-AWStatus([string]$Text) { $ui.StatusText.Text = $Text }
+
+# Remote target: $null = this PC, otherwise @{ Host; Credential; ComputerName; OS }.
+$script:Target = $null
+function Test-AWRemote { [bool]$script:Target }
+# Admin-only features: local admin, or a remote target (WinRM sessions are admin by default).
+function Test-AWCanAdmin { $script:IsAdmin -or [bool]$script:Target }
 #endregion
 
 #region ---------------------------------------------------------------- Background task runner
@@ -1607,6 +2144,7 @@ function Start-AWTask {
     $rs.ThreadOptions  = 'ReuseThread'
     $rs.Open()
     $rs.SessionStateProxy.SetVariable('Sync', $Sync)
+    $rs.SessionStateProxy.SetVariable('Target', $script:Target)
     foreach ($k in $Arguments.Keys) { $rs.SessionStateProxy.SetVariable($k, $Arguments[$k]) }
     $ps = [powershell]::Create()
     $ps.Runspace = $rs
@@ -1682,7 +2220,7 @@ $script:IdleStatus = 'Ready'
 #region ---------------------------------------------------------------- Navigation + title bar
 $script:ViewTitles = @{
     Home = 'Dashboard'; Cleaner = 'Cleaner'; Map = 'Space Map'; Large = 'Large Files'
-    Startup = 'Startup'; Programs = 'Programs'; Tools = 'Tools and Activity Log'
+    Startup = 'Startup'; Programs = 'Programs'; Debloat = 'Debloat'; Tools = 'Tools and Activity Log'
 }
 $script:Loaded = @{}
 
@@ -1691,12 +2229,13 @@ foreach ($v in $script:ViewTitles.Keys) {
         param($s, $e)
         $name = $s.Name.Substring(3)
         foreach ($k in $script:ViewTitles.Keys) { $ui["View$k"].Visibility = if ($k -eq $name) { 'Visible' } else { 'Collapsed' } }
-        $ui.ViewTitle.Text = $script:ViewTitles[$name]
+        Update-AWViewTitle $name
         if (-not $script:Loaded[$name]) {
             $script:Loaded[$name] = $true
             switch ($name) {
                 'Startup'  { Update-AWStartupList }
                 'Programs' { Update-AWProgramList }
+                'Debloat'  { Update-AWAppList; Update-AWTweakStatus }
             }
         }
         if ($name -eq 'Map') { Request-AWMapRedraw }
@@ -1704,6 +2243,17 @@ foreach ($v in $script:ViewTitles.Keys) {
 }
 
 function Select-AWView([string]$Name) { $ui["Nav$Name"].IsChecked = $true }
+
+# Views that always work on this PC, even when a remote computer is targeted.
+$script:LocalOnlyViews = @('Home', 'Map', 'Large', 'Startup')
+function Get-AWCurrentView { foreach ($k in $script:ViewTitles.Keys) { if ($ui["Nav$k"].IsChecked) { return $k } } }
+function Update-AWViewTitle([string]$Name) {
+    $title = $script:ViewTitles[$Name]
+    if (Test-AWRemote) {
+        $title += if ($script:LocalOnlyViews -contains $Name) { '   -   this PC only' } else { "   -   $($script:Target.ComputerName)" }
+    }
+    $ui.ViewTitle.Text = $title
+}
 
 $ui.BtnMin.Add_Click({ $window.WindowState = 'Minimized' })
 $ui.BtnMax.Add_Click({ $window.WindowState = if ($window.WindowState -eq 'Maximized') { 'Normal' } else { 'Maximized' } })
@@ -1738,6 +2288,20 @@ function New-AWText([string]$Text, [double]$Size = 13, $Brush = $null, [string]$
     $t.Text = $Text; $t.FontSize = $Size; $t.FontWeight = $Weight
     if ($Brush) { $t.Foreground = $Brush }
     $t
+}
+
+function New-AWPill([string]$Text, [bool]$Ok = $true, [string]$Tone = '') {
+    $pill = New-Object System.Windows.Controls.Border
+    $pill.Style = $window.FindResource('Pill')
+    if ($Tone -eq 'Teal') {
+        $pill.BorderBrush = New-Brush '#2E8F86'; $fg = $script:Res.Teal
+    } elseif ($Ok) {
+        $pill.BorderBrush = New-Brush '#4A5680'; $fg = $script:Res.Muted
+    } else {
+        $pill.BorderBrush = New-Brush '#8C6A2E'; $fg = $script:Res.Amber
+    }
+    $pill.Child = New-AWText $Text 9 $fg 'Bold'
+    $pill
 }
 
 function Get-AWFixedDrives {
@@ -1886,6 +2450,17 @@ $ui.HomeStartup.Add_Click({ Select-AWView 'Startup' })
 $script:CleanerChecks = New-Object System.Collections.Generic.List[object]
 $script:CleanerBusy = $false
 
+# Rules that live in the signed-in user's profile only make sense on this PC.
+function Test-AWUserScopeRule($Rule) {
+    if ($Rule.Kind -eq 'RecycleBin' -or $Rule.Action -eq 'Clipboard') { return $true }
+    foreach ($t in $Rule.Targets) { if ($t.Path -match '%(TEMP|LOCALAPPDATA|APPDATA|USERPROFILE)%') { return $true } }
+    $false
+}
+function Test-AWRuleAllowed($Rule) {
+    if (Test-AWRemote) { return -not (Test-AWUserScopeRule $Rule) }
+    $script:IsAdmin -or -not $Rule.Admin
+}
+
 function Initialize-AWCleaner {
     $ui.CleanerItems.Children.Clear()
     $script:CleanerChecks.Clear()
@@ -1900,20 +2475,15 @@ function Initialize-AWCleaner {
         $cb = New-Object System.Windows.Controls.CheckBox
         $cb.Margin = '0,5'
         $cb.Tag = $rule
-        $allowed = $script:IsAdmin -or -not $rule.Admin
+        $allowed = Test-AWRuleAllowed $rule
         $cb.IsEnabled = $allowed
         $cb.IsChecked = $rule.Default -and $allowed
-        $cb.ToolTip = $rule.Desc
+        $cb.ToolTip = if ((Test-AWRemote) -and -not $allowed) { "$($rule.Desc)`n`nPer-user item - only available on this PC." } else { $rule.Desc }
+        if ((Test-AWRemote) -and -not $allowed) { [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($cb, $true) }
 
         $sp = New-Object System.Windows.Controls.StackPanel; $sp.Orientation = 'Horizontal'
         [void]$sp.Children.Add((New-AWText $rule.Name 13))
-        if ($rule.Admin) {
-            $pill = New-Object System.Windows.Controls.Border
-            $pill.Style = $window.FindResource('Pill')
-            $pill.BorderBrush = if ($script:IsAdmin) { New-Brush '#4A5680' } else { New-Brush '#8C6A2E' }
-            $pill.Child = New-AWText 'ADMIN' 9 $(if ($script:IsAdmin) { $script:Res.Muted } else { $script:Res.Amber }) 'Bold'
-            [void]$sp.Children.Add($pill)
-        }
+        if ($rule.Admin) { [void]$sp.Children.Add((New-AWPill 'ADMIN' (Test-AWCanAdmin))) }
         $cb.Content = $sp
         [void]$ui.CleanerItems.Children.Add($cb)
         $script:CleanerChecks.Add($cb)
@@ -1928,7 +2498,7 @@ function Set-AWCleanerBusy([bool]$Busy) {
     $script:CleanerBusy = $Busy
     $ui.BtnAnalyze.IsEnabled = -not $Busy
     $ui.BtnClean.IsEnabled   = -not $Busy
-    foreach ($cb in $script:CleanerChecks) { if ($script:IsAdmin -or -not $cb.Tag.Admin) { $cb.IsEnabled = -not $Busy } }
+    foreach ($cb in $script:CleanerChecks) { if (Test-AWRuleAllowed $cb.Tag) { $cb.IsEnabled = -not $Busy } }
 }
 
 function Show-AWCleanResults($Result, [string]$Mode) {
@@ -1980,7 +2550,7 @@ function Start-AWAnalyze {
         foreach ($rule in $Rules) {
             $Sync.Status = "Analyzing: $($rule.Name)"
             $Sync.Progress = [int]($i * 100 / $Rules.Count)
-            try { Measure-WItem $rule }
+            try { Invoke-WTarget { param($r) Measure-WItem $r } -ArgumentList @(, $rule) }
             catch { @{ Id = $rule.Id; Name = $rule.Name; Group = $rule.Group; Files = 0; Bytes = [long]0; Note = "Error: $($_.Exception.Message)" } }
             $i++
         }
@@ -1997,7 +2567,8 @@ function Start-AWClean {
     $rules = Get-AWSelectedRules
     if ($rules.Count -eq 0) { Show-AWMessage 'Select at least one cleaning rule first.'; return }
     $names = ($rules | ForEach-Object { "  - $($_.Name)" }) -join "`n"
-    if (-not (Confirm-AW "AWiper will permanently delete the files matched by these rules:`n`n$names`n`nFiles that are in use are skipped. Continue?")) { return }
+    $where = if (Test-AWRemote) { " on $($script:Target.ComputerName)" } else { '' }
+    if (-not (Confirm-AW "AWiper will permanently delete the files matched by these rules$($where):`n`n$names`n`nFiles that are in use are skipped. Continue?")) { return }
     Set-AWCleanerBusy $true
     $ui.CleanSummary.Text = 'Cleaning...'
     $ui.CleanSubtext.Text = 'Removing files. Locked files are skipped automatically.'
@@ -2007,7 +2578,7 @@ function Start-AWClean {
         foreach ($rule in $Rules) {
             $Sync.Status = "Cleaning: $($rule.Name)"
             $Sync.Progress = [int]($i * 100 / $Rules.Count)
-            try { Invoke-WClean $rule }
+            try { Invoke-WTarget { param($r) Invoke-WClean $r } -ArgumentList @(, $rule) }
             catch {
                 Write-WLog "$($rule.Name): $($_.Exception.Message)" 'ERROR'
                 @{ Id = $rule.Id; Name = $rule.Name; Group = $rule.Group; Files = 0; Bytes = [long]0; Note = "Error: $($_.Exception.Message)" }
@@ -2482,30 +3053,43 @@ function Update-AWProgramView {
 function Update-AWProgramList {
     $ui.ProgInfo.Text = 'Loading installed programs...'
     $ui.ProgRefresh.IsEnabled = $false
+    $remote = Test-AWRemote
+    $ui.ProgUninstall.IsEnabled = -not $remote
+    $ui.ProgOpen.IsEnabled = -not $remote
+    $ui.ProgUninstall.ToolTip = if ($remote) { 'Uninstalling is only available on this PC.' } else { $null }
     Start-AWTask -Name 'Read installed programs' -Work {
-        $paths = @(
-            @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*';             S = 'Machine' }
-            @{ P = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'; S = 'Machine (x86)' }
-            @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*';             S = 'User' }
-        )
-        $seen = @{}
-        foreach ($src in $paths) {
-            foreach ($e in (Get-ItemProperty -Path $src.P -ErrorAction SilentlyContinue)) {
-                if (-not $e.DisplayName -or $e.SystemComponent -eq 1 -or $e.ParentKeyName -or $e.ReleaseType -match 'Update|Hotfix') { continue }
-                if (-not $e.UninstallString) { continue }
-                $key = "$($e.DisplayName)|$($e.DisplayVersion)"
-                if ($seen.ContainsKey($key)) { continue }
-                $seen[$key] = $true
-                $installed = ''
-                if ($e.InstallDate -match '^\d{8}$') {
-                    try { $installed = [datetime]::ParseExact($e.InstallDate, 'yyyyMMdd', $null).ToString('yyyy-MM-dd') } catch { }
+        $raw = Invoke-WTarget {
+            $paths = @(
+                @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*';             S = 'Machine' }
+                @{ P = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'; S = 'Machine (x86)' }
+                @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*';             S = 'User' }
+            )
+            $seen = @{}
+            foreach ($src in $paths) {
+                foreach ($e in (Get-ItemProperty -Path $src.P -ErrorAction SilentlyContinue)) {
+                    if (-not $e.DisplayName -or $e.SystemComponent -eq 1 -or $e.ParentKeyName -or $e.ReleaseType -match 'Update|Hotfix') { continue }
+                    if (-not $e.UninstallString) { continue }
+                    $key = "$($e.DisplayName)|$($e.DisplayVersion)"
+                    if ($seen.ContainsKey($key)) { continue }
+                    $seen[$key] = $true
+                    $installed = ''
+                    if ($e.InstallDate -match '^\d{8}$') {
+                        try { $installed = [datetime]::ParseExact($e.InstallDate, 'yyyyMMdd', $null).ToString('yyyy-MM-dd') } catch { }
+                    }
+                    [pscustomobject]@{
+                        Name = [string]$e.DisplayName; Publisher = [string]$e.Publisher; Version = [string]$e.DisplayVersion; Installed = $installed
+                        SizeBytes = $(if ($e.EstimatedSize) { [long]$e.EstimatedSize * 1KB } else { [long]0 })
+                        Scope = $src.S; Uninstall = [string]$e.UninstallString; Location = [string]$e.InstallLocation
+                    }
                 }
-                $size = if ($e.EstimatedSize) { [long]$e.EstimatedSize * 1KB } else { [long]0 }
-                [pscustomobject]@{
-                    Name = $e.DisplayName; Publisher = $e.Publisher; Version = $e.DisplayVersion; Installed = $installed
-                    SizeBytes = $size; SizeText = $(if ($size) { [AWiper.Fmt]::Size($size) } else { '' })
-                    Scope = $src.S; Uninstall = $e.UninstallString; Location = $e.InstallLocation
-                }
+            }
+        }
+        # Rebuild locally so remote (deserialized) results bind and sort like local ones.
+        foreach ($r in $raw) {
+            [pscustomobject]@{
+                Name = $r.Name; Publisher = $r.Publisher; Version = $r.Version; Installed = $r.Installed
+                SizeBytes = [long]$r.SizeBytes; SizeText = $(if ($r.SizeBytes) { [AWiper.Fmt]::Size([long]$r.SizeBytes) } else { '' })
+                Scope = $r.Scope; Uninstall = $r.Uninstall; Location = $r.Location
             }
         }
     } -OnComplete {
@@ -2541,9 +3125,500 @@ $ui.ProgUninstall.Add_Click({
 })
 #endregion
 
+#region ---------------------------------------------------------------- Shared actions
+function Restart-AWExplorer {
+    Get-Process -Name explorer -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Milliseconds 1200
+    if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+    Write-AWLog 'Explorer restarted'; Set-AWStatus 'Explorer restarted'
+}
+
+function Start-AWRestorePoint {
+    if (-not (Test-AWCanAdmin)) { Show-AWMessage 'Creating a restore point needs administrator rights.'; return }
+    Start-AWTask -Name 'Create restore point' -Work {
+        $Sync.Status = 'Creating System Restore point...'
+        try {
+            Invoke-WTarget {
+                $r = Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint `
+                     -Arguments @{ Description = 'AWiper checkpoint'; RestorePointType = [uint32]12; EventType = [uint32]100 } -ErrorAction Stop
+                if ($r.ReturnValue -eq 0) { Write-WLog 'Restore point created' }
+                else { Write-WLog "Restore point returned code $($r.ReturnValue) (System Protection may be off for this drive)" 'WARN' }
+            }
+        } catch { Write-WLog "Restore point failed: $($_.Exception.Message)" 'ERROR' }
+    } -OnComplete { param($r) $script:IdleStatus = 'Restore point request finished - see Activity log' }
+}
+
+# Runs a console command on the target and streams its output to the Activity log.
+# Lines containing a percentage drive the progress bar. The body should end with "AWEXIT $LASTEXITCODE".
+function Start-AWCommandTask([string]$Name, [scriptblock]$Body) {
+    Start-AWTask -Name $Name -Arguments @{ Label = $Name; Body = $Body.ToString() } -Work {
+        $Sync.Status = "$Label running..."
+        Invoke-WTarget ([scriptblock]::Create($Body)) | ForEach-Object {
+            foreach ($seg in (("$_" -replace "`0", '') -split "`r")) {
+                $l = $seg.Trim()
+                if (-not $l) { continue }
+                if ($l -match '^AWEXIT (-?\d+)$') { Write-WLog "$Label finished with exit code $($Matches[1])"; continue }
+                if ($l -match '(\d+(\.\d+)?)\s*%') { $Sync.Progress = [int][double]$Matches[1]; $Sync.Status = "$Label - $l"; continue }
+                if ($l -notmatch '^\[=*') { Write-WLog "${Label}: $l" }
+            }
+        }
+        "$Label finished"
+    } -OnComplete {
+        param($r)
+        $m = @($r | Where-Object { $_ })
+        $script:IdleStatus = if ($m.Count) { "$($m[-1]) - see Activity log" } else { 'Task failed - see Activity log' }
+    }
+}
+#endregion
+
+#region ---------------------------------------------------------------- Debloat
+$script:AllApps = @()
+$script:TweakChecks = New-Object System.Collections.Generic.List[object]
+$script:TweakState = @{}
+$script:PendingExplorerRestart = $false
+
+# HKCU tweaks would land in the remote admin's own profile, so only machine-wide tweaks run remotely.
+function Test-AWTweakRemoteOk($Tweak) { -not @($Tweak.Values | Where-Object { $_.Path -notlike 'HKLM:*' }) }
+function Test-AWTweakAllowed($Tweak) {
+    if (Test-AWRemote) { return Test-AWTweakRemoteOk $Tweak }
+    $script:IsAdmin -or -not $Tweak.Admin
+}
+
+function Update-AWAppView {
+    $q = $ui.AppSearch.Text.Trim()
+    $all = [bool]$ui.AppsShowAll.IsChecked
+    $items = @($script:AllApps | Where-Object { ($all -or $_.Category -ne 'Other') -and (-not $q -or $_.Name -like "*$q*" -or $_.Package -like "*$q*") })
+    $ui.AppList.ItemsSource = $items
+    $ui.AppsInfo.Text = '{0} app(s) shown' -f $items.Count
+}
+
+function Update-AWAppList {
+    $ui.AppsInfo.Text = 'Reading installed apps...'
+    $ui.AppsRemove.IsEnabled = $false
+    $ui.AppsProvisioned.IsEnabled = Test-AWCanAdmin
+    Start-AWTask -Name 'Read Store apps' -Arguments @{ Catalog = $script:BloatCatalog; Protected = $script:ProtectedApps; AllUsers = [bool](Test-AWCanAdmin) } -Work {
+        $raw = Invoke-WTarget {
+            param($AllUsers)
+            if ($PSVersionTable.PSVersion.Major -ge 7) { Import-Module Appx -UseWindowsPowerShell -WarningAction SilentlyContinue -ErrorAction SilentlyContinue }
+            $prov = @{}
+            if ($AllUsers) {
+                try { foreach ($p in (Get-AppxProvisionedPackage -Online -ErrorAction Stop)) { $prov[$p.DisplayName] = $true } }
+                catch { Write-WLog "Could not read provisioned apps: $($_.Exception.Message)" 'WARN' }
+            }
+            $pk = if ($AllUsers) { Get-AppxPackage -AllUsers } else { Get-AppxPackage }
+            foreach ($p in $pk) {
+                if ($p.IsFramework -or $p.NonRemovable -or "$($p.SignatureKind)" -eq 'System') { continue }
+                [pscustomobject]@{ Name = [string]$p.Name; FullName = [string]$p.PackageFullName; Version = [string]$p.Version; Publisher = [string]$p.Publisher; Prov = [bool]$prov[$p.Name] }
+            }
+        } -ArgumentList @($AllUsers)
+
+        $seen = @{}
+        foreach ($p in $raw) {
+            if ($seen[$p.Name]) { continue }
+            $seen[$p.Name] = $true
+            $match = $null
+            foreach ($c in $Catalog) { if ($p.Name -like $c.Pattern) { $match = $c; break } }
+            if (-not $match) {
+                $prot = $false
+                foreach ($x in $Protected) { if ($p.Name -like $x) { $prot = $true; break } }
+                if ($prot) { continue }
+            }
+            $e = New-Object AWiper.AppEntry
+            $e.Package = $p.Name; $e.FullName = $p.FullName; $e.Version = $p.Version; $e.Publisher = $p.Publisher; $e.Provisioned = $p.Prov
+            if ($match) { $e.Name = $match.Name; $e.Category = $match.Category; $e.Recommended = $match.Recommended; $e.Note = $match.Note }
+            else { $e.Name = $p.Name -replace '^[^.]+\.(?=.)', ''; $e.Category = 'Other'; $e.Note = "Version $($p.Version)" }
+            $e.IsChecked = $e.Recommended
+            $e
+        }
+    } -OnComplete {
+        param($Result)
+        $script:AllApps = @($Result | Where-Object { $_ } | Sort-Object Category, Name)
+        $ui.AppsRemove.IsEnabled = $true
+        Update-AWAppView
+    }
+}
+
+function Start-AWAppRemoval {
+    $apps = @($script:AllApps | Where-Object { $_.IsChecked })
+    if ($apps.Count -eq 0) { Show-AWMessage 'Check at least one app first.'; return }
+    $prov  = [bool]$ui.AppsProvisioned.IsChecked -and (Test-AWCanAdmin)
+    $scope = if (Test-AWCanAdmin) { 'for all users' } else { 'for your account' }
+    $where = if (Test-AWRemote) { " on $($script:Target.ComputerName)" } else { '' }
+    $list  = ($apps | Select-Object -First 20 | ForEach-Object { "  - $($_.Name)" }) -join "`n"
+    if ($apps.Count -gt 20) { $list += "`n  ...and $($apps.Count - 20) more" }
+    if (-not (Confirm-AW "Remove $($apps.Count) app(s) $scope$($where)?`n`n$list`n`nMost of these can be reinstalled from the Microsoft Store.")) { return }
+
+    $ui.AppsRemove.IsEnabled = $false
+    $pk = @($apps | ForEach-Object { @{ Name = $_.Name; Package = $_.Package; Provisioned = $_.Provisioned } })
+    Start-AWTask -Name 'Remove Store apps' -Arguments @{ Pk = $pk; AllUsers = [bool](Test-AWCanAdmin); Prov = $prov } -Work {
+        $i = 0
+        foreach ($a in $Pk) {
+            $Sync.Status = "Removing $($a.Name)..."
+            $Sync.Progress = [int]($i * 100 / $Pk.Count); $i++
+            try {
+                Invoke-WTarget {
+                    param($App, $AllUsers, $Prov)
+                    if ($PSVersionTable.PSVersion.Major -ge 7) { Import-Module Appx -UseWindowsPowerShell -WarningAction SilentlyContinue -ErrorAction SilentlyContinue }
+                    $done = $false
+                    if ($AllUsers) {
+                        try { Get-AppxPackage -AllUsers -Name $App.Package | Remove-AppxPackage -AllUsers -ErrorAction Stop; $done = $true }
+                        catch { Write-WLog "$($App.Name): all-users removal failed ($($_.Exception.Message)), trying current user" 'WARN' }
+                    }
+                    if (-not $done) {
+                        $mine = @(Get-AppxPackage -Name $App.Package)
+                        if ($mine.Count) { $mine | Remove-AppxPackage -ErrorAction Stop }
+                        else { Write-WLog "$($App.Name): not installed for this account" 'WARN' }
+                    }
+                    if ($Prov -and $App.Provisioned) {
+                        Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $App.Package } |
+                            Remove-AppxProvisionedPackage -Online -ErrorAction Stop | Out-Null
+                        Write-WLog "$($App.Name): removed provisioned copy (new users won't get it)"
+                    }
+                    Write-WLog "Removed $($App.Name)"
+                } -ArgumentList @($a, $AllUsers, $Prov)
+            } catch { Write-WLog "$($a.Name): $($_.Exception.Message)" 'ERROR' }
+        }
+        $Sync.Progress = 100
+    } -OnComplete {
+        param($r)
+        $script:IdleStatus = 'App removal finished - see Activity log'
+        Update-AWAppList
+    }
+}
+
+function Initialize-AWTweaks {
+    $ui.TweakItems.Children.Clear()
+    $script:TweakChecks.Clear()
+    $script:TweakState = @{}
+    $lastGroup = ''
+    foreach ($tw in $script:Tweaks) {
+        if ($tw.Group -ne $lastGroup) {
+            $h = New-AWText $tw.Group.ToUpper() 11 $script:Res.Dim 'Bold'
+            $h.Margin = if ($lastGroup) { '0,16,0,6' } else { '0,8,0,6' }
+            [void]$ui.TweakItems.Children.Add($h)
+            $lastGroup = $tw.Group
+        }
+        $cb = New-Object System.Windows.Controls.CheckBox
+        $cb.Margin = '0,5'; $cb.Tag = $tw
+        $allowed = Test-AWTweakAllowed $tw
+        $cb.IsEnabled = $allowed
+        $cb.IsChecked = $tw.Default -and $allowed
+        $cb.ToolTip = if ((Test-AWRemote) -and -not $allowed) { "$($tw.Desc)`n`nPer-user setting - only available on this PC." } else { $tw.Desc }
+        [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($cb, $true)
+
+        $sp = New-Object System.Windows.Controls.StackPanel; $sp.Orientation = 'Horizontal'
+        [void]$sp.Children.Add((New-AWText $tw.Name 13))
+        if ($tw.Admin) { [void]$sp.Children.Add((New-AWPill 'ADMIN' (Test-AWCanAdmin))) }
+        $on = New-AWPill 'ON' $true 'Teal'; $on.Visibility = 'Collapsed'
+        [void]$sp.Children.Add($on)
+        $script:TweakState[$tw.Id] = $on
+        $cb.Content = $sp
+        [void]$ui.TweakItems.Children.Add($cb)
+        $script:TweakChecks.Add($cb)
+    }
+}
+
+function Update-AWTweakStatus {
+    $list = @($script:Tweaks | Where-Object { Test-AWTweakAllowed $_ })
+    Start-AWTask -Name 'Read tweak status' -Arguments @{ Tw = $list } -Work {
+        Invoke-WTarget { param($Items) foreach ($t in $Items) { [pscustomobject]@{ Id = $t.Id; On = [bool](Test-WTweak $t) } } } -ArgumentList @(, $Tw)
+    } -OnComplete {
+        param($Result)
+        foreach ($p in $script:TweakState.Values) { $p.Visibility = 'Collapsed' }
+        foreach ($r in $Result) { if ($r -and $r.On -and $script:TweakState[[string]$r.Id]) { $script:TweakState[[string]$r.Id].Visibility = 'Visible' } }
+    }
+}
+
+function Start-AWTweaks([bool]$Apply) {
+    $sel = @($script:TweakChecks | Where-Object { $_.IsChecked -and $_.IsEnabled } | ForEach-Object { $_.Tag })
+    if ($sel.Count -eq 0) { Show-AWMessage 'Check at least one tweak first.'; return }
+    $verb  = if ($Apply) { 'Apply' } else { 'Revert' }
+    $where = if (Test-AWRemote) { " on $($script:Target.ComputerName)" } else { '' }
+    $names = ($sel | ForEach-Object { "  - $($_.Name)" }) -join "`n"
+    if (-not (Confirm-AW "$verb these tweaks$($where)?`n`n$names")) { return }
+    $script:PendingExplorerRestart = (-not (Test-AWRemote)) -and [bool]$ui.TweaksRestartExplorer.IsChecked -and @($sel | Where-Object { $_.Explorer }).Count -gt 0
+    $ui.TweaksApply.IsEnabled = $false; $ui.TweaksRevert.IsEnabled = $false
+    Start-AWTask -Name "$verb tweaks" -Arguments @{ Sel = $sel; Apply = $Apply } -Work {
+        foreach ($t in $Sel) {
+            $Sync.Status = "$($t.Name)..."
+            try { Invoke-WTarget { param($Tw, $On) Set-WTweak $Tw $On } -ArgumentList @($t, $Apply) }
+            catch { Write-WLog "$($t.Name): $($_.Exception.Message)" 'ERROR' }
+        }
+    } -OnComplete {
+        param($r)
+        $ui.TweaksApply.IsEnabled = $true; $ui.TweaksRevert.IsEnabled = $true
+        if ($script:PendingExplorerRestart) { Restart-AWExplorer }
+        $script:PendingExplorerRestart = $false
+        $script:IdleStatus = 'Tweaks updated - some changes take effect after signing out'
+        Update-AWTweakStatus
+    }
+}
+
+$ui.AppSearch.Add_TextChanged({ Update-AWAppView })
+$ui.AppsShowAll.Add_Checked({ Update-AWAppView })
+$ui.AppsShowAll.Add_Unchecked({ Update-AWAppView })
+$ui.AppsRecommended.Add_Click({ foreach ($a in $script:AllApps) { $a.IsChecked = $a.Recommended }; $ui.AppList.Items.Refresh() })
+$ui.AppsNone.Add_Click({ foreach ($a in $script:AllApps) { $a.IsChecked = $false }; $ui.AppList.Items.Refresh() })
+$ui.AppsRemove.Add_Click({ Start-AWAppRemoval })
+$ui.DebloatRefresh.Add_Click({ Update-AWAppList; Update-AWTweakStatus })
+$ui.DebloatRestore.Add_Click({ Start-AWRestorePoint })
+$ui.TweaksDefault.Add_Click({ foreach ($cb in $script:TweakChecks) { $cb.IsChecked = $cb.IsEnabled -and $cb.Tag.Default } })
+$ui.TweaksNone.Add_Click({ foreach ($cb in $script:TweakChecks) { $cb.IsChecked = $false } })
+$ui.TweaksApply.Add_Click({ Start-AWTweaks $true })
+$ui.TweaksRevert.Add_Click({ Start-AWTweaks $false })
+#endregion
+
+#region ---------------------------------------------------------------- Remote target
+$script:ConnPending = $null
+$script:ConnLoadedSaved = $null
+
+function Get-AWCredTarget([string]$TargetHost) { 'AWiper:' + $TargetHost.ToLowerInvariant() }
+function Get-AWSavedCred([string]$TargetHost) { try { [AWiper.CredMan]::Read((Get-AWCredTarget $TargetHost)) } catch { $null } }
+
+# Short names get the domain appended; IPs and FQDNs are used as typed.
+function Resolve-AWHost {
+    $h = $ui.ConnHost.Text.Trim()
+    $d = $ui.ConnDomain.Text.Trim().TrimStart('.')
+    if ($h -and $d -and $h -notmatch '[.:]') { "$h.$d" } else { $h }
+}
+function Resolve-AWUser([string]$User) {
+    $d = $ui.ConnDomain.Text.Trim().TrimStart('.')
+    if (-not $User -or -not $d -or $User -match '[\\@]') { return $User }
+    if ($d -match '\.') { "$User@$d" } else { "$d\$User" }
+}
+function Test-AWIsAddress([string]$TargetHost) { $TargetHost -match '^\d{1,3}(\.\d{1,3}){3}$' -or $TargetHost -match ':' }
+
+function Show-AWConnMsg([string]$Text, [bool]$Trust = $false) {
+    $ui.ConnMsg.Text = $Text
+    $ui.ConnMsgBox.Visibility = if ($Text) { 'Visible' } else { 'Collapsed' }
+    $ui.ConnTrust.Visibility = if ($Trust) { 'Visible' } else { 'Collapsed' }
+}
+
+function Update-AWRecentChips {
+    $ui.ConnRecent.Children.Clear()
+    $saved = @()
+    try { $saved = @([AWiper.CredMan]::List('AWiper:*') | ForEach-Object { $_.Substring(7) }) } catch { }
+    $hosts = @(@($script:State.RecentTargets) + $saved | Where-Object { $_ } | Select-Object -Unique | Select-Object -First 8)
+    foreach ($h in $hosts) {
+        $b = New-Object System.Windows.Controls.Button
+        $b.Style = $window.FindResource('BtnChip'); $b.Margin = '0,0,6,6'; $b.Tag = $h
+        $sp = New-Object System.Windows.Controls.StackPanel; $sp.Orientation = 'Horizontal'
+        if ($saved -contains $h.ToLowerInvariant()) {
+            $k = New-AWText ([string][char]0xE8D7) 11 $script:Res.Teal; $k.FontFamily = $window.FindResource('IconFont'); $k.Margin = '0,0,6,0'
+            $k.VerticalAlignment = 'Center'
+            [void]$sp.Children.Add($k)
+            $b.ToolTip = 'Credentials saved in Windows Credential Manager'
+        }
+        [void]$sp.Children.Add((New-AWText $h 12))
+        $b.Content = $sp
+        $b.Add_Click({ param($s, $e) $ui.ConnHost.Text = $s.Tag; $ui.ConnHost.CaretIndex = $s.Tag.Length })
+        [void]$ui.ConnRecent.Children.Add($b)
+    }
+    $ui.ConnRecent.Visibility = if ($hosts.Count) { 'Visible' } else { 'Collapsed' }
+}
+
+function Update-AWConnSaved {
+    $h = Resolve-AWHost
+    $ui.ConnResolved.Text = if ($h -and $h -ne $ui.ConnHost.Text.Trim()) { "Connects to $h" } else { '' }
+    $saved = if ($h) { Get-AWSavedCred $h } else { $null }
+    if ($saved) {
+        $ui.ConnUseOther.IsChecked = $true
+        $ui.ConnUser.Text = $saved[0]; $ui.ConnPass.Password = $saved[1]; $ui.ConnSave.IsChecked = $true
+        $ui.ConnForget.Visibility = 'Visible'
+        $ui.ConnSavedNote.Text = "Using credentials saved in Windows Credential Manager for $h"
+        $ui.ConnSavedNote.Visibility = 'Visible'
+        $script:ConnLoadedSaved = $h
+    } else {
+        $ui.ConnForget.Visibility = 'Collapsed'; $ui.ConnSavedNote.Visibility = 'Collapsed'
+        if ($script:ConnLoadedSaved) {
+            $ui.ConnUser.Text = ''; $ui.ConnPass.Clear(); $ui.ConnSave.IsChecked = $false
+            $script:ConnLoadedSaved = $null
+        }
+    }
+}
+
+function Show-AWConnect {
+    Show-AWConnMsg ''
+    $ui.ConnProgress.Visibility = 'Collapsed'; $ui.ConnGo.IsEnabled = $true
+    $ui.ConnLocal.Visibility = if (Test-AWRemote) { 'Visible' } else { 'Collapsed' }
+    $ui.ConnCurrentText.Text = "Current ($env:USERNAME)"
+    if (-not $ui.ConnDomain.Text -and $env:USERDNSDOMAIN) { $ui.ConnDomain.Text = $env:USERDNSDOMAIN.ToLowerInvariant() }
+    if (Test-AWRemote) { $ui.ConnHost.Text = $script:Target.Host }
+    Update-AWRecentChips
+    Update-AWConnSaved
+    $ui.ConnectOverlay.Visibility = 'Visible'
+    [void]$ui.ConnHost.Focus(); $ui.ConnHost.SelectAll()
+}
+function Hide-AWConnect {
+    $ui.ConnectOverlay.Visibility = 'Collapsed'
+    $ui.ConnPass.Clear(); $script:ConnLoadedSaved = $null
+}
+
+function Update-AWTargetUI {
+    if (Test-AWRemote) {
+        $ui.TargetText.Text = $script:Target.ComputerName
+        $ui.TargetIcon.Foreground = $script:Res.Purple
+        $ui.TargetBtn.BorderBrush = $script:Res.Purple
+        $ui.TargetBtn.ToolTip = "Working on $($script:Target.ComputerName) ($($script:Target.OS)) as $($script:Target.User)`nClick to change"
+        $window.Title = "AWiper - $($script:Target.ComputerName)"
+    } else {
+        $ui.TargetText.Text = 'This PC'
+        $ui.TargetIcon.Foreground = $script:Res.Teal
+        $ui.TargetBtn.ClearValue([System.Windows.Controls.Control]::BorderBrushProperty)
+        $ui.TargetBtn.ToolTip = 'Choose which computer AWiper works on'
+        $window.Title = 'AWiper'
+    }
+}
+
+function Set-AWTarget($NewTarget) {
+    $script:Target = $NewTarget
+    Update-AWTargetUI
+    Initialize-AWCleaner
+    Initialize-AWTools
+    Initialize-AWTweaks
+    $ui.CleanResults.ItemsSource = $null
+    $ui.CleanSummary.Text = 'Ready to analyze'
+    $ui.CleanSubtext.Text = if (Test-AWRemote) { "Machine-wide rules run on $($NewTarget.ComputerName). Per-user rules are only available on this PC." } else { 'Pick the rules on the left, then Analyze to see what can be removed.' }
+    $ui.CleanProgress.Value = 0
+    $script:AllApps = @(); $ui.AppList.ItemsSource = $null; $script:Programs = @(); $ui.ProgList.ItemsSource = $null
+    [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat')
+    $cur = Get-AWCurrentView
+    Update-AWViewTitle $cur
+    if ($cur -eq 'Programs') { $script:Loaded['Programs'] = $true; Update-AWProgramList }
+    if ($cur -eq 'Debloat')  { $script:Loaded['Debloat'] = $true; Update-AWAppList; Update-AWTweakStatus }
+    if (Test-AWRemote) {
+        Write-AWLog "Target is now $($NewTarget.ComputerName) ($($NewTarget.Host)) - $($NewTarget.OS), signed in as $($NewTarget.User)"
+        $script:IdleStatus = "Connected to $($NewTarget.ComputerName)"
+    } else {
+        Write-AWLog 'Target is now this PC'
+        $script:IdleStatus = 'Working on this PC'
+    }
+    Set-AWStatus $script:IdleStatus
+}
+
+function Start-AWConnect {
+    if ($script:Jobs.Count -gt 0) { Show-AWConnMsg 'Wait for the running task to finish before switching computers.'; return }
+    $h = Resolve-AWHost
+    if (-not $h) { Show-AWConnMsg 'Enter a hostname, FQDN or IP address.'; return }
+    $cred = $null
+    if ($ui.ConnUseOther.IsChecked) {
+        $u = Resolve-AWUser $ui.ConnUser.Text.Trim()
+        if (-not $u -or $ui.ConnPass.SecurePassword.Length -eq 0) { Show-AWConnMsg 'Enter a username and password, or choose Current credentials.'; return }
+        $cred = New-Object System.Management.Automation.PSCredential($u, $ui.ConnPass.SecurePassword.Copy())
+    }
+    $script:ConnPending = @{ Host = $h; Credential = $cred; Save = ($null -ne $cred -and [bool]$ui.ConnSave.IsChecked) }
+    Show-AWConnMsg ''
+    $ui.ConnGo.IsEnabled = $false
+    $ui.ConnProgress.Visibility = 'Visible'
+    Start-AWTask -Name "Connect to $h" -Arguments @{ Cand = @{ Host = $h; Credential = $cred } } -Work {
+        $Sync.Status = "Connecting to $($Cand.Host)..."
+        $p = @{ ComputerName = $Cand.Host; ErrorAction = 'Stop'; ScriptBlock = {
+            $os = Get-CimInstance Win32_OperatingSystem
+            $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+            [pscustomobject]@{
+                ComputerName = $env:COMPUTERNAME; OS = ($os.Caption -replace '^Microsoft\s+', ''); User = $id.Name
+                Admin = ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            }
+        } }
+        if ($Cand.Credential) { $p.Credential = $Cand.Credential }
+        try { @{ Ok = $true; Info = (Invoke-Command @p) } }
+        catch { @{ Ok = $false; Error = $_.Exception.Message } }
+    } -OnComplete { param($Result) Complete-AWConnect $Result }
+}
+
+function Complete-AWConnect($Result) {
+    $ui.ConnGo.IsEnabled = $true
+    $ui.ConnProgress.Visibility = 'Collapsed'
+    $res = @($Result | Where-Object { $_ }) | Select-Object -Last 1
+    $pend = $script:ConnPending
+    if (-not $res -or -not $res.Ok) {
+        $err = if ($res) { [string]$res.Error } else { 'The connection attempt failed.' }
+        $isAddr = Test-AWIsAddress $pend.Host
+        $hint = if ($err -match 'TrustedHosts|Kerberos|0x8009030e|0x80090311|authentication scheme') {
+            if ($isAddr) { 'Connecting by IP address needs Other credentials, and the address must be in this PC''s WinRM TrustedHosts list. You can also use the computer''s name instead.' }
+            else { 'Kerberos could not authenticate. Use the full name (FQDN) of a domain-joined PC, or choose Other credentials and add the computer to TrustedHosts.' }
+        } elseif ($err -match 'Access is denied|access denied') {
+            'Access denied. The account needs admin rights on the remote PC, or the username or password is wrong.'
+        } elseif ($err -match 'cannot be resolved|cannot find the computer|could not resolve|network path|WinRM cannot complete|firewall|did not respond') {
+            'The computer could not be reached. Check the name, make sure it is on, and that PowerShell remoting is enabled on it (Enable-PSRemoting -Force).'
+        } else { 'Could not connect.' }
+        if ($err.Length -gt 320) { $err = $err.Substring(0, 320) + '...' }
+        $trust = $err -match 'TrustedHosts|Kerberos|0x8009030e|0x80090311|authentication scheme'
+        Show-AWConnMsg "$hint`n`n$err" $trust
+        Write-AWLog "Connect to $($pend.Host) failed: $err" 'WARN'
+        return
+    }
+    $info = $res.Info
+    if ($pend.Save) {
+        try {
+            [AWiper.CredMan]::Write((Get-AWCredTarget $pend.Host), $pend.Credential.UserName, $ui.ConnPass.Password)
+            Write-AWLog "Saved credentials for $($pend.Host) to Windows Credential Manager"
+        } catch { Write-AWLog "Could not save credentials: $($_.Exception.Message)" 'WARN' }
+    }
+    $script:State.RecentTargets = @(@($pend.Host) + @($script:State.RecentTargets | Where-Object { $_ -and $_ -ne $pend.Host }) | Select-Object -First 8)
+    Save-AWState
+    if (-not $info.Admin) { Write-AWLog "Connected to $($pend.Host) without admin rights - most actions will fail" 'WARN' }
+    Hide-AWConnect
+    Set-AWTarget @{ Host = $pend.Host; Credential = $pend.Credential; ComputerName = [string]$info.ComputerName; OS = [string]$info.OS; User = [string]$info.User }
+}
+
+$ui.TargetBtn.Add_Click({ Show-AWConnect })
+$ui.ConnClose.Add_Click({ Hide-AWConnect })
+$ui.ConnCancel.Add_Click({ Hide-AWConnect })
+$ui.ConnGo.Add_Click({ Start-AWConnect })
+$ui.ConnLocal.Add_Click({
+    if ($script:Jobs.Count -gt 0) { Show-AWConnMsg 'Wait for the running task to finish before switching computers.'; return }
+    Hide-AWConnect; Set-AWTarget $null
+})
+$ui.ConnPass.Add_PasswordChanged({ $ui.ConnPassHint.Visibility = if ($ui.ConnPass.SecurePassword.Length) { 'Collapsed' } else { 'Visible' } })
+$ui.ConnHost.Add_TextChanged({ Update-AWConnSaved })
+$ui.ConnDomain.Add_TextChanged({ Update-AWConnSaved })
+$ui.ConnUseOther.Add_Checked({ $ui.ConnOtherPanel.Visibility = 'Visible' })
+$ui.ConnUseCurrent.Add_Checked({ $ui.ConnOtherPanel.Visibility = 'Collapsed' })
+foreach ($c in @($ui.ConnHost, $ui.ConnDomain, $ui.ConnUser, $ui.ConnPass)) {
+    $c.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return') { $e.Handled = $true; if ($ui.ConnGo.IsEnabled) { Start-AWConnect } } })
+}
+$ui.ConnForget.Add_Click({
+    $h = Resolve-AWHost
+    if ($h -and (Confirm-AW "Remove the saved credentials for $h from Windows Credential Manager?")) {
+        [void][AWiper.CredMan]::Delete((Get-AWCredTarget $h))
+        Write-AWLog "Removed saved credentials for $h"
+        $ui.ConnSave.IsChecked = $false
+        Update-AWConnSaved; Update-AWRecentChips
+    }
+})
+$ui.ConnTrust.Add_Click({
+    $h = Resolve-AWHost
+    if (-not $script:IsAdmin) { Show-AWConnMsg 'Changing TrustedHosts needs AWiper to run as administrator. Use "Restart as admin", then try again.'; return }
+    if (-not (Confirm-AW "Add $h to this PC's WinRM TrustedHosts list?`n`nThis lets PowerShell remoting connect to it with a username and password (NTLM). Only do this for computers you trust.")) { return }
+    try {
+        if ((Get-Service WinRM).Status -ne 'Running') { Start-Service WinRM -ErrorAction Stop }
+        Set-Item -Path WSMan:\localhost\Client\TrustedHosts -Value $h -Concatenate -Force -ErrorAction Stop
+        Write-AWLog "Added $h to WinRM TrustedHosts"
+        $ui.ConnUseOther.IsChecked = $true
+        Show-AWConnMsg "Added $h to TrustedHosts. Enter credentials under Other credentials and connect again."
+    } catch { Show-AWConnMsg "Could not update TrustedHosts: $($_.Exception.Message)" }
+})
+$window.Add_PreviewKeyDown({
+    param($s, $e)
+    if ($e.Key -eq 'Escape' -and $ui.ConnectOverlay.Visibility -eq 'Visible') { Hide-AWConnect; $e.Handled = $true }
+})
+#endregion
+
 #region ---------------------------------------------------------------- Tools
+$script:ToolPanel = $null
+
+function Add-AWToolSection([string]$Title) {
+    $h = New-AWText $Title.ToUpper() 11 $script:Res.Dim 'Bold'
+    $h.Margin = if ($ui.ToolCards.Children.Count) { '4,6,0,10' } else { '4,0,0,10' }
+    [void]$ui.ToolCards.Children.Add($h)
+    $script:ToolPanel = New-Object System.Windows.Controls.WrapPanel
+    [void]$ui.ToolCards.Children.Add($script:ToolPanel)
+}
+
 function New-AWToolCard {
-    param([string]$Glyph, [string]$Title, [string]$Desc, [string]$ButtonText, [bool]$Admin, [scriptblock]$Action, [string]$Accent = 'Teal')
+    param([string]$Glyph, [string]$Title, [string]$Desc, [string]$ButtonText, [bool]$Admin, [scriptblock]$Action,
+          [string]$Accent = 'Teal', [bool]$Remote = $false, [string]$Unavailable = '')
     $card = New-Object System.Windows.Controls.Border
     $card.Style = $window.FindResource('Card'); $card.Width = 300; $card.Margin = '0,0,14,14'; $card.Padding = '18,16'
     $sp = New-Object System.Windows.Controls.StackPanel
@@ -2558,36 +3633,61 @@ function New-AWToolCard {
     [void]$head.Children.Add($ico)
     $tt = New-AWText $Title 14.5 $null 'SemiBold'; $tt.Margin = '12,0,0,0'; $tt.VerticalAlignment = 'Center'
     [void]$head.Children.Add($tt)
-    if ($Admin) {
-        $pill = New-Object System.Windows.Controls.Border
-        $pill.Style = $window.FindResource('Pill')
-        $pill.BorderBrush = if ($script:IsAdmin) { New-Brush '#4A5680' } else { New-Brush '#8C6A2E' }
-        $pill.Child = New-AWText 'ADMIN' 9 $(if ($script:IsAdmin) { $script:Res.Muted } else { $script:Res.Amber }) 'Bold'
-        [void]$head.Children.Add($pill)
-    }
+    $localOnly = (Test-AWRemote) -and -not $Remote
+    if ($localOnly) { [void]$head.Children.Add((New-AWPill 'THIS PC' $false)) }
+    elseif ($Admin) { [void]$head.Children.Add((New-AWPill 'ADMIN' (Test-AWCanAdmin))) }
     [void]$sp.Children.Add($head)
 
     $d = New-AWText $Desc 12.5 $script:Res.Muted; $d.TextWrapping = 'Wrap'; $d.Margin = '0,10,0,14'; $d.Height = 52
+    $d.TextTrimming = 'CharacterEllipsis'; $d.ToolTip = $Desc
     [void]$sp.Children.Add($d)
 
     $btn = New-Object System.Windows.Controls.Button
     $btn.Content = $ButtonText; $btn.Style = $window.FindResource('BtnChip'); $btn.HorizontalAlignment = 'Left'
     $btn.Tag = $Action
-    $btn.IsEnabled = $script:IsAdmin -or -not $Admin
+    $btn.IsEnabled = -not $localOnly -and -not $Unavailable -and (-not $Admin -or (Test-AWCanAdmin))
+    if ($Unavailable) { $btn.ToolTip = $Unavailable }
+    elseif ($localOnly) { $btn.ToolTip = 'Only available on this PC' }
+    [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($btn, $true)
     $btn.Add_Click({ param($s, $e) try { & $s.Tag } catch { Show-AWMessage $_.Exception.Message 'Error' } })
     [void]$sp.Children.Add($btn)
     $card.Child = $sp
-    [void]$ui.ToolCards.Children.Add($card)
+    [void]$script:ToolPanel.Children.Add($card)
 }
+
+function Get-AWWhere { if (Test-AWRemote) { " on $($script:Target.ComputerName)" } else { '' } }
 
 function Initialize-AWTools {
     $ui.ToolCards.Children.Clear()
 
+    # ---------------- Quick fixes
+    Add-AWToolSection 'Quick fixes'
+
     New-AWToolCard ([string][char]0xE774) 'Flush DNS cache' 'Clears cached name lookups. Handy after DNS or hosts-file changes.' 'Flush now' $false {
-        $out = (& ipconfig.exe /flushdns) -join ' '
-        Write-AWLog "ipconfig /flushdns: $($out.Trim())"
-        Set-AWStatus 'DNS resolver cache flushed'
+        Start-AWCommandTask 'Flush DNS' { & ipconfig.exe /flushdns 2>&1; "AWEXIT $LASTEXITCODE" }
+    } -Remote $true
+
+    New-AWToolCard ([string][char]0xE8B7) 'Group Policy update' 'Re-applies Group Policy now (gpupdate /force) instead of waiting for the next refresh.' 'Update' $false {
+        Start-AWCommandTask 'Group Policy update' {
+            # Answer "N" to any restart / log-off prompt. Remotely only computer policy applies.
+            if ($Sync.Remote) { & cmd.exe /c 'echo N| gpupdate /target:computer /force' 2>&1 } else { & cmd.exe /c 'echo N| gpupdate /force' 2>&1 }
+            "AWEXIT $LASTEXITCODE"
+        }
+    } -Remote $true -Unavailable $(if (-not (Test-AWRemote) -and -not (Test-Path "$env:SystemRoot\System32\gpupdate.exe")) { 'gpupdate is not available on this edition of Windows' } else { '' })
+
+    New-AWToolCard ([string][char]0xE72C) 'Restart Explorer' 'Restarts the Windows shell. Fixes a frozen taskbar or Start menu without signing out.' 'Restart' $false {
+        Restart-AWExplorer
     }
+
+    New-AWToolCard ([string][char]0xE7AC) 'Reset default apps' 'Removes custom default-app associations (DISM), then opens Default apps where Reset restores Microsoft defaults.' 'Reset' $true {
+        if (-not (Confirm-AW "Remove the custom default app associations$(Get-AWWhere)?")) { return }
+        Start-AWCommandTask 'Reset default app associations' { & dism.exe /Online /Remove-DefaultAppAssociations 2>&1; "AWEXIT $LASTEXITCODE" }
+        if (-not (Test-AWRemote)) { Start-Process 'ms-settings:defaultapps' }
+    } -Accent 'Purple' -Remote $true
+
+    New-AWToolCard ([string][char]0xE74D) 'Junk file cleanup' 'Temp folders, error reports, crash dumps, update and Delivery Optimization caches live in the Cleaner.' 'Open Cleaner' $false {
+        Select-AWView 'Cleaner'
+    } -Remote $true
 
     New-AWToolCard ([string][char]0xE74D) 'Empty Recycle Bin' 'Permanently removes everything in the Recycle Bin on all drives.' 'Empty' $false {
         if (Confirm-AW 'Permanently empty the Recycle Bin on all drives?') {
@@ -2596,37 +3696,76 @@ function Initialize-AWTools {
         }
     } -Accent 'Purple'
 
-    New-AWToolCard ([string][char]0xE90F) 'Component store cleanup' 'Runs DISM /StartComponentCleanup to remove superseded Windows update components. Can take 5-15 minutes.' 'Run DISM' $true {
-        if (-not (Confirm-AW 'Run DISM component store cleanup now? This can take several minutes.')) { return }
-        Start-AWTask -Name 'DISM component cleanup' -Work {
-            $Sync.Status = 'DISM /Online /Cleanup-Image /StartComponentCleanup running...'
-            & dism.exe /Online /Cleanup-Image /StartComponentCleanup /NoRestart 2>&1 | ForEach-Object {
-                $l = "$_".Trim()
-                if ($l -and $l -notmatch '^\[=*') { Write-WLog "DISM: $l" }
-                if ($l -match '(\d+(\.\d+)?)%') { $Sync.Progress = [int][double]$Matches[1] }
+    # ---------------- Repair
+    Add-AWToolSection 'Repair'
+
+    New-AWToolCard ([string][char]0xE9F5) 'System File Checker' 'Runs sfc /scannow to find and repair corrupted Windows system files. Takes 10-20 minutes.' 'Run SFC' $true {
+        if (-not (Confirm-AW "Run System File Checker$(Get-AWWhere)? This can take 10-20 minutes.")) { return }
+        Start-AWCommandTask 'System File Checker' { & sfc.exe /scannow 2>&1; "AWEXIT $LASTEXITCODE" }
+    } -Remote $true
+
+    New-AWToolCard ([string][char]0xE90F) 'Repair Windows image' 'DISM /RestoreHealth repairs the component store from Windows Update. Run it when SFC cannot fix files.' 'Run DISM' $true {
+        if (-not (Confirm-AW "Run DISM RestoreHealth$(Get-AWWhere)? This can take 10-30 minutes and needs internet access.")) { return }
+        Start-AWCommandTask 'DISM RestoreHealth' { & dism.exe /Online /Cleanup-Image /RestoreHealth /NoRestart 2>&1; "AWEXIT $LASTEXITCODE" }
+    } -Accent 'Purple' -Remote $true
+
+    New-AWToolCard ([string][char]0xE895) 'Reset Windows Update' 'Stops update services, renames SoftwareDistribution and catroot2, then restarts them. Fixes stuck updates.' 'Reset' $true {
+        if (-not (Confirm-AW "Reset the Windows Update components$(Get-AWWhere)?`n`nUpdate history shown in Settings will be cleared; installed updates are not affected.")) { return }
+        Start-AWCommandTask 'Reset Windows Update' {
+            $svcs = @('wuauserv', 'bits', 'cryptsvc', 'msiserver')
+            foreach ($s in $svcs) {
+                try { Stop-Service -Name $s -Force -ErrorAction Stop; Write-WLog "Stopped $s" }
+                catch { Write-WLog "Could not stop ${s}: $($_.Exception.Message)" 'WARN' }
             }
-            Write-WLog "DISM exit code $LASTEXITCODE"
-        } -OnComplete { param($r) $script:IdleStatus = 'Component store cleanup finished - see Activity log'; Update-AWDashboard }
-    }
+            foreach ($d in @("$env:SystemRoot\SoftwareDistribution", "$env:SystemRoot\System32\catroot2")) {
+                $old = "$d.old"
+                if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+                try { Rename-Item -LiteralPath $d -NewName ((Split-Path $d -Leaf) + '.old') -ErrorAction Stop; Write-WLog "Renamed $d to $old" }
+                catch { Write-WLog "Could not rename ${d}: $($_.Exception.Message)" 'WARN' }
+            }
+            [array]::Reverse($svcs)
+            foreach ($s in $svcs) {
+                try { Start-Service -Name $s -ErrorAction Stop; Write-WLog "Started $s" }
+                catch { Write-WLog "Could not start ${s}: $($_.Exception.Message)" 'WARN' }
+            }
+            'AWEXIT 0'
+        }
+    } -Remote $true
+
+    $ccm = "$env:SystemRoot\CCM\ccmrepair.exe"
+    New-AWToolCard ([string][char]0xE7B8) 'Repair Software Center' 'Repairs the Configuration Manager (SCCM) client that powers Software Center. Runs in the background.' 'Repair' $true {
+        if (-not (Confirm-AW "Start a Configuration Manager client repair$(Get-AWWhere)?")) { return }
+        Start-AWCommandTask 'ConfigMgr client repair' {
+            $exe = "$env:SystemRoot\CCM\ccmrepair.exe"
+            if (Test-Path -LiteralPath $exe) {
+                Start-Process -FilePath $exe
+                'Repair started. Progress is logged to C:\Windows\CCM\Logs\ccmrepair.log and ccmsetup.log'
+                'AWEXIT 0'
+            } else { 'The ConfigMgr client is not installed on this computer'; 'AWEXIT 1' }
+        }
+    } -Accent 'Purple' -Remote $true -Unavailable $(if (-not (Test-AWRemote) -and -not (Test-Path -LiteralPath $ccm)) { 'The Configuration Manager client is not installed on this PC' } else { '' })
+
+    # ---------------- Maintenance
+    Add-AWToolSection 'Maintenance'
+
+    New-AWToolCard ([string][char]0xE90F) 'Component store cleanup' 'Runs DISM /StartComponentCleanup to remove superseded Windows update components. Can take 5-15 minutes.' 'Run DISM' $true {
+        if (-not (Confirm-AW "Run DISM component store cleanup$(Get-AWWhere)? This can take several minutes.")) { return }
+        Start-AWCommandTask 'DISM component cleanup' { & dism.exe /Online /Cleanup-Image /StartComponentCleanup /NoRestart 2>&1; "AWEXIT $LASTEXITCODE" }
+    } -Remote $true
 
     New-AWToolCard ([string][char]0xE777) 'Create restore point' 'Saves a System Restore checkpoint before you make bigger changes. Windows allows one every 24 hours by default.' 'Create' $true {
-        Start-AWTask -Name 'Create restore point' -Work {
-            $Sync.Status = 'Creating System Restore point...'
-            try {
-                $r = Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint `
-                     -Arguments @{ Description = 'AWiper checkpoint'; RestorePointType = [uint32]12; EventType = [uint32]100 } -ErrorAction Stop
-                if ($r.ReturnValue -eq 0) { Write-WLog 'Restore point created' }
-                else { Write-WLog "Restore point returned code $($r.ReturnValue) (System Protection may be off for this drive)" 'WARN' }
-            } catch { Write-WLog "Restore point failed: $($_.Exception.Message)" 'ERROR' }
-        } -OnComplete { param($r) $script:IdleStatus = 'Restore point request finished - see Activity log' }
-    } -Accent 'Purple'
+        Start-AWRestorePoint
+    } -Accent 'Purple' -Remote $true
 
-    New-AWToolCard ([string][char]0xE72C) 'Restart Explorer' 'Restarts the Windows shell. Fixes a frozen taskbar or Start menu without signing out.' 'Restart' $false {
-        Get-Process -Name explorer -ErrorAction SilentlyContinue | Stop-Process -Force
-        Start-Sleep -Milliseconds 1200
-        if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
-        Write-AWLog 'Explorer restarted'; Set-AWStatus 'Explorer restarted'
+    $hibDesc = 'Turns off hibernation and Fast Startup and deletes hiberfil.sys. Re-enable with powercfg /h on.'
+    if (-not (Test-AWRemote)) {
+        try { $hf = Get-Item -LiteralPath "$env:SystemDrive\hiberfil.sys" -Force -ErrorAction Stop; $hibDesc = "Frees $(Format-AWSize $hf.Length) by deleting hiberfil.sys. Also turns off Fast Startup. Undo: powercfg /h on." }
+        catch { }
     }
+    New-AWToolCard ([string][char]0xE708) 'Disable hibernation' $hibDesc 'Disable' $true {
+        if (-not (Confirm-AW "Turn off hibernation$(Get-AWWhere)?`n`nThis also disables Fast Startup. Sleep is not affected.")) { return }
+        Start-AWCommandTask 'Disable hibernation' { & powercfg.exe /hibernate off 2>&1; "AWEXIT $LASTEXITCODE" }
+    } -Remote $true
 
     New-AWToolCard ([string][char]0xE7C3) 'Windows Disk Cleanup' 'Opens the built-in Disk Cleanup for anything AWiper does not cover, like old Windows installations.' 'Open' $false {
         Start-Process cleanmgr.exe
@@ -2637,7 +3776,7 @@ function Initialize-AWTools {
     } -Accent 'Purple'
 
     New-AWToolCard ([string][char]0xE713) 'Refresh dashboard' 'Re-reads drive space and system information after big changes.' 'Refresh' $false {
-        Update-AWDashboard; Initialize-AWMapDrives; Set-AWStatus 'Dashboard refreshed'
+        Update-AWDashboard; Initialize-AWMapDrives; Initialize-AWTools; Set-AWStatus 'Dashboard refreshed'
     }
 }
 
@@ -2669,6 +3808,7 @@ Enable-AWSort $ui.LargeList    @{ Name = 'Name'; Size = 'Size'; Type = 'Extensio
 Enable-AWSort $ui.ProgList     @{ Name = 'Name'; Publisher = 'Publisher'; Version = 'Version'; Installed = 'Installed'; Size = 'SizeBytes'; Scope = 'Scope' }
 Enable-AWSort $ui.StartupList  @{ Name = 'Name'; Scope = 'Scope'; Source = 'Location'; Status = 'Enabled' }
 Enable-AWSort $ui.CleanResults @{ Item = 'Name'; Group = 'Group'; Size = 'Bytes' }
+Enable-AWSort $ui.AppList      @{ App = 'Name'; Category = 'Category'; Notes = 'Note' }
 #endregion
 
 #region ---------------------------------------------------------------- Startup + run
@@ -2678,6 +3818,7 @@ $window.Add_Loaded({
         Initialize-AWCleaner
         Initialize-AWMapDrives
         Initialize-AWTools
+        Initialize-AWTweaks
     } catch { Write-AWLog "Startup: $($_.Exception.Message)" 'ERROR' }
     $script:Timer.Start()
     Write-AWLog ("AWiper {0} started - {1} - PowerShell {2}" -f $script:AppVersion, $(if ($script:IsAdmin) { 'administrator' } else { 'standard user' }), $PSVersionTable.PSVersion)
