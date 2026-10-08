@@ -6,12 +6,14 @@
     AWiper bundles the most useful parts of tools like CCleaner and SpaceMonger:
 
       * Dashboard    - drive usage gauges, system summary, quick actions
+      * Health Check - disks, crashes, hardware errors, stability, devices, battery, antivirus, pending
+                       restart, local network - read-only, works offline, never counts missing data as healthy
       * Cleaner      - analyze / clean temp files, caches, update leftovers, dumps, recycle bin
       * Space Map    - SpaceMonger-style nested treemap of any drive or folder (drill down, recycle)
       * Large Files  - the 1,000 largest files from the last scan, searchable, recycle or export
       * Recovery     - restore from any user's Recycle Bin, find deleted files in shadow-copy snapshots,
-                       native NTFS undelete (reads the MFT directly), deep scan with Windows File Recovery,
-                       per-drive recoverability (SSD/TRIM) check
+                       native NTFS undelete (reads the MFT directly), restore-point manager, deep scan with
+                       Windows File Recovery, per-drive recoverability (SSD/TRIM) check
       * Startup      - enable / disable startup entries (same StartupApproved switches Task Manager uses)
       * Programs     - installed software list with size, search and uninstall
       * Debloat      - remove preinstalled Store apps, turn off ads, suggestions, Copilot and other extras
@@ -21,6 +23,16 @@
 
     AWiper can also work on another computer over PowerShell remoting (WinRM). Pick the target from
     the button in the title bar; credentials can be saved to Windows Credential Manager.
+
+    Offline: AWiper detects whether the internet is reachable (or use offline mode / -Offline) and then
+    uses a Resources folder (next to the script, or <drive>:\AWiper\Resources on a USB stick) for
+    Windows repair media, Defender definitions and more. Every change is written to an action log
+    (%ProgramData%\AWiper\Logs, plus the Application event log when elevated) and tweaks can be undone.
+
+    Headless: pass any of the command-line parameters below to run without a window, e.g. from a
+    scheduled task or across a fleet with -ComputerName. Changes are only previewed unless -Yes is given.
+    Exit codes: 0 OK, 1 a step failed, 2 bad arguments, 3 health warnings, 4 health problems,
+    5 PowerShell is in ConstrainedLanguage mode (App Control / AppLocker; sign the script).
 
     On launch AWiper asks for administrator rights (UAC). If the prompt is declined or
     elevation is not possible, it keeps running with standard permissions and simply
@@ -39,6 +51,46 @@
 .PARAMETER Elevated
     Internal - set when AWiper relaunches itself elevated, prevents a prompt loop.
 
+.PARAMETER Config
+    Headless: a JSON profile, e.g. {"Clean":["Default"],"ApplyTweaks":["AdId","FileExt"],"RemoveApps":["Recommended"],
+    "RestorePoint":"Monthly maintenance","HealthCheck":true}. Only built-in rule / tweak IDs are accepted.
+
+.PARAMETER Analyze
+    Headless: measure cleaning rules (the -Clean list, or the defaults). Nothing is deleted.
+
+.PARAMETER Clean
+    Headless: cleaning rule IDs (see -ListRules), or Default / All.
+
+.PARAMETER HealthCheck
+    Headless: run the health check. Exit code 3 = warnings, 4 = problems.
+
+.PARAMETER ApplyTweak
+    Headless: tweak IDs to apply (see -ListTweaks). The previous values are saved for undo.
+
+.PARAMETER RevertTweak
+    Headless: tweak IDs to set back to the Windows default.
+
+.PARAMETER RemoveApp
+    Headless: Store package names or wildcards (see -ListApps), or Recommended.
+
+.PARAMETER RestorePoint
+    Headless: create a restore point with this description before the other changes.
+
+.PARAMETER ComputerName
+    Headless: run against another PC over WinRM. Use with -Credential or -UseSavedCredential.
+
+.PARAMETER Offline
+    Never use the internet; use the Resources folder instead.
+
+.PARAMETER Format
+    Headless output: Text (default) or Json.
+
+.PARAMETER OutFile
+    Headless: also save the results as JSON to this file.
+
+.PARAMETER Yes
+    Headless: actually make the changes. Without it they're only listed.
+
 .EXAMPLE
     .\AWiper.ps1
     Prompts for admin rights, then opens the AWiper window.
@@ -46,9 +98,21 @@
 .EXAMPLE
     powershell.exe -ExecutionPolicy Bypass -File .\AWiper.ps1 -NoElevate
 
+.EXAMPLE
+    .\AWiper.ps1 -HealthCheck -Format Json -OutFile C:\Reports\health.json
+    Runs the health check without a window and saves the result.
+
+.EXAMPLE
+    .\AWiper.ps1 -Clean Default -ApplyTweak AdId,Suggestions -Yes
+    Cleans with the default rules and applies two tweaks (from an elevated prompt for the admin-only items).
+
+.EXAMPLE
+    .\AWiper.ps1 -ComputerName PC042 -UseSavedCredential -Clean WinTemp,WerSys -Yes
+    Cleans machine-wide junk on another PC over WinRM.
+
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.4.0
+    Version : 1.5.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -57,11 +121,46 @@
 param(
     [switch]$NoElevate,
     [switch]$ShowConsole,
-    [switch]$Elevated
+    [switch]$Elevated,
+
+    # ---- Headless (command-line) mode. Any of these runs AWiper without a window.
+    [string]$Config,                 # JSON profile: Clean, ApplyTweaks, RevertTweaks, RemoveApps, RestorePoint, HealthCheck
+    [switch]$Analyze,                # measure cleaning rules (nothing is deleted)
+    [string[]]$Clean,                # rule IDs to clean, or 'Default' / 'All'
+    [switch]$HealthCheck,            # run the health check
+    [string[]]$ApplyTweak,           # tweak IDs to apply
+    [string[]]$RevertTweak,          # tweak IDs to set back to Windows defaults
+    [string[]]$RemoveApp,            # Store package names / patterns, or 'Recommended'
+    [string]$RestorePoint,           # create a restore point with this description
+    [switch]$ListRules,
+    [switch]$ListTweaks,
+    [switch]$ListApps,
+    [string]$ComputerName,           # run against a remote PC over WinRM
+    [pscredential]$Credential,
+    [switch]$UseSavedCredential,     # use credentials saved for -ComputerName in Credential Manager
+    [switch]$Offline,                # never use the internet
+    [string]$Resources,              # path to an AWiper Resources folder
+    [ValidateSet('Text', 'Json')][string]$Format = 'Text',
+    [string]$OutFile,                # also write the results (JSON) to this file
+    [switch]$Yes                     # actually make changes (without it, changes are only listed)
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.4.0'
+$script:AppVersion = '1.5.0'
+$script:CliMode = [bool]($Config -or $Analyze -or $Clean -or $HealthCheck -or $ApplyTweak -or $RevertTweak -or $RemoveApp -or
+                         $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps)
+
+# Under App Control / AppLocker, unsigned scripts run in ConstrainedLanguage mode, which blocks WPF,
+# embedded C# and most .NET/COM use. Explain instead of failing with a wall of red text.
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    Write-Host ''
+    Write-Host "AWiper can't run here: PowerShell is in $($ExecutionContext.SessionState.LanguageMode) mode." -ForegroundColor Yellow
+    Write-Host 'This PC enforces App Control (WDAC) or AppLocker, which only allows trusted, signed scripts to use'
+    Write-Host 'the features AWiper needs. Ask your administrator to sign AWiper.ps1 with a certificate the policy'
+    Write-Host 'trusts (keep settings in separate JSON profiles - editing a signed script breaks its signature).'
+    if (-not $script:CliMode -and [Environment]::UserInteractive) { try { [void](Read-Host 'Press Enter to close') } catch { } }
+    exit 5
+}
 
 #region ---------------------------------------------------------------- Elevation / STA
 function Test-AWAdmin {
@@ -95,7 +194,11 @@ function Invoke-AWElevation {
 $script:IsAdmin = Test-AWAdmin
 $script:ElevationNote = ''
 
-if (-not $script:IsAdmin -and -not $Elevated -and -not $NoElevate) {
+if ($script:CliMode) {
+    # Headless runs never pop a UAC prompt (output would land in a hidden window); admin-only work is skipped.
+    if (-not $script:IsAdmin) { $script:ElevationNote = 'Not elevated - items that need administrator rights are skipped.' }
+}
+elseif (-not $script:IsAdmin -and -not $Elevated -and -not $NoElevate) {
     if (Invoke-AWElevation) { exit }
     $script:ElevationNote = 'Admin prompt was declined or unavailable - running with standard permissions.'
 }
@@ -107,7 +210,7 @@ elseif (-not $script:IsAdmin) {
 }
 
 # WPF needs a single-threaded apartment. Relaunch with -STA if needed (same permission level).
-if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+if (-not $script:CliMode -and [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     if ($PSCommandPath) {
         $exe = (Get-Process -Id $PID).Path
         Start-Process -FilePath $exe -ArgumentList (Get-AWRelaunchArgs -AddNoElevate) | Out-Null
@@ -1049,6 +1152,8 @@ namespace AWiper
         [DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList(uint[] list, uint count);
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SHEmptyRecycleBin(IntPtr hwnd, string root, uint flags);
+        // Deletes one System Restore point by sequence number (the API System Properties uses). Returns 0 on success.
+        [DllImport("srclient.dll")] public static extern int SRRemoveRestorePoint(int sequenceNumber);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern bool GetVolumePathName(string fileName, System.Text.StringBuilder volumePath, uint length);
@@ -1076,7 +1181,7 @@ namespace AWiper
 }
 
 # Hide the console only when AWiper owns it (double-click / elevated relaunch), never a shared terminal.
-if (-not $ShowConsole -and [AWiper.Native]::OwnsConsole()) {
+if (-not $script:CliMode -and -not $ShowConsole -and [AWiper.Native]::OwnsConsole()) {
     $hwnd = [AWiper.Native]::GetConsoleWindow()
     if ($hwnd -ne [IntPtr]::Zero) { [void][AWiper.Native]::ShowWindow($hwnd, 0) }
 }
@@ -1088,7 +1193,7 @@ $script:LogFile   = Join-Path $script:DataDir 'AWiper.log'
 $script:StateFile = Join-Path $script:DataDir 'state.json'
 if (-not (Test-Path -LiteralPath $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
 
-$script:State = @{ TotalFreed = [long]0; Cleans = 0; LastClean = ''; RecentTargets = @() }
+$script:State = @{ TotalFreed = [long]0; Cleans = 0; LastClean = ''; RecentTargets = @(); AutoRestorePoint = $true; ResourcesPath = ''; ForceOffline = $false }
 try {
     if (Test-Path -LiteralPath $script:StateFile) {
         $j = Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json
@@ -1096,6 +1201,9 @@ try {
         $script:State.Cleans     = [int]$j.Cleans
         $script:State.LastClean  = if ($j.LastClean -is [datetime]) { $j.LastClean.ToString('o') } else { [string]$j.LastClean }
         if ($j.RecentTargets) { $script:State.RecentTargets = @($j.RecentTargets | ForEach-Object { [string]$_ }) }
+        if ($null -ne $j.AutoRestorePoint) { $script:State.AutoRestorePoint = [bool]$j.AutoRestorePoint }
+        if ($j.ResourcesPath) { $script:State.ResourcesPath = [string]$j.ResourcesPath }
+        if ($null -ne $j.ForceOffline) { $script:State.ForceOffline = [bool]$j.ForceOffline }
     }
 } catch { }
 
@@ -1115,6 +1223,68 @@ function Write-AWLog {
 }
 
 function Format-AWSize([long]$Bytes) { [AWiper.Fmt]::Size($Bytes) }
+
+# ---------------- Action log (append-only JSON lines) and undo journal
+# Every change AWiper makes is recorded: who, when, which computer, what, and the result.
+# Lines go to %ProgramData%\AWiper\Logs\actions-<yyyy-MM>.jsonl and, when running as admin,
+# to the Application event log (source "AWiper") so event forwarding / SIEM can pick them up.
+$script:ActionLogDir = Join-Path $env:ProgramData 'AWiper\Logs'
+$script:UndoFile = Join-Path $script:DataDir 'undo.json'
+
+function Write-AWAction([string]$Action, $Items = @(), [hashtable]$Details = @{}, [string]$Result = 'Started', [string]$UndoId = '') {
+    $target = if ($script:Target) { $script:Target.ComputerName } else { $env:COMPUTERNAME }
+    $entry = [ordered]@{
+        Time = (Get-Date).ToString('o'); User = "$env:USERDOMAIN\$env:USERNAME"; Computer = $env:COMPUTERNAME; Target = $target
+        Action = $Action; Items = @($Items | ForEach-Object { "$_" }); Details = $Details; Result = $Result; UndoId = $UndoId
+        Mode = $(if ($script:CliMode) { 'CLI' } else { 'GUI' }); Version = $script:AppVersion
+    }
+    $line = ConvertTo-Json -InputObject $entry -Compress -Depth 6
+    foreach ($dir in @($script:ActionLogDir, (Join-Path $script:DataDir 'Logs'))) {
+        try {
+            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            [IO.File]::AppendAllText((Join-Path $dir ('actions-{0:yyyy-MM}.jsonl' -f (Get-Date))), $line + "`n")
+            break
+        } catch { }
+    }
+    if ($script:IsAdmin) {
+        try {
+            if (-not [Diagnostics.EventLog]::SourceExists('AWiper')) { [Diagnostics.EventLog]::CreateEventSource('AWiper', 'Application') }
+            $msg = "AWiper $Action on $target by $($entry.User): $Result`n" + (($entry.Items | Select-Object -First 50) -join "`n")
+            [Diagnostics.EventLog]::WriteEntry('AWiper', $msg, $(if ($Result -match 'fail|error') { 'Warning' } else { 'Information' }), 1000)
+        } catch { }
+    }
+}
+
+function Get-AWUndoJournal {
+    try {
+        if (-not (Test-Path -LiteralPath $script:UndoFile)) { return @() }
+        $j = Get-Content -LiteralPath $script:UndoFile -Raw | ConvertFrom-Json
+        @($j)
+    } catch { @() }
+}
+
+function Save-AWUndoJournal($Entries) {
+    try { ConvertTo-Json -InputObject @($Entries | Select-Object -Last 200) -Depth 8 | Set-Content -LiteralPath $script:UndoFile -Encoding UTF8 } catch { }
+}
+
+# Records the "before" snapshot returned by a change (e.g. Set-WTweak) so it can be put back later.
+function Add-AWUndoEntry($Capture) {
+    $id = [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $entry = [pscustomobject]@{
+        Id = $id; Time = (Get-Date).ToString('o'); Label = [string]$Capture.Label; Kind = [string]$Capture.UndoKind
+        Target = $(if ($script:Target) { $script:Target.ComputerName } else { $env:COMPUTERNAME })
+        TargetHost = $(if ($script:Target) { $script:Target.Host } else { '' })
+        Snapshot = @($Capture.Snapshot | ForEach-Object { [pscustomobject]@{ Path = $_.Path; Name = $_.Name; Existed = $_.Existed; Prev = $_.Prev; Kind = $_.Kind } })
+        RemoveKeys = @($Capture.RemoveKeys); Undone = $false
+    }
+    Save-AWUndoJournal (@(Get-AWUndoJournal) + $entry)
+    $id
+}
+
+# Description for an automatic restore point before a risky batch, or $null when the option is off.
+function Get-AWAutoRP([string]$Reason) {
+    if ($script:State.AutoRestorePoint -and ($script:IsAdmin -or $script:Target)) { "AWiper - before $Reason" } else { $null }
+}
 #endregion
 
 #region ---------------------------------------------------------------- Worker library (runs inside background runspaces)
@@ -1124,7 +1294,7 @@ function Write-WLog {
     $line = '{0:HH:mm:ss}  {1,-5}  {2}' -f (Get-Date), $Level, $Message
     # On a remote machine the line travels back on the information stream (see Invoke-WTarget).
     if ($Sync.Remote) { Write-Information -MessageData $line -InformationAction SilentlyContinue }
-    else { $Sync.Log.Enqueue($line) }
+    else { $Sync.Log.Enqueue($line); if ($Sync.Echo) { [Console]::Out.WriteLine($line) } }
 }
 
 function Format-WSize([long]$Bytes) {
@@ -1266,7 +1436,42 @@ function Test-WTweak($Tweak) {
     $true
 }
 
+function Get-WRegValueKind([string]$Path, [string]$Name) {
+    try { [string](Get-Item -LiteralPath $Path -ErrorAction Stop).GetValueKind($(if ($Name -eq '(default)') { '' } else { $Name })) } catch { $null }
+}
+
+# Snapshot of registry values before a change, for the undo journal.
+function Get-WRegSnapshot($Values) {
+    foreach ($v in $Values) {
+        [pscustomobject]@{
+            Path = $v.Path; Name = $v.Name; Existed = (Test-Path -LiteralPath $v.Path)
+            Prev = (Get-WRegValue $v.Path $v.Name); Kind = (Get-WRegValueKind $v.Path $v.Name)
+        }
+    }
+}
+
+# Puts registry values back exactly as a snapshot recorded them (absent values are removed again).
+function Restore-WRegSnapshot($Snapshot, $RemoveKeys = @()) {
+    foreach ($s in $Snapshot) {
+        if ($null -eq $s.Prev) {
+            if ($s.Name -ne '(default)') { Remove-ItemProperty -LiteralPath $s.Path -Name $s.Name -ErrorAction SilentlyContinue }
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $s.Path)) { New-Item -Path $s.Path -Force | Out-Null }
+        $val = $s.Prev
+        switch ($s.Kind) { 'Binary' { $val = [byte[]]@($s.Prev) } 'MultiString' { $val = [string[]]@($s.Prev) } }
+        if ($s.Name -eq '(default)') { Set-Item -LiteralPath $s.Path -Value $val }
+        else { New-ItemProperty -LiteralPath $s.Path -Name $s.Name -PropertyType $(if ($s.Kind) { $s.Kind } else { 'String' }) -Value $val -Force | Out-Null }
+    }
+    # Keys the change created (e.g. the classic context-menu CLSID) are removed when nothing existed before.
+    foreach ($k in $RemoveKeys) {
+        $created = @($Snapshot | Where-Object { $_.Path -like "$k*" -and -not $_.Existed }).Count -gt 0
+        if ($created -and $k -like 'HK*:\Software\Classes\CLSID\{*}') { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Set-WTweak($Tweak, [bool]$Apply) {
+    $before = @(Get-WRegSnapshot $Tweak.Values)
     foreach ($v in $Tweak.Values) {
         if ($Apply -or $null -ne $v.Revert) {
             $val = if ($Apply) { $v.Value } else { $v.Revert }
@@ -1282,6 +1487,297 @@ function Set-WTweak($Tweak, [bool]$Apply) {
         foreach ($k in $Tweak.RemoveKeys) { if ($k -like 'HK*:\Software\Classes\CLSID\{*}') { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction SilentlyContinue } }
     }
     Write-WLog ('{0} tweak: {1}' -f $(if ($Apply) { 'Applied' } else { 'Reverted' }), $Tweak.Name)
+    [pscustomobject]@{ UndoKind = 'Registry'; TweakId = $Tweak.Id; Applied = $Apply; Label = ('{0} "{1}"' -f $(if ($Apply) { 'Applied' } else { 'Reverted' }), $Tweak.Name); Snapshot = $before; RemoveKeys = @($Tweak.RemoveKeys) }
+}
+
+# Creates a restore point even if one was made in the last 24 hours (Windows' default throttle):
+# the SystemRestorePointCreationFrequency value is set to 0 for the call and put back afterwards.
+function New-WRestorePoint([string]$Description) {
+    $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+    $prev = Get-WRegValue $key 'SystemRestorePointCreationFrequency'
+    try {
+        New-ItemProperty -LiteralPath $key -Name 'SystemRestorePointCreationFrequency' -PropertyType DWord -Value 0 -Force | Out-Null
+        $r = Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint `
+             -Arguments @{ Description = $Description; RestorePointType = [uint32]12; EventType = [uint32]100 } -ErrorAction Stop
+        if ($r.ReturnValue -eq 0) { Write-WLog "Restore point created: $Description"; return $true }
+        Write-WLog "Restore point returned code $($r.ReturnValue) - System Protection may be off for the system drive" 'WARN'
+        $false
+    } catch { Write-WLog "Restore point failed: $($_.Exception.Message)" 'ERROR'; $false }
+    finally {
+        if ($null -eq $prev) { Remove-ItemProperty -LiteralPath $key -Name 'SystemRestorePointCreationFrequency' -ErrorAction SilentlyContinue }
+        else { New-ItemProperty -LiteralPath $key -Name 'SystemRestorePointCreationFrequency' -PropertyType DWord -Value $prev -Force | Out-Null }
+    }
+}
+
+# Removable Store packages for this user (or all users when $AllUsers), plus whether a provisioned copy exists.
+function Get-WStoreAppsRaw([bool]$AllUsers) {
+    if ($PSVersionTable.PSVersion.Major -ge 7) { Import-Module Appx -UseWindowsPowerShell -WarningAction SilentlyContinue -ErrorAction SilentlyContinue }
+    $prov = @{}
+    if ($AllUsers) {
+        try { foreach ($p in (Get-AppxProvisionedPackage -Online -ErrorAction Stop)) { $prov[$p.DisplayName] = $true } }
+        catch { Write-WLog "Could not read provisioned apps: $($_.Exception.Message)" 'WARN' }
+    }
+    $pk = if ($AllUsers) { Get-AppxPackage -AllUsers } else { Get-AppxPackage }
+    foreach ($p in $pk) {
+        if ($p.IsFramework -or $p.NonRemovable -or "$($p.SignatureKind)" -eq 'System') { continue }
+        [pscustomobject]@{ Name = [string]$p.Name; FullName = [string]$p.PackageFullName; Version = [string]$p.Version; Publisher = [string]$p.Publisher; Prov = [bool]$prov[$p.Name] }
+    }
+}
+
+function Remove-WStoreApp($App, [bool]$AllUsers, [bool]$Prov) {
+    if ($PSVersionTable.PSVersion.Major -ge 7) { Import-Module Appx -UseWindowsPowerShell -WarningAction SilentlyContinue -ErrorAction SilentlyContinue }
+    $done = $false
+    if ($AllUsers) {
+        try { Get-AppxPackage -AllUsers -Name $App.Package | Remove-AppxPackage -AllUsers -ErrorAction Stop; $done = $true }
+        catch { Write-WLog "$($App.Name): all-users removal failed ($($_.Exception.Message)), trying current user" 'WARN' }
+    }
+    if (-not $done) {
+        $mine = @(Get-AppxPackage -Name $App.Package)
+        if ($mine.Count) { $mine | Remove-AppxPackage -ErrorAction Stop }
+        else { Write-WLog "$($App.Name): not installed for this account" 'WARN' }
+    }
+    if ($Prov -and $App.Provisioned) {
+        Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $App.Package } |
+            Remove-AppxProvisionedPackage -Online -ErrorAction Stop | Out-Null
+        Write-WLog "$($App.Name): removed provisioned copy (new users won't get it)"
+    }
+    Write-WLog "Removed $($App.Name)"
+}
+
+# ---------------------------------------------------------------- Offline repair media
+# Opens Windows install media (an .iso under Resources\ISO, or an extracted folder containing
+# sources\install.wim|esd), picks the image index matching this PC's edition and compares builds.
+# DISM can only repair from the same feature release; older update levels may repair only partly.
+function Open-WRepairSource([string]$MediaPath) {
+    $src = [ordered]@{ Media = $MediaPath; Root = $null; Mounted = $null; Wim = $null; Index = 0; ImageName = ''; Build = 0; Ubr = 0; Sxs = $null; Usable = $false; Warning = '' }
+    if ($MediaPath -like '*.iso') {
+        $img = Mount-DiskImage -ImagePath $MediaPath -PassThru -ErrorAction Stop
+        $src.Mounted = $MediaPath
+        $letter = $null
+        for ($i = 0; $i -lt 20 -and -not $letter; $i++) { $letter = ($img | Get-Volume -ErrorAction SilentlyContinue).DriveLetter; if (-not $letter) { Start-Sleep -Milliseconds 250 } }
+        if (-not $letter) { throw "Mounted $MediaPath but Windows did not give it a drive letter." }
+        $src.Root = "$($letter):\"
+    } else { $src.Root = $MediaPath }
+    $sxs = Join-Path $src.Root 'sources\sxs'
+    if (Test-Path -LiteralPath $sxs) { $src.Sxs = $sxs }
+    foreach ($n in 'install.wim', 'install.esd') { $p = Join-Path $src.Root "sources\$n"; if (Test-Path -LiteralPath $p) { $src.Wim = $p; break } }
+    if (-not $src.Wim) { $src.Warning = 'No sources\install.wim or install.esd on this media.'; return [pscustomobject]$src }
+
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $myBuild = [int]$cv.CurrentBuild; $myUbr = [int]$cv.UBR; $myEdition = [string]$cv.EditionID
+    $pick = $null
+    foreach ($im in @(Get-WindowsImage -ImagePath $src.Wim -ErrorAction Stop)) {
+        $info = Get-WindowsImage -ImagePath $src.Wim -Index $im.ImageIndex -ErrorAction Stop
+        if (-not $pick) { $pick = $info }
+        if ($info.EditionId -eq $myEdition) { $pick = $info; break }
+    }
+    $src.Index = [int]$pick.ImageIndex; $src.ImageName = [string]$pick.ImageName
+    $src.Build = [int]$pick.Build; $src.Ubr = [int]$pick.SPBuild
+    if ($src.Build -ne $myBuild) {
+        $src.Warning = "This media is Windows build $($src.Build), but this PC runs build $myBuild. DISM can only repair from the same Windows version - use matching media."
+    } else {
+        $src.Usable = $true
+        $notes = @()
+        if ($pick.EditionId -ne $myEdition) { $notes += "no $myEdition image on this media, using $($pick.EditionId)" }
+        if ($src.Ubr -lt $myUbr) { $notes += "the media is older ($($src.Build).$($src.Ubr)) than this PC's updates ($myBuild.$myUbr), so some files may not be repairable" }
+        $src.Warning = $notes -join '; '
+    }
+    [pscustomobject]$src
+}
+
+function Close-WRepairSource($Source) {
+    if ($Source -and $Source.Mounted) { Dismount-DiskImage -ImagePath $Source.Mounted -ErrorAction SilentlyContinue | Out-Null }
+}
+
+# DISM source argument for an install image: wim:<path>:<index> or esd:<path>:<index>.
+function Get-WDismSourceArg($Source) {
+    $kind = if ($Source.Wim -like '*.esd') { 'esd' } else { 'wim' }
+    "/Source:$($kind):$($Source.Wim):$($Source.Index)"
+}
+
+# ---------------------------------------------------------------- Resources manifest (SHA-256)
+function New-WResourceManifest([string]$Root) {
+    $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'manifest.json' })
+    $i = 0
+    $list = foreach ($f in $files) {
+        $i++; $Sync.Status = "Hashing $($f.Name) ($i of $($files.Count))..."; $Sync.Progress = [int]($i * 100 / [Math]::Max(1, $files.Count))
+        [ordered]@{ Path = $f.FullName.Substring($Root.TrimEnd('\').Length + 1); Size = $f.Length; Sha256 = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash }
+    }
+    $doc = [ordered]@{ Created = (Get-Date).ToString('o'); Computer = $env:COMPUTERNAME; Files = @($list) }
+    ConvertTo-Json -InputObject $doc -Depth 4 | Set-Content -LiteralPath (Join-Path $Root 'manifest.json') -Encoding UTF8
+    Write-WLog "Resources manifest written: $($files.Count) file(s)"
+    $files.Count
+}
+
+function Test-WResourceManifest([string]$Root) {
+    $mf = Join-Path $Root 'manifest.json'
+    if (-not (Test-Path -LiteralPath $mf)) { Write-WLog 'No manifest.json in the Resources folder - use "Build manifest" on a trusted copy first' 'WARN'; return $null }
+    $doc = Get-Content -LiteralPath $mf -Raw | ConvertFrom-Json
+    $bad = 0; $ok = 0; $i = 0; $all = @($doc.Files)
+    foreach ($e in $all) {
+        $i++; $Sync.Status = "Verifying $($e.Path) ($i of $($all.Count))..."; $Sync.Progress = [int]($i * 100 / [Math]::Max(1, $all.Count))
+        $p = Join-Path $Root $e.Path
+        if (-not (Test-Path -LiteralPath $p)) { Write-WLog "Missing: $($e.Path)" 'WARN'; $bad++; continue }
+        if ((Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash -ne $e.Sha256) { Write-WLog "Changed or corrupt: $($e.Path)" 'ERROR'; $bad++; continue }
+        $ok++
+    }
+    Write-WLog ("Resources check: {0} file(s) OK, {1} problem(s) (manifest from {2})" -f $ok, $bad, $doc.Created) $(if ($bad) { 'WARN' } else { 'INFO' })
+    [pscustomobject]@{ Ok = $ok; Bad = $bad; Created = [string]$doc.Created }
+}
+
+# ---------------------------------------------------------------- Health check
+# Every row: Id, Name, Status (Good / Warning / Problem / Info / NA), Detail, Action.
+# NA means the data source isn't available here - it must never be counted as healthy.
+function Get-WHealth {
+    $rows = New-Object System.Collections.Generic.List[object]
+    $add = { param($Id, $Name, $Status, $Detail, $Action) $rows.Add([pscustomobject]@{ Id = $Id; Name = $Name; Status = $Status; Detail = $Detail; Action = [string]$Action }) }
+    $since = (Get-Date).AddDays(-30)
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    # Disks: Windows' health flag plus whatever reliability counters the driver exposes.
+    try {
+        foreach ($d in @(Get-PhysicalDisk -ErrorAction Stop | Sort-Object DeviceId)) {
+            $rc = $null
+            try { $rc = $d | Get-StorageReliabilityCounter -ErrorAction Stop } catch { }
+            $facts = New-Object System.Collections.Generic.List[string]; $status = 'Good'; $why = @()
+            $hs = "$($d.HealthStatus)"
+            if ($hs -and $hs -ne 'Healthy' -and $hs -ne '0') { $status = 'Problem'; $why += "Windows reports the disk as $hs" }
+            if ($rc) {
+                if ($rc.Temperature -gt 0) { $facts.Add("$($rc.Temperature) C"); if ($rc.Temperature -ge 70 -and $status -eq 'Good') { $status = 'Warning'; $why += 'running hot' } }
+                if ($rc.Wear -gt 0) {
+                    $facts.Add("$($rc.Wear)% of rated life used")
+                    if ($rc.Wear -ge 90) { $status = 'Problem'; $why += 'nearly worn out' } elseif ($rc.Wear -ge 70 -and $status -eq 'Good') { $status = 'Warning'; $why += 'heavily worn' }
+                }
+                if ($rc.PowerOnHours -gt 0) { $facts.Add(('{0:N0} hours powered on' -f $rc.PowerOnHours)) }
+                if ($rc.ReadErrorsUncorrected -gt 0 -or $rc.WriteErrorsUncorrected -gt 0) { $status = 'Problem'; $why += 'uncorrected read/write errors' }
+            }
+            if ($status -eq 'Good' -and $facts.Count -eq 0 -and (-not $hs -or $hs -eq 'Unknown')) {
+                $status = 'NA'; $why += $(if ("$($d.BusType)" -eq 'USB') { 'health data is not passed through this USB enclosure' } else { 'the drive does not report health data' })
+            }
+            $detail = (@($why) + @($facts)) -join ' - '
+            if (-not $detail) { $detail = 'Windows reports the disk as healthy' + $(if (-not $rc -and -not $isAdmin) { ' (run as admin to also see wear and temperature)' } else { '' }) }
+            & $add "Disk$($d.DeviceId)" "Disk: $($d.FriendlyName)" $status $detail 'Map'
+        }
+    } catch { & $add 'Disk' 'Disk health' 'NA' "Not available: $($_.Exception.Message)" '' }
+
+    # SMART failure prediction (SATA drives; NVMe drives don't expose this class).
+    try {
+        $sm = @(Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop)
+        if ($sm.Count) {
+            $bad = @($sm | Where-Object { $_.PredictFailure })
+            if ($bad.Count) { & $add 'Smart' 'SMART failure prediction' 'Problem' "$($bad.Count) drive(s) predict a failure - back up now" 'Backup' }
+            else { & $add 'Smart' 'SMART failure prediction' 'Good' "$($sm.Count) drive(s) report no predicted failure" '' }
+        } else { & $add 'Smart' 'SMART failure prediction' 'NA' 'No SATA SMART data (normal for NVMe drives)' '' }
+    } catch { & $add 'Smart' 'SMART failure prediction' 'NA' $(if ($isAdmin) { 'No SATA SMART data (normal for NVMe drives)' } else { 'Needs administrator rights' }) '' }
+
+    # Free space on the system drive.
+    try {
+        $sd = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction Stop
+        $pct = [Math]::Round($sd.FreeSpace * 100.0 / $sd.Size, 1)
+        $st = if ($pct -lt 5) { 'Problem' } elseif ($pct -lt 10) { 'Warning' } else { 'Good' }
+        & $add 'Space' "Free space on $($env:SystemDrive)" $st ('{0} free ({1}%)' -f (Format-WSize $sd.FreeSpace), $pct) 'Cleaner'
+    } catch { & $add 'Space' 'Free space' 'NA' $_.Exception.Message '' }
+
+    # Crashes and unexpected shutdowns in the last 30 days.
+    try {
+        $bsod = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001; StartTime = $since } -ErrorAction SilentlyContinue)
+        $kp   = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41; StartTime = $since } -ErrorAction SilentlyContinue)
+        $dirty = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'EventLog'; Id = 6008; StartTime = $since } -ErrorAction SilentlyContinue)
+        if ($bsod.Count) { & $add 'Crash' 'Crashes (30 days)' 'Problem' ('{0} blue screen(s), last on {1:MMM d}. {2} unexpected shutdown(s).' -f $bsod.Count, $bsod[0].TimeCreated, $kp.Count) 'Reliability' }
+        elseif ($kp.Count -or $dirty.Count) { & $add 'Crash' 'Crashes (30 days)' 'Warning' ('{0} unexpected shutdown(s) - power loss, a hard reset or a hang' -f [Math]::Max($kp.Count, $dirty.Count)) 'Reliability' }
+        else { & $add 'Crash' 'Crashes (30 days)' 'Good' 'No blue screens or unexpected shutdowns' 'Reliability' }
+    } catch { & $add 'Crash' 'Crashes (30 days)' 'NA' $_.Exception.Message '' }
+
+    # Hardware errors reported by the CPU / chipset (WHEA).
+    try {
+        $wh = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = $since } -ErrorAction SilentlyContinue)
+        $fatal = @($wh | Where-Object { $_.Level -le 2 })
+        if ($fatal.Count) { & $add 'Whea' 'Hardware errors (30 days)' 'Problem' "$($fatal.Count) uncorrected hardware error(s) - check memory, CPU and overclocking" 'Memory' }
+        elseif ($wh.Count) { & $add 'Whea' 'Hardware errors (30 days)' 'Warning' "$($wh.Count) corrected hardware error(s)" 'Memory' }
+        else { & $add 'Whea' 'Hardware errors (30 days)' 'Good' 'None reported' '' }
+    } catch { & $add 'Whea' 'Hardware errors (30 days)' 'NA' $_.Exception.Message '' }
+
+    # Last Windows Memory Diagnostic result.
+    try {
+        $md = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results' } -MaxEvents 1 -ErrorAction SilentlyContinue
+        if (-not $md) { & $add 'MemTest' 'Memory test' 'Info' 'Never run on this PC' 'Memory' }
+        elseif ($md.Id -eq 1202) { & $add 'MemTest' 'Memory test' 'Problem' ('Found errors on {0:MMM d, yyyy} - a memory module is likely faulty' -f $md.TimeCreated) 'Memory' }
+        else { & $add 'MemTest' 'Memory test' 'Good' ('Passed on {0:MMM d, yyyy}' -f $md.TimeCreated) 'Memory' }
+    } catch { & $add 'MemTest' 'Memory test' 'NA' $_.Exception.Message '' }
+
+    # Reliability Monitor's stability index (1-10).
+    try {
+        $si = Get-CimInstance Win32_ReliabilityStabilityMetrics -ErrorAction Stop | Sort-Object TimeGenerated -Descending | Select-Object -First 1
+        if ($si) {
+            $v = [Math]::Round([double]$si.SystemStabilityIndex, 1)
+            $st = if ($v -ge 8) { 'Good' } elseif ($v -ge 5) { 'Warning' } else { 'Problem' }
+            & $add 'Stability' 'Stability index' $st "$v out of 10 (Reliability Monitor)" 'Reliability'
+        } else { & $add 'Stability' 'Stability index' 'NA' 'Reliability Monitor has no data yet' 'Reliability' }
+    } catch { & $add 'Stability' 'Stability index' 'NA' 'Reliability Monitor data is not available' '' }
+
+    # Devices with driver problems (disabled and disconnected devices are ignored).
+    try {
+        $pd = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' -ErrorAction Stop | Where-Object { $_.ConfigManagerErrorCode -notin 22, 24, 45 })
+        if ($pd.Count) { & $add 'Devices' 'Device problems' 'Warning' ("$($pd.Count): " + (($pd | Select-Object -First 3 | ForEach-Object { "$($_.Name) (code $($_.ConfigManagerErrorCode))" }) -join ', ')) 'Devices' }
+        else { & $add 'Devices' 'Device problems' 'Good' 'All devices are working' 'Devices' }
+    } catch { & $add 'Devices' 'Device problems' 'NA' $_.Exception.Message '' }
+
+    # Battery wear (laptops only).
+    try {
+        if (@(Get-CimInstance Win32_Battery -ErrorAction Stop).Count) {
+            $xmlPath = Join-Path ([IO.Path]::GetTempPath()) ('awiper-battery-{0}.xml' -f [guid]::NewGuid().ToString('N'))
+            & powercfg.exe /batteryreport /xml /output $xmlPath 2>&1 | Out-Null
+            [xml]$x = Get-Content -LiteralPath $xmlPath -Raw
+            Remove-Item -LiteralPath $xmlPath -Force -ErrorAction SilentlyContinue
+            $b = @($x.BatteryReport.Batteries.Battery)[0]
+            $design = [double]$b.DesignCapacity; $full = [double]$b.FullChargeCapacity
+            if ($design -gt 0 -and $full -gt 0 -and $full -le $design * 1.1) {
+                $wear = [Math]::Round((1 - $full / $design) * 100)
+                if ($wear -lt 0) { $wear = 0 }
+                $cyc = if ([int]$b.CycleCount -gt 0) { ", $($b.CycleCount) charge cycles" } else { '' }
+                $st = if ($wear -ge 40) { 'Problem' } elseif ($wear -ge 20) { 'Warning' } else { 'Good' }
+                & $add 'Battery' 'Battery' $st "$wear% worn (holds $([int]$full) of $([int]$design) mWh)$cyc" ''
+            } else { & $add 'Battery' 'Battery' 'NA' 'The battery does not report its capacity' '' }
+        }
+    } catch { & $add 'Battery' 'Battery' 'NA' $_.Exception.Message '' }
+
+    # Antivirus: Microsoft Defender, or a third-party product registered with Security Center.
+    try {
+        $av3 = @()
+        try { $av3 = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop | Where-Object { $_.displayName -notmatch 'Windows Defender|Microsoft Defender' }) } catch { }
+        $mp = $null
+        try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch { }
+        if ($mp -and $mp.AMServiceEnabled -and $mp.RealTimeProtectionEnabled) {
+            $age = [int]$mp.AntivirusSignatureAge
+            $st = if ($age -gt 14) { 'Problem' } elseif ($age -gt 3) { 'Warning' } else { 'Good' }
+            & $add 'Defender' 'Antivirus' $st ("Microsoft Defender is on. Definitions are $age day(s) old" + $(if ($age -gt 3) { ' - update them, or import an offline update from Resources\defs' } else { '' })) 'Defender'
+        } elseif ($av3.Count) {
+            & $add 'Defender' 'Antivirus' 'Info' "Protected by $(($av3 | ForEach-Object displayName) -join ', ')" ''
+        } elseif ($mp) {
+            & $add 'Defender' 'Antivirus' 'Problem' 'Microsoft Defender real-time protection is off and no other antivirus is registered' 'Defender'
+        } else { & $add 'Defender' 'Antivirus' 'NA' 'Antivirus status is not available' '' }
+    } catch { & $add 'Defender' 'Antivirus' 'NA' $_.Exception.Message '' }
+
+    # Pending restart and uptime.
+    try {
+        $cbs = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        $wu  = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $days = [int]((Get-Date) - $os.LastBootUpTime).TotalDays
+        if ($cbs -or $wu) { & $add 'Reboot' 'Restart' 'Warning' "A restart is needed to finish installing updates (up $days day(s))" '' }
+        elseif ($days -ge 14) { & $add 'Reboot' 'Restart' 'Warning' "Not restarted in $days days - a restart often clears slowdowns" '' }
+        else { & $add 'Reboot' 'Restart' 'Good' "No restart pending (up $days day(s))" '' }
+    } catch { & $add 'Reboot' 'Restart' 'NA' $_.Exception.Message '' }
+
+    # Local network: is the default gateway answering? (No internet needed.)
+    try {
+        $gw = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Sort-Object RouteMetric | Select-Object -First 1
+        if (-not $gw) { & $add 'Network' 'Local network' 'Info' 'No default gateway - this PC is not on a routed network' '' }
+        elseif (Test-Connection -ComputerName $gw.NextHop -Count 1 -Quiet -ErrorAction SilentlyContinue) { & $add 'Network' 'Local network' 'Good' "Gateway $($gw.NextHop) is reachable" '' }
+        else { & $add 'Network' 'Local network' 'Warning' "Gateway $($gw.NextHop) did not answer a ping (it may block ping)" '' }
+    } catch { & $add 'Network' 'Local network' 'Info' 'No default gateway - this PC is not on a routed network' '' }
+
+    $rows
 }
 
 function Resolve-WTarget([string]$Path) {
@@ -1626,6 +2122,296 @@ $script:Tweaks = @(
     New-AWTweak 'Hidden' 'Taskbar and Explorer' 'Show hidden files' 'Shows hidden files and folders in File Explorer.' -Default $false -Explorer $true -Values @(
         (RegV $adv 'Hidden' 1 2))
 )
+#endregion
+
+#region ---------------------------------------------------------------- Offline mode + Resources folder
+# Online state: $true / $false / $null (unknown). Forced offline (switch, saved setting) always wins.
+$script:Online = $null
+$script:ForceOffline = [bool]$Offline -or [bool]$script:State.ForceOffline
+$script:ResourceDirs = @('ISO', 'LOF', 'updates', 'defs', 'apps', 'appx', 'drivers', 'tools')
+
+function Test-AWOffline { $script:ForceOffline -or ($script:Online -eq $false) }
+
+# Uses the result Windows' own connectivity check (NCSI) already computed, then one short probe of the
+# same endpoint Windows uses. "Unknown" is treated as online-capable; features still fail gracefully.
+function Test-AWInternet {
+    try {
+        $profiles = @(Get-NetConnectionProfile -ErrorAction Stop)
+        if (@($profiles | Where-Object { "$($_.IPv4Connectivity)" -eq 'Internet' -or "$($_.IPv6Connectivity)" -eq 'Internet' }).Count) { return $true }
+        if ($profiles.Count -eq 0) { return $false }
+    } catch { }
+    try {
+        $req = [Net.WebRequest]::Create('http://www.msftconnecttest.com/connecttest.txt')
+        $req.Timeout = 3000
+        $resp = $req.GetResponse()
+        $text = (New-Object IO.StreamReader($resp.GetResponseStream())).ReadToEnd(); $resp.Close()
+        return $text -eq 'Microsoft Connect Test'
+    } catch { return $false }
+}
+
+# A Resources folder holds everything AWiper needs offline: ISO\ (Windows media), updates\, defs\,
+# drivers\, apps\, appx\, LOF\, tools\. It can live next to AWiper.ps1, on any drive as
+# <drive>:\AWiper\Resources (handy on a USB stick), or anywhere chosen in Tools.
+function Find-AWResources {
+    $cands = New-Object System.Collections.Generic.List[string]
+    if ($Resources) { $cands.Add($Resources) }
+    if ($script:State.ResourcesPath) { $cands.Add($script:State.ResourcesPath) }
+    if ($PSCommandPath) { $cands.Add((Join-Path (Split-Path $PSCommandPath) 'Resources')) }
+    foreach ($d in [IO.DriveInfo]::GetDrives()) {
+        if (("$($d.DriveType)" -eq 'Fixed' -or "$($d.DriveType)" -eq 'Removable') -and $d.IsReady) { $cands.Add((Join-Path $d.RootDirectory.FullName 'AWiper\Resources')) }
+    }
+    foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c -PathType Container)) { return (Resolve-Path -LiteralPath $c).ProviderPath } }
+    $null
+}
+
+# Windows install media found under Resources\ISO: .iso files, or folders that contain sources\install.wim|esd.
+function Get-AWRepairMedia([string]$Root) {
+    if (-not $Root) { return }
+    $iso = Join-Path $Root 'ISO'
+    if (-not (Test-Path -LiteralPath $iso)) { return }
+    foreach ($f in @(Get-ChildItem -LiteralPath $iso -Filter '*.iso' -File -ErrorAction SilentlyContinue)) { [pscustomobject]@{ Kind = 'ISO'; Path = $f.FullName; Name = $f.Name } }
+    foreach ($d in @($iso) + @(Get-ChildItem -LiteralPath $iso -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName)) {
+        if ((Test-Path -LiteralPath (Join-Path $d 'sources\install.wim')) -or (Test-Path -LiteralPath (Join-Path $d 'sources\install.esd'))) {
+            [pscustomobject]@{ Kind = 'Folder'; Path = $d; Name = Split-Path $d -Leaf }
+        }
+    }
+}
+
+function New-AWResourceLayout([string]$Root) {
+    foreach ($d in $script:ResourceDirs) { New-Item -ItemType Directory -Path (Join-Path $Root $d) -Force | Out-Null }
+    @'
+AWiper Resources folder - everything AWiper needs to work without internet.
+
+  ISO\       Windows install media matching your PCs (an .iso, or its extracted files).
+             Used for "Repair Windows image" and ".NET Framework 3.5" with no internet.
+  LOF\       Languages and Optional Features media (Features on Demand).
+  updates\   wsusscn2.cab and downloaded .msu update packages.
+  defs\      Microsoft Defender offline definitions (x64\mpam-fe.exe).
+  drivers\   Exported drivers, one folder per PC model.
+  apps\      Installers; appx\  Store app packages (.msixbundle / .appx) with dependencies.
+  tools\     Your own utilities (e.g. Sysinternals - they can't be redistributed, so bring your own copy).
+
+Put this folder next to AWiper.ps1, or at <drive>:\AWiper\Resources on a USB stick, and AWiper finds it.
+Use "Build manifest" in AWiper's Tools on a trusted copy, then "Verify" on other machines to detect
+missing or tampered files (SHA-256).
+'@ | Set-Content -LiteralPath (Join-Path $Root 'README.txt') -Encoding UTF8
+}
+#endregion
+
+#region ---------------------------------------------------------------- Headless (command-line) mode
+function Write-AWCli([string]$Text, [string]$Color = '') {
+    if ($Format -ne 'Text') { return }
+    if ($Color) { Write-Host $Text -ForegroundColor $Color } else { Write-Host $Text }
+}
+
+function Read-AWConfig([string]$Path) {
+    $j = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    @{
+        Clean = @($j.Clean | Where-Object { $_ }); ApplyTweaks = @($j.ApplyTweaks | Where-Object { $_ }); RevertTweaks = @($j.RevertTweaks | Where-Object { $_ })
+        RemoveApps = @($j.RemoveApps | Where-Object { $_ }); RestorePoint = [string]$j.RestorePoint; HealthCheck = [bool]$j.HealthCheck; Analyze = [bool]$j.Analyze
+    }
+}
+
+function Invoke-AWCli {
+    $Sync.Echo = ($Format -eq 'Text')
+    . ([scriptblock]::Create($Sync.WorkerLib))
+    $Target = $null
+    $result = [ordered]@{ Computer = $env:COMPUTERNAME; Target = $env:COMPUTERNAME; Started = (Get-Date).ToString('o'); DryRun = (-not $Yes); Admin = $script:IsAdmin; Steps = @() }
+    $failed = $false; $healthCode = 0
+
+    # ---- inputs: switches plus an optional JSON profile (profiles only reference built-in IDs)
+    $want = @{ Clean = @($Clean); ApplyTweaks = @($ApplyTweak); RevertTweaks = @($RevertTweak); RemoveApps = @($RemoveApp); RestorePoint = $RestorePoint; HealthCheck = [bool]$HealthCheck; Analyze = [bool]$Analyze }
+    if ($Config) {
+        try { $cfg = Read-AWConfig $Config } catch { Write-Host "Could not read profile $($Config): $($_.Exception.Message)" -ForegroundColor Red; return 2 }
+        foreach ($k in 'Clean', 'ApplyTweaks', 'RevertTweaks', 'RemoveApps') { $want[$k] = @($want[$k]) + @($cfg[$k]) }
+        if (-not $want.RestorePoint) { $want.RestorePoint = $cfg.RestorePoint }
+        $want.HealthCheck = $want.HealthCheck -or $cfg.HealthCheck; $want.Analyze = $want.Analyze -or $cfg.Analyze
+    }
+    foreach ($k in 'Clean', 'ApplyTweaks', 'RevertTweaks', 'RemoveApps') { $want[$k] = @($want[$k] | Where-Object { $_ } | ForEach-Object { "$_".Split(',') } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique) }
+
+    $rules = @()
+    foreach ($r in $want.Clean) {
+        if ($r -eq 'Default') { $rules += @($script:CleanerRules | Where-Object { $_.Default }) }
+        elseif ($r -eq 'All') { $rules += $script:CleanerRules }
+        else {
+            $m = @($script:CleanerRules | Where-Object { $_.Id -eq $r })
+            if (-not $m.Count) { Write-Host "Unknown cleaning rule '$r'. Use -ListRules to see the IDs." -ForegroundColor Red; return 2 }
+            $rules += $m
+        }
+    }
+    if ($want.Analyze -and -not $rules.Count) { $rules = @($script:CleanerRules | Where-Object { $_.Default }) }
+    $rules = @($rules | Sort-Object { $_.Id } -Unique)
+    $tweakSel = @{}
+    foreach ($pair in @(@('ApplyTweaks', $true), @('RevertTweaks', $false))) {
+        foreach ($id in $want[$pair[0]]) {
+            $tw = @($script:Tweaks | Where-Object { $_.Id -eq $id })
+            if (-not $tw.Count) { Write-Host "Unknown tweak '$id'. Use -ListTweaks to see the IDs." -ForegroundColor Red; return 2 }
+            $tweakSel[$id] = @{ Tweak = $tw[0]; Apply = $pair[1] }
+        }
+    }
+
+    # ---- target
+    if ($ComputerName) {
+        $cred = $Credential
+        if (-not $cred -and $UseSavedCredential) {
+            $saved = try { [AWiper.CredMan]::Read('AWiper:' + $ComputerName.ToLowerInvariant()) } catch { $null }
+            if (-not $saved) { Write-Host "No saved credentials for $ComputerName in Credential Manager." -ForegroundColor Red; return 2 }
+            $cred = New-Object System.Management.Automation.PSCredential($saved[0], (ConvertTo-SecureString $saved[1] -AsPlainText -Force))
+        }
+        try {
+            $p = @{ ComputerName = $ComputerName; ScriptBlock = { $env:COMPUTERNAME }; ErrorAction = 'Stop' }
+            if ($cred) { $p.Credential = $cred }
+            $name = Invoke-Command @p
+        } catch { Write-Host "Could not connect to $($ComputerName): $($_.Exception.Message)" -ForegroundColor Red; return 1 }
+        $Target = @{ Host = $ComputerName; Credential = $cred; ComputerName = [string]$name }
+        $script:Target = $Target
+        $result.Target = [string]$name
+    }
+    $remote = [bool]$Target
+    $canAdmin = $script:IsAdmin -or $remote
+    $wantsChanges = ($want.Clean.Count -and -not $want.Analyze) -or $want.ApplyTweaks.Count -or $want.RevertTweaks.Count -or $want.RemoveApps.Count -or $want.RestorePoint
+    Write-AWCli ("AWiper {0} - {1}{2}{3}" -f $script:AppVersion, $result.Target, $(if ($remote) { ' (remote)' } else { '' }), $(if ($wantsChanges -and -not $Yes) { ' - preview only, add -Yes to make changes' } else { '' })) Cyan
+    if ($script:ElevationNote -and -not $remote) { Write-AWCli $script:ElevationNote Yellow }
+
+    # ---- listings
+    if ($ListRules) {
+        $rows = $script:CleanerRules | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Group = $_.Group; Name = $_.Name; Admin = $_.Admin; Default = $_.Default } }
+        Write-AWCli ($rows | Format-Table -AutoSize | Out-String).TrimEnd()
+        $result.Steps += [ordered]@{ Step = 'ListRules'; Items = @($rows) }
+    }
+    if ($ListTweaks) {
+        $rows = $script:Tweaks | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Group = $_.Group; Name = $_.Name; Admin = $_.Admin; Default = $_.Default } }
+        Write-AWCli ($rows | Format-Table -AutoSize | Out-String).TrimEnd()
+        $result.Steps += [ordered]@{ Step = 'ListTweaks'; Items = @($rows) }
+    }
+
+    # Catalog-matched Store apps (protected system apps are never offered)
+    $appList = $null
+    $getApps = {
+        $raw = @(Invoke-WTarget { param($AllUsers) Get-WStoreAppsRaw $AllUsers } -ArgumentList @($canAdmin))
+        $seen = @{}
+        foreach ($p in $raw) {
+            if ($seen[$p.Name]) { continue }; $seen[$p.Name] = $true
+            $match = $null; foreach ($c in $script:BloatCatalog) { if ($p.Name -like $c.Pattern) { $match = $c; break } }
+            if (-not $match) { $prot = $false; foreach ($x in $script:ProtectedApps) { if ($p.Name -like $x) { $prot = $true; break } }; if ($prot) { continue } }
+            [pscustomobject]@{ Package = $p.Name; Name = $(if ($match) { $match.Name } else { $p.Name }); Category = $(if ($match) { $match.Category } else { 'Other' }); Recommended = [bool]($match -and $match.Recommended); Provisioned = $p.Prov }
+        }
+    }
+    if ($ListApps) {
+        $appList = @(& $getApps)
+        Write-AWCli ($appList | Sort-Object Category, Name | Format-Table Package, Name, Category, Recommended -AutoSize | Out-String).TrimEnd()
+        $result.Steps += [ordered]@{ Step = 'ListApps'; Items = @($appList) }
+    }
+
+    # ---- health check (read-only)
+    if ($want.HealthCheck) {
+        Write-AWCli "`nHealth check" Cyan
+        $rows = @(Invoke-WTarget { Get-WHealth } | Where-Object { $_.Status })
+        foreach ($r in $rows) {
+            $c = switch ($r.Status) { 'Good' { 'Green' } 'Warning' { 'Yellow' } 'Problem' { 'Red' } default { 'Gray' } }
+            Write-AWCli ('  {0,-8} {1,-28} {2}' -f $r.Status.ToUpper(), $r.Name, $r.Detail) $c
+        }
+        $cnt = @{}; foreach ($s in 'Good', 'Warning', 'Problem', 'Info', 'NA') { $cnt[$s] = @($rows | Where-Object { $_.Status -eq $s }).Count }
+        Write-AWCli ("  {0} good, {1} warning(s), {2} problem(s), {3} not available here" -f $cnt.Good, $cnt.Warning, $cnt.Problem, $cnt.NA)
+        $healthCode = if ($cnt.Problem) { 4 } elseif ($cnt.Warning) { 3 } else { 0 }
+        $result.Steps += [ordered]@{ Step = 'HealthCheck'; Items = @($rows); Summary = $cnt }
+    }
+
+    # ---- restore point (explicit, or automatic before tweaks / app removal)
+    $rpDesc = $want.RestorePoint
+    if (-not $rpDesc -and $Yes -and ($want.ApplyTweaks.Count -or $want.RemoveApps.Count)) { $rpDesc = Get-AWAutoRP 'command-line changes' }
+    if ($rpDesc) {
+        if (-not $canAdmin) { Write-AWCli 'Restore point skipped: needs administrator rights.' Yellow }
+        elseif (-not $Yes) { Write-AWCli "Would create restore point '$rpDesc'." }
+        else {
+            $ok = [bool](@(Invoke-WTarget { param($d) New-WRestorePoint $d } -ArgumentList @($rpDesc)) | Select-Object -Last 1)
+            Write-AWAction 'RestorePoint' @($rpDesc) @{} $(if ($ok) { 'Done' } else { 'Failed' })
+            $result.Steps += [ordered]@{ Step = 'RestorePoint'; Description = $rpDesc; Ok = $ok }
+        }
+    }
+
+    # ---- cleaning
+    if ($rules.Count) {
+        $doClean = $Yes -and $want.Clean.Count -and -not $want.Analyze
+        Write-AWCli $(if ($doClean) { "`nCleaning" } else { "`nAnalyzing (nothing is deleted)" }) Cyan
+        $items = @()
+        foreach ($rule in $rules) {
+            $userScope = $rule.Kind -eq 'RecycleBin' -or $rule.Action -eq 'Clipboard' -or @($rule.Targets | Where-Object { $_.Path -match '%(TEMP|LOCALAPPDATA|APPDATA|USERPROFILE)%' }).Count
+            if ($remote -and $userScope) { Write-AWCli "  skipped  $($rule.Name) (per-user, this PC only)" Gray; continue }
+            if ($rule.Admin -and -not $canAdmin) { Write-AWCli "  skipped  $($rule.Name) (needs admin)" Gray; continue }
+            try {
+                $r = if ($doClean) { Invoke-WTarget { param($x) Invoke-WClean $x } -ArgumentList @(, $rule) } else { Invoke-WTarget { param($x) Measure-WItem $x } -ArgumentList @(, $rule) }
+                $r = @($r | Where-Object { $_ -is [hashtable] -or $_.Bytes -ne $null }) | Select-Object -Last 1
+                Write-AWCli ('  {0,10}  {1,-28} {2}' -f (Format-AWSize ([long]$r.Bytes)), $rule.Name, $r.Note)
+                $items += [ordered]@{ Id = $rule.Id; Name = $rule.Name; Files = [long]$r.Files; Bytes = [long]$r.Bytes; Note = [string]$r.Note }
+            } catch { Write-AWCli "  failed   $($rule.Name): $($_.Exception.Message)" Red; $failed = $true }
+        }
+        [long]$total = 0; foreach ($i in $items) { $total += $i.Bytes }
+        Write-AWCli ('  {0} {1}' -f (Format-AWSize $total), $(if ($doClean) { 'freed' } else { 'can be cleaned' })) Green
+        if ($doClean) {
+            $script:State.TotalFreed += $total; $script:State.Cleans++; $script:State.LastClean = (Get-Date).ToString('o'); Save-AWState
+            Write-AWAction 'Clean' ($items | ForEach-Object { $_.Id }) @{ Bytes = $total } 'Done'
+        }
+        $result.Steps += [ordered]@{ Step = $(if ($doClean) { 'Clean' } else { 'Analyze' }); Items = $items; TotalBytes = $total }
+    }
+
+    # ---- tweaks
+    if ($tweakSel.Count) {
+        Write-AWCli "`nTweaks" Cyan
+        $done = @()
+        foreach ($id in $tweakSel.Keys) {
+            $t = $tweakSel[$id].Tweak; $apply = $tweakSel[$id].Apply
+            $hklmOnly = -not @($t.Values | Where-Object { $_.Path -notlike 'HKLM:*' }).Count
+            if ($remote -and -not $hklmOnly) { Write-AWCli "  skipped  $($t.Name) (per-user setting, this PC only)" Gray; continue }
+            if (-not $remote -and $t.Admin -and -not $script:IsAdmin) { Write-AWCli "  skipped  $($t.Name) (needs admin)" Gray; continue }
+            if (-not $Yes) { Write-AWCli ("  would {0} {1}" -f $(if ($apply) { 'apply ' } else { 'revert' }), $t.Name); continue }
+            try {
+                $cap = @(Invoke-WTarget { param($Tw, $On) Set-WTweak $Tw $On } -ArgumentList @($t, $apply)) | Where-Object { $_.UndoKind } | Select-Object -Last 1
+                $uid = if ($cap) { Add-AWUndoEntry $cap } else { '' }
+                Write-AWAction $(if ($apply) { 'ApplyTweak' } else { 'RevertTweak' }) @($t.Id) @{} 'Done' $uid
+                $done += [ordered]@{ Id = $t.Id; Applied = $apply; UndoId = $uid }
+            } catch { Write-AWCli "  failed   $($t.Name): $($_.Exception.Message)" Red; $failed = $true }
+        }
+        $result.Steps += [ordered]@{ Step = 'Tweaks'; Items = $done }
+    }
+
+    # ---- Store app removal
+    if ($want.RemoveApps.Count) {
+        Write-AWCli "`nStore apps" Cyan
+        if (-not $appList) { $appList = @(& $getApps) }
+        $sel = @($appList | Where-Object {
+            $a = $_
+            @($want.RemoveApps | Where-Object { ($_ -eq 'Recommended' -and $a.Recommended) -or ($_ -ne 'Recommended' -and $a.Package -like $_) }).Count
+        })
+        if (-not $sel.Count) { Write-AWCli '  No matching apps are installed.' Gray }
+        $removed = @()
+        foreach ($a in $sel) {
+            if (-not $Yes) { Write-AWCli "  would remove $($a.Name) ($($a.Package))"; continue }
+            try {
+                Invoke-WTarget { param($App, $AllUsers, $Prov) Remove-WStoreApp $App $AllUsers $Prov } -ArgumentList @(@{ Name = $a.Name; Package = $a.Package; Provisioned = $a.Provisioned }, $canAdmin, $canAdmin)
+                $removed += $a.Package
+            } catch { Write-AWCli "  failed   $($a.Name): $($_.Exception.Message)" Red; $failed = $true }
+        }
+        if ($removed.Count) { Write-AWAction 'RemoveApps' $removed @{ AllUsers = $canAdmin } 'Done' }
+        $result.Steps += [ordered]@{ Step = 'RemoveApps'; Items = @($sel | ForEach-Object Package); Removed = $removed }
+    }
+
+    # ---- finish: flush the activity log, write results
+    $line = $null; $buf = New-Object System.Text.StringBuilder
+    while ($Sync.Log.TryDequeue([ref]$line)) { [void]$buf.AppendLine($line) }
+    try { [IO.File]::AppendAllText($script:LogFile, $buf.ToString()) } catch { }
+    $code = if ($failed) { 1 } else { $healthCode }
+    $result.ExitCode = $code; $result.Finished = (Get-Date).ToString('o')
+    $json = ConvertTo-Json -InputObject $result -Depth 8
+    if ($OutFile) { try { $json | Set-Content -LiteralPath $OutFile -Encoding UTF8 } catch { Write-Host "Could not write $($OutFile): $($_.Exception.Message)" -ForegroundColor Red } }
+    if ($Format -eq 'Json') { [Console]::Out.WriteLine($json) }
+    $code
+}
+
+if ($script:CliMode) {
+    $code = Invoke-AWCli
+    exit ([int](@($code)[-1]))
+}
 #endregion
 
 #region ---------------------------------------------------------------- XAML
@@ -2187,6 +2973,13 @@ $script:Tweaks = @(
               <TextBlock Text="&#xE70D;" Style="{StaticResource Icon}" FontSize="9" Margin="8,1,0,0" Foreground="{StaticResource MutedBrush}"/>
             </StackPanel>
           </Button>
+          <Button x:Name="NetBtn" Margin="0,0,10,0" Padding="11,5" FontSize="12" WindowChrome.IsHitTestVisibleInChrome="True"
+                  ToolTip="Internet status. Click to switch offline mode on or off.">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock x:Name="NetIcon" Text="&#xE774;" Style="{StaticResource Icon}" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
+              <TextBlock x:Name="NetText" Text="Checking..." Margin="7,0,0,0"/>
+            </StackPanel>
+          </Button>
           <Border x:Name="AdminBadge" CornerRadius="13" Padding="11,5" BorderThickness="1" BorderBrush="#2E8F86" Background="#163A44">
             <StackPanel Orientation="Horizontal">
               <TextBlock x:Name="AdminIcon" Text="&#xEA18;" Style="{StaticResource Icon}" FontSize="12" Foreground="{StaticResource TealBrush}"/>
@@ -2221,6 +3014,7 @@ $script:Tweaks = @(
             <StackPanel>
               <TextBlock Text="MENU" Style="{StaticResource Caps}" Margin="8,4,0,6"/>
               <RadioButton x:Name="NavHome"     Style="{StaticResource NavBtn}" Tag="&#xE80F;" Content="Dashboard" IsChecked="True"/>
+              <RadioButton x:Name="NavHealth"   Style="{StaticResource NavBtn}" Tag="&#xE95E;" Content="Health Check"/>
               <RadioButton x:Name="NavCleaner"  Style="{StaticResource NavBtn}" Tag="&#xE74D;" Content="Cleaner"/>
               <RadioButton x:Name="NavMap"      Style="{StaticResource NavBtn}" Tag="&#xEB05;" Content="Space Map"/>
               <RadioButton x:Name="NavLarge"    Style="{StaticResource NavBtn}" Tag="&#xE7C3;" Content="Large Files"/>
@@ -2291,6 +3085,33 @@ $script:Tweaks = @(
                 </StackPanel>
               </Border>
             </Grid>
+          </Grid>
+
+          <!-- ===== Health Check ===== -->
+          <Grid x:Name="ViewHealth" Visibility="Collapsed">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Border Style="{StaticResource Card}" Padding="24,20">
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel>
+                  <TextBlock x:Name="HealthTitle" Text="Health check" Style="{StaticResource H1}"/>
+                  <TextBlock x:Name="HealthSummary" Text="Checks disks, crashes, hardware errors, devices, battery, antivirus and more. Read-only and works offline."
+                             Style="{StaticResource Muted}" Margin="0,6,0,12" MaxWidth="640" HorizontalAlignment="Left"/>
+                  <WrapPanel x:Name="HealthCounts"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                  <Button x:Name="HealthSave" Content="Save report..." Style="{StaticResource BtnChip}" IsEnabled="False"/>
+                  <Button x:Name="HealthRun" Style="{StaticResource BtnAccent}" Padding="20,10">
+                    <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE95E;" Style="{StaticResource Icon}" Margin="0,0,8,0"/><TextBlock Text="Run health check"/></StackPanel>
+                  </Button>
+                </StackPanel>
+              </Grid>
+            </Border>
+            <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="10,8">
+              <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel x:Name="HealthRows" Margin="4,0,8,0"/>
+              </ScrollViewer>
+            </Border>
           </Grid>
 
           <!-- ===== Cleaner ===== -->
@@ -2536,6 +3357,7 @@ $script:Tweaks = @(
                     <RadioButton x:Name="RecTabBin"    Style="{StaticResource SegBtn}" GroupName="RecTab" IsChecked="True" Content="Recycle Bin"/>
                     <RadioButton x:Name="RecTabShadow" Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Previous versions"/>
                     <RadioButton x:Name="RecTabUndel"  Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Undelete"/>
+                    <RadioButton x:Name="RecTabRP"     Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Restore points"/>
                     <RadioButton x:Name="RecTabDeep"   Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Deep scan"/>
                   </StackPanel>
                 </Border>
@@ -2726,6 +3548,67 @@ $script:Tweaks = @(
                   </ListView>
                 </DockPanel>
               </Border>
+
+              <!-- Restore points -->
+              <Grid x:Name="RecPanelRP" Visibility="Collapsed">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="340"/></Grid.ColumnDefinitions>
+                <Border Style="{StaticResource Card}" Padding="14,12">
+                  <DockPanel>
+                    <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                      <TextBlock Text="Restore points" Style="{StaticResource H2}" VerticalAlignment="Center"/>
+                      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button x:Name="RPRefresh" Content="Refresh" Style="{StaticResource BtnChip}"/>
+                        <Button x:Name="RPOpen" Content="Open System Restore" Style="{StaticResource BtnChip}" Margin="0"
+                                ToolTip="Windows' own wizard for rolling the PC back to a restore point"/>
+                      </StackPanel>
+                    </Grid>
+                    <Grid DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                      <TextBlock x:Name="RPInfo" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="4,0,160,0"/>
+                      <Button x:Name="RPDelete" Content="Delete selected" Style="{StaticResource BtnPurple}" Padding="14,6" FontSize="12" HorizontalAlignment="Right"/>
+                    </Grid>
+                    <ListView x:Name="RPList" SelectionMode="Extended">
+                      <ListView.View>
+                        <GridView>
+                          <GridViewColumn Header="Created" Width="170" DisplayMemberBinding="{Binding CreatedText}"/>
+                          <GridViewColumn Header="Description" Width="330">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Description}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Description}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                          <GridViewColumn Header="Type" Width="150">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding TypeText}" Foreground="#8C95BD"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                          <GridViewColumn Header="#" Width="60" DisplayMemberBinding="{Binding Sequence}"/>
+                        </GridView>
+                      </ListView.View>
+                    </ListView>
+                  </DockPanel>
+                </Border>
+                <Border Grid.Column="1" Style="{StaticResource Card}" Margin="16,0,0,0" Padding="18,14">
+                  <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="0,0,6,0">
+                      <TextBlock Text="New restore point" Style="{StaticResource H2}"/>
+                      <TextBox x:Name="RPDesc" Tag="Description, e.g. Before installing drivers" Margin="0,10,0,8"/>
+                      <Button x:Name="RPCreate" Content="Create restore point" Style="{StaticResource BtnAccent}" Padding="14,6" FontSize="12" HorizontalAlignment="Left"/>
+                      <TextBlock Text="AWiper works around Windows' one-per-24-hours limit for restore points you create here."
+                                 Style="{StaticResource Muted}" FontSize="11.5" Margin="0,8,0,0"/>
+
+                      <TextBlock Text="PROTECTION" Style="{StaticResource Caps}" Margin="0,18,0,6"/>
+                      <TextBlock x:Name="RPProtect" Text="" TextWrapping="Wrap" FontSize="12.5"/>
+                      <Button x:Name="RPEnable" Content="Turn on for system drive" Style="{StaticResource BtnChip}" HorizontalAlignment="Left" Margin="0,8,0,0" Visibility="Collapsed"/>
+
+                      <TextBlock Text="SPACE FOR RESTORE POINTS" Style="{StaticResource Caps}" Margin="0,18,0,6"/>
+                      <TextBlock x:Name="RPStorage" Text="" TextWrapping="Wrap" FontSize="12.5"/>
+                      <WrapPanel Margin="0,8,0,0">
+                        <Button x:Name="RPSize5"  Content="5%"  Style="{StaticResource BtnChip}" Tag="5"/>
+                        <Button x:Name="RPSize10" Content="10%" Style="{StaticResource BtnChip}" Tag="10"/>
+                        <Button x:Name="RPSize15" Content="15%" Style="{StaticResource BtnChip}" Tag="15"/>
+                      </WrapPanel>
+
+                      <TextBlock Text="SAFETY NET" Style="{StaticResource Caps}" Margin="0,18,0,6"/>
+                      <CheckBox x:Name="RPAuto" Content="Create one automatically before removing apps or applying tweaks"/>
+                    </StackPanel>
+                  </ScrollViewer>
+                </Border>
+              </Grid>
 
               <!-- Deep scan (Windows File Recovery) -->
               <Grid x:Name="RecPanelDeep" Visibility="Collapsed">
@@ -3018,7 +3901,28 @@ $script:Tweaks = @(
                   </ListView>
                 </DockPanel>
               </Border>
-              <Border Grid.Column="1" Style="{StaticResource Card}" Margin="16,0,0,0" Padding="16,14">
+              <Grid Grid.Column="1" Margin="16,0,0,0">
+              <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="230"/></Grid.RowDefinitions>
+              <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,14,0,0" Padding="16,12">
+                <DockPanel>
+                  <Grid DockPanel.Dock="Top" Margin="0,0,0,6">
+                    <TextBlock Text="Undo history" Style="{StaticResource H2}" VerticalAlignment="Center"/>
+                    <Button x:Name="UndoBtn" Content="Undo selected" Style="{StaticResource BtnChip}" HorizontalAlignment="Right" Margin="0"/>
+                  </Grid>
+                  <TextBlock DockPanel.Dock="Bottom" Text="Puts settings back exactly as they were before each change." Style="{StaticResource Muted}" FontSize="11.5" Margin="2,6,0,0"/>
+                  <ListBox x:Name="UndoList">
+                    <ListBox.ItemTemplate>
+                      <DataTemplate>
+                        <StackPanel Margin="2,2">
+                          <TextBlock Text="{Binding Label}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                          <TextBlock Text="{Binding Sub}" Foreground="#8C95BD" FontSize="11.5"/>
+                        </StackPanel>
+                      </DataTemplate>
+                    </ListBox.ItemTemplate>
+                  </ListBox>
+                </DockPanel>
+              </Border>
+              <Border Style="{StaticResource Card}" Padding="16,14">
                 <DockPanel>
                   <TextBlock DockPanel.Dock="Top" Text="Tweaks in effect" Style="{StaticResource H2}"/>
                   <TextBlock DockPanel.Dock="Top" Text="Check the ones to set back to the Windows default." Style="{StaticResource Muted}" FontSize="12" Margin="0,4,0,4"/>
@@ -3031,6 +3935,7 @@ $script:Tweaks = @(
                   </ScrollViewer>
                 </DockPanel>
               </Border>
+              </Grid>
             </Grid>
           </Grid>
 
@@ -3280,7 +4185,7 @@ $script:IdleStatus = 'Ready'
 
 #region ---------------------------------------------------------------- Navigation + title bar
 $script:ViewTitles = @{
-    Home = 'Dashboard'; Cleaner = 'Cleaner'; Map = 'Space Map'; Large = 'Large Files'; Recovery = 'Recovery'
+    Home = 'Dashboard'; Health = 'Health Check'; Cleaner = 'Cleaner'; Map = 'Space Map'; Large = 'Large Files'; Recovery = 'Recovery'
     Startup = 'Startup'; Programs = 'Programs'; Debloat = 'Debloat'; Rebloat = 'Rebloat'; Tools = 'Tools and Activity Log'
 }
 $script:Loaded = @{}
@@ -3299,6 +4204,7 @@ foreach ($v in $script:ViewTitles.Keys) {
                 'Debloat'  { Update-AWAppList; Update-AWTweakStatus }
                 'Recovery' { Initialize-AWRecovery }
                 'Rebloat'  { Initialize-AWRebloat }
+                'Health'   { Start-AWHealthCheck }
             }
         }
         if ($name -eq 'Map') { Request-AWMapRedraw }
@@ -3591,6 +4497,7 @@ function Show-AWCleanResults($Result, [string]$Mode) {
     } else {
         $ui.CleanSummary.Text = '{0} freed' -f (Format-AWSize $total)
         $ui.CleanSubtext.Text = '{0:N0} files removed. Files that were in use were skipped safely.' -f $files
+        Write-AWAction 'Clean' ($rows | ForEach-Object Name) @{ Bytes = $total; Files = $files } 'Done'
         $script:State.TotalFreed += $total
         $script:State.Cleans++
         $script:State.LastClean = (Get-Date).ToString('o')
@@ -4196,24 +5103,57 @@ function Restart-AWExplorer {
     Write-AWLog 'Explorer restarted'; Set-AWStatus 'Explorer restarted'
 }
 
-function Start-AWRestorePoint {
+function Start-AWRestorePoint([string]$Description = 'AWiper checkpoint') {
     if (-not (Test-AWCanAdmin)) { Show-AWMessage 'Creating a restore point needs administrator rights.'; return }
-    Start-AWTask -Name 'Create restore point' -Work {
+    if (-not $Description) { $Description = 'AWiper checkpoint' }
+    Start-AWTask -Name 'Create restore point' -Arguments @{ Desc = $Description } -Work {
         $Sync.Status = 'Creating System Restore point...'
-        try {
-            Invoke-WTarget {
-                $r = Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint `
-                     -Arguments @{ Description = 'AWiper checkpoint'; RestorePointType = [uint32]12; EventType = [uint32]100 } -ErrorAction Stop
-                if ($r.ReturnValue -eq 0) { Write-WLog 'Restore point created' }
-                else { Write-WLog "Restore point returned code $($r.ReturnValue) (System Protection may be off for this drive)" 'WARN' }
-            }
-        } catch { Write-WLog "Restore point failed: $($_.Exception.Message)" 'ERROR' }
-    } -OnComplete { param($r) $script:IdleStatus = 'Restore point request finished - see Activity log' }
+        try { [bool](@(Invoke-WTarget { param($d) New-WRestorePoint $d } -ArgumentList @($Desc)) | Select-Object -Last 1) }
+        catch { Write-WLog "Restore point failed: $($_.Exception.Message)" 'ERROR'; $false }
+    } -OnComplete {
+        param($r)
+        $ok = [bool](@($r) | Select-Object -Last 1)
+        Write-AWAction 'RestorePoint' @('create') @{} $(if ($ok) { 'Done' } else { 'Failed' })
+        $script:IdleStatus = if ($ok) { 'Restore point created' } else { 'Restore point was not created - see Activity log' }
+        if ($script:RecLoadedTabs['RP']) { Update-AWRestorePoints }
+    }
+}
+
+# DISM repair or .NET 3.5 install from Windows media in the Resources folder (local PC, no internet).
+function Start-AWOfflineRepair([string]$Kind, $Media) {
+    $what = if ($Kind -eq 'NetFx3') { 'Install .NET Framework 3.5' } else { 'Repair the Windows image' }
+    if (-not (Confirm-AW "$what using $($Media.Name) from the Resources folder?`n`nNo internet is used. AWiper picks the image that matches this PC's edition and warns if the media is older than this PC's updates. This can take 10-30 minutes.")) { return }
+    Write-AWAction $(if ($Kind -eq 'NetFx3') { 'NetFx3Offline' } else { 'DismRepairOffline' }) @($Media.Path) @{} 'Started'
+    $path = $Media.Path -replace "'", "''"
+    $step = if ($Kind -eq 'NetFx3') {
+        'if (-not $src.Sxs) { Write-WLog "No sources\sxs folder on this media" "ERROR"; "AWEXIT 1"; return }
+         Write-WLog "Installing .NET 3.5 from $($src.Sxs)"
+         & dism.exe /Online /Enable-Feature /FeatureName:NetFx3 /All "/Source:$($src.Sxs)" /LimitAccess /NoRestart 2>&1'
+    } else {
+        'Write-WLog "Repairing from image $($src.Index) ($($src.ImageName)), build $($src.Build).$($src.Ubr)"
+         & dism.exe /Online /Cleanup-Image /RestoreHealth (Get-WDismSourceArg $src) /LimitAccess /NoRestart 2>&1'
+    }
+    $body = @"
+`$src = Open-WRepairSource '$path'
+try {
+    if (`$src.Warning) { Write-WLog `$src.Warning `$(if (`$src.Usable) { 'WARN' } else { 'ERROR' }) }
+    if (-not `$src.Usable -and '$Kind' -ne 'NetFx3') { 'AWEXIT 1'; return }
+    $step
+    "AWEXIT `$LASTEXITCODE"
+} finally { Close-WRepairSource `$src }
+"@
+    $saved = $script:Target; $script:Target = $null        # the media is on this PC
+    try { Start-AWCommandTask $what ([scriptblock]::Create($body)) } finally { $script:Target = $saved }
+}
+
+function Get-WRegValueLocal([string]$Path, [string]$Name) {
+    try { (Get-Item -LiteralPath $Path -ErrorAction Stop).GetValue($Name, $null) } catch { $null }
 }
 
 # Runs a console command on the target and streams its output to the Activity log.
 # Lines containing a percentage drive the progress bar. The body should end with "AWEXIT $LASTEXITCODE".
 function Start-AWCommandTask([string]$Name, [scriptblock]$Body) {
+    Write-AWAction 'Tool' @($Name) @{} 'Started'
     Start-AWTask -Name $Name -Arguments @{ Label = $Name; Body = $Body.ToString() } -Work {
         $Sync.Status = "$Label running..."
         Invoke-WTarget ([scriptblock]::Create($Body)) | ForEach-Object {
@@ -4260,20 +5200,7 @@ function Update-AWAppList {
     $ui.AppsRemove.IsEnabled = $false
     $ui.AppsProvisioned.IsEnabled = Test-AWCanAdmin
     Start-AWTask -Name 'Read Store apps' -Arguments @{ Catalog = $script:BloatCatalog; Protected = $script:ProtectedApps; AllUsers = [bool](Test-AWCanAdmin) } -Work {
-        $raw = Invoke-WTarget {
-            param($AllUsers)
-            if ($PSVersionTable.PSVersion.Major -ge 7) { Import-Module Appx -UseWindowsPowerShell -WarningAction SilentlyContinue -ErrorAction SilentlyContinue }
-            $prov = @{}
-            if ($AllUsers) {
-                try { foreach ($p in (Get-AppxProvisionedPackage -Online -ErrorAction Stop)) { $prov[$p.DisplayName] = $true } }
-                catch { Write-WLog "Could not read provisioned apps: $($_.Exception.Message)" 'WARN' }
-            }
-            $pk = if ($AllUsers) { Get-AppxPackage -AllUsers } else { Get-AppxPackage }
-            foreach ($p in $pk) {
-                if ($p.IsFramework -or $p.NonRemovable -or "$($p.SignatureKind)" -eq 'System') { continue }
-                [pscustomobject]@{ Name = [string]$p.Name; FullName = [string]$p.PackageFullName; Version = [string]$p.Version; Publisher = [string]$p.Publisher; Prov = [bool]$prov[$p.Name] }
-            }
-        } -ArgumentList @($AllUsers)
+        $raw = Invoke-WTarget { param($AllUsers) Get-WStoreAppsRaw $AllUsers } -ArgumentList @($AllUsers)
 
         $seen = @{}
         foreach ($p in $raw) {
@@ -4313,33 +5240,15 @@ function Start-AWAppRemoval {
 
     $ui.AppsRemove.IsEnabled = $false
     $pk = @($apps | ForEach-Object { @{ Name = $_.Name; Package = $_.Package; Provisioned = $_.Provisioned } })
-    Start-AWTask -Name 'Remove Store apps' -Arguments @{ Pk = $pk; AllUsers = [bool](Test-AWCanAdmin); Prov = $prov } -Work {
+    Write-AWAction 'RemoveApps' ($apps | ForEach-Object Package) @{ AllUsers = [bool](Test-AWCanAdmin); Provisioned = $prov }
+    Start-AWTask -Name 'Remove Store apps' -Arguments @{ Pk = $pk; AllUsers = [bool](Test-AWCanAdmin); Prov = $prov; AutoRP = (Get-AWAutoRP 'removing Store apps') } -Work {
+        if ($AutoRP) { $Sync.Status = 'Creating a restore point first...'; [void](Invoke-WTarget { param($d) New-WRestorePoint $d } -ArgumentList @($AutoRP)) }
         $i = 0
         foreach ($a in $Pk) {
             $Sync.Status = "Removing $($a.Name)..."
             $Sync.Progress = [int]($i * 100 / $Pk.Count); $i++
-            try {
-                Invoke-WTarget {
-                    param($App, $AllUsers, $Prov)
-                    if ($PSVersionTable.PSVersion.Major -ge 7) { Import-Module Appx -UseWindowsPowerShell -WarningAction SilentlyContinue -ErrorAction SilentlyContinue }
-                    $done = $false
-                    if ($AllUsers) {
-                        try { Get-AppxPackage -AllUsers -Name $App.Package | Remove-AppxPackage -AllUsers -ErrorAction Stop; $done = $true }
-                        catch { Write-WLog "$($App.Name): all-users removal failed ($($_.Exception.Message)), trying current user" 'WARN' }
-                    }
-                    if (-not $done) {
-                        $mine = @(Get-AppxPackage -Name $App.Package)
-                        if ($mine.Count) { $mine | Remove-AppxPackage -ErrorAction Stop }
-                        else { Write-WLog "$($App.Name): not installed for this account" 'WARN' }
-                    }
-                    if ($Prov -and $App.Provisioned) {
-                        Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $App.Package } |
-                            Remove-AppxProvisionedPackage -Online -ErrorAction Stop | Out-Null
-                        Write-WLog "$($App.Name): removed provisioned copy (new users won't get it)"
-                    }
-                    Write-WLog "Removed $($App.Name)"
-                } -ArgumentList @($a, $AllUsers, $Prov)
-            } catch { Write-WLog "$($a.Name): $($_.Exception.Message)" 'ERROR' }
+            try { Invoke-WTarget { param($App, $AllUsers, $Prov) Remove-WStoreApp $App $AllUsers $Prov } -ArgumentList @($a, $AllUsers, $Prov) }
+            catch { Write-WLog "$($a.Name): $($_.Exception.Message)" 'ERROR' }
         }
         $Sync.Progress = 100
     } -OnComplete {
@@ -4404,7 +5313,9 @@ function Start-AWTweaks([bool]$Apply, $Selected = $null, $RestartExplorer = $nul
     if (-not (Confirm-AW "$verb these tweaks$($where)?`n`n$names")) { return }
     $script:PendingExplorerRestart = (-not (Test-AWRemote)) -and [bool]$RestartExplorer -and @($sel | Where-Object { $_.Explorer }).Count -gt 0
     $ui.TweaksApply.IsEnabled = $false; $ui.TweaksRevert.IsEnabled = $false; $ui.RebloatRevert.IsEnabled = $false
-    Start-AWTask -Name "$verb tweaks" -Arguments @{ Sel = $sel; Apply = $Apply } -Work {
+    $autoRP = if ($Apply) { Get-AWAutoRP 'applying tweaks' } else { $null }
+    Start-AWTask -Name "$verb tweaks" -Arguments @{ Sel = $sel; Apply = $Apply; AutoRP = $autoRP } -Work {
+        if ($AutoRP) { $Sync.Status = 'Creating a restore point first...'; [void](Invoke-WTarget { param($d) New-WRestorePoint $d } -ArgumentList @($AutoRP)) }
         foreach ($t in $Sel) {
             $Sync.Status = "$($t.Name)..."
             try { Invoke-WTarget { param($Tw, $On) Set-WTweak $Tw $On } -ArgumentList @($t, $Apply) }
@@ -4412,6 +5323,11 @@ function Start-AWTweaks([bool]$Apply, $Selected = $null, $RestartExplorer = $nul
         }
     } -OnComplete {
         param($r)
+        foreach ($cap in @($r | Where-Object { $_ -and $_.UndoKind })) {
+            $uid = Add-AWUndoEntry $cap
+            Write-AWAction $(if ($cap.Applied) { 'ApplyTweak' } else { 'RevertTweak' }) @($cap.TweakId) @{} 'Done' $uid
+        }
+        if ($script:Loaded['Rebloat']) { Update-AWUndoList }
         $ui.TweaksApply.IsEnabled = $true; $ui.TweaksRevert.IsEnabled = $true; $ui.RebloatRevert.IsEnabled = $true
         if ($script:PendingExplorerRestart) { Restart-AWExplorer }
         $script:PendingExplorerRestart = $false
@@ -4444,6 +5360,9 @@ function Update-AWRebloatView {
     $items = @(if ($q) { $script:RebloatApps | Where-Object { $_.Name -like "*$q*" -or $_.Package -like "*$q*" } } else { $script:RebloatApps })
     $ui.RebloatList.ItemsSource = $items
     $ui.RebloatInfo.Text = if ($script:RebloatApps.Count) { '{0} app(s) can be put back' -f $items.Count } else { 'Every app AWiper knows about is installed.' }
+    if ((Test-AWOffline) -and $script:RebloatApps.Count) {
+        $ui.RebloatInfo.Text += ' - offline: only apps marked "Windows copy" can come back now'
+    }
 }
 
 # Catalog apps missing for the signed-in user, with where each one can come back from:
@@ -4507,12 +5426,21 @@ function Update-AWRebloatList {
 function Start-AWRebloat {
     $sel = @($script:RebloatApps | Where-Object { $_.IsChecked })
     if ($sel.Count -eq 0) { Show-AWMessage 'Check the apps you want back first.'; return }
+    if (Test-AWOffline) {
+        $net = @($sel | Where-Object { $_.Source -ne 'Windows copy' })
+        if ($net.Count) {
+            if ($net.Count -eq $sel.Count) { Show-AWMessage "These apps can only come back from the Microsoft Store, and this PC is offline.`n`nConnect to the internet (or turn off offline mode), or run AWiper as admin to find copies still on disk."; return }
+            Write-AWLog "Offline: skipping $($net.Count) app(s) that need the Microsoft Store" 'WARN'
+            $sel = @($sel | Where-Object { $_.Source -eq 'Windows copy' })
+        }
+    }
     $search = @($sel | Where-Object { $_.Source -eq 'Store search' })
     $work = @($sel | Where-Object { $_.Source -ne 'Store search' } | ForEach-Object { @{ Name = $_.Name; Manifest = $_.Manifest; StoreId = $_.StoreId } })
     $list = ($sel | Select-Object -First 20 | ForEach-Object { "  - $($_.Name)  ($($_.Source))" }) -join "`n"
     if ($sel.Count -gt 20) { $list += "`n  ...and $($sel.Count - 20) more" }
     $extra = if ($search.Count) { "`n`nApps marked Store search open in the Microsoft Store so you can install them there." } else { '' }
     if (-not (Confirm-AW "Reinstall $($sel.Count) app(s) for your account?`n`n$list$extra")) { return }
+    Write-AWAction 'ReinstallApps' ($sel | ForEach-Object Name) @{} 'Started'
 
     foreach ($s in ($search | Select-Object -First 5)) {
         Start-Process ('ms-windows-store://search/?query=' + [uri]::EscapeDataString($s.Name))
@@ -4591,6 +5519,7 @@ function Update-AWRebloatTweaks {
 function Initialize-AWRebloat {
     Update-AWRebloatList
     Update-AWRebloatTweaks
+    Update-AWUndoList
 }
 
 $ui.RebloatRefresh.Add_Click({ Initialize-AWRebloat })
@@ -4717,13 +5646,14 @@ function Set-AWTarget($NewTarget) {
     $ui.CleanSubtext.Text = if (Test-AWRemote) { "Machine-wide rules run on $($NewTarget.ComputerName). Per-user rules are only available on this PC." } else { 'Pick the rules on the left, then Analyze to see what can be removed.' }
     $ui.CleanProgress.Value = 0
     $script:AllApps = @(); $ui.AppList.ItemsSource = $null; $script:Programs = @(); $ui.ProgList.ItemsSource = $null
-    [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat'); [void]$script:Loaded.Remove('Recovery'); [void]$script:Loaded.Remove('Rebloat')
+    [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat'); [void]$script:Loaded.Remove('Recovery'); [void]$script:Loaded.Remove('Rebloat'); [void]$script:Loaded.Remove('Health')
     $cur = Get-AWCurrentView
     Update-AWViewTitle $cur
     if ($cur -eq 'Programs') { $script:Loaded['Programs'] = $true; Update-AWProgramList }
     if ($cur -eq 'Debloat')  { $script:Loaded['Debloat'] = $true; Update-AWAppList; Update-AWTweakStatus }
     if ($cur -eq 'Recovery') { $script:Loaded['Recovery'] = $true; Initialize-AWRecovery }
     if ($cur -eq 'Rebloat')  { $script:Loaded['Rebloat'] = $true; Initialize-AWRebloat }
+    if ($cur -eq 'Health')   { $script:Loaded['Health'] = $true; Start-AWHealthCheck }
     if (Test-AWRemote) {
         Write-AWLog "Target is now $($NewTarget.ComputerName) ($($NewTarget.Host)) - $($NewTarget.OS), signed in as $($NewTarget.User)"
         $script:IdleStatus = "Connected to $($NewTarget.ComputerName)"
@@ -4897,6 +5827,48 @@ function Get-AWWhere { if (Test-AWRemote) { " on $($script:Target.ComputerName)"
 
 function Initialize-AWTools {
     $ui.ToolCards.Children.Clear()
+    $script:ResourcesRoot = Find-AWResources
+
+    # ---------------- Offline kit
+    Add-AWToolSection 'Offline kit'
+    $resDesc = if ($script:ResourcesRoot) {
+        $have = @($script:ResourceDirs | Where-Object { @(Get-ChildItem -LiteralPath (Join-Path $script:ResourcesRoot $_) -Force -ErrorAction SilentlyContinue).Count })
+        "Using $($script:ResourcesRoot)" + $(if ($have.Count) { " - has $($have -join ', ')" } else { ' - still empty' })
+    } else { 'None found. Create one (e.g. on a USB stick) to repair Windows and update Defender without internet.' }
+    New-AWToolCard ([string][char]0xE8B7) 'Resources folder' $resDesc $(if ($script:ResourcesRoot) { 'Open' } else { 'Create...' }) $false {
+        if ($script:ResourcesRoot) { Open-AWExplorer $script:ResourcesRoot; return }
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = 'Choose where to create the Resources folder (a USB stick works well)'
+        if ($dlg.ShowDialog() -ne 'OK') { return }
+        $root = Join-Path $dlg.SelectedPath 'AWiper\Resources'
+        if ((Split-Path $dlg.SelectedPath -Leaf) -eq 'Resources') { $root = $dlg.SelectedPath }
+        New-AWResourceLayout $root
+        $script:State.ResourcesPath = $root; Save-AWState
+        Write-AWLog "Created Resources folder at $root"
+        Initialize-AWTools; Open-AWExplorer $root
+    }
+    New-AWToolCard ([string][char]0xE838) 'Use another folder' 'Point AWiper at a Resources folder somewhere else, such as a network share or a different USB stick.' 'Choose...' $false {
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = 'Choose an AWiper Resources folder'
+        if ($dlg.ShowDialog() -ne 'OK') { return }
+        $script:State.ResourcesPath = $dlg.SelectedPath; Save-AWState
+        Write-AWLog "Resources folder set to $($dlg.SelectedPath)"
+        Initialize-AWTools
+    } -Accent 'Purple'
+    New-AWToolCard ([string][char]0xE9D5) 'Verify Resources' 'Checks every file against manifest.json (SHA-256) so a corrupted or tampered stick is caught before use.' 'Verify' $false {
+        Start-AWTask -Name 'Verify Resources' -Arguments @{ Root = $script:ResourcesRoot } -Work { Test-WResourceManifest $Root } -OnComplete {
+            param($r)
+            $res = @($r | Where-Object { $_ -and $null -ne $_.Ok }) | Select-Object -Last 1
+            $script:IdleStatus = if (-not $res) { 'No manifest.json - build one on a trusted copy first' } elseif ($res.Bad) { "Resources check: $($res.Bad) problem(s) - see Activity log" } else { "Resources check: all $($res.Ok) file(s) OK" }
+            if ($res -and $res.Bad) { Show-AWMessage "$($res.Bad) file(s) in the Resources folder are missing or don't match the manifest. See the Activity log for the list." 'Warning' }
+        }
+    } -Unavailable $(if ($script:ResourcesRoot) { '' } else { 'No Resources folder yet' })
+    New-AWToolCard ([string][char]0xE8C8) 'Build manifest' 'Hashes every file in the Resources folder into manifest.json. Do this once on a trusted, complete copy.' 'Build' $false {
+        if (-not (Confirm-AW "Hash every file in $($script:ResourcesRoot) and write manifest.json? Large ISOs take a minute or two.")) { return }
+        Start-AWTask -Name 'Build Resources manifest' -Arguments @{ Root = $script:ResourcesRoot } -Work { New-WResourceManifest $Root } -OnComplete {
+            param($r) $script:IdleStatus = "Manifest written ($(@($r)[-1]) files)"; Write-AWAction 'BuildManifest' @($script:ResourcesRoot) @{} 'Done'
+        }
+    } -Accent 'Purple' -Unavailable $(if ($script:ResourcesRoot) { '' } else { 'No Resources folder yet' })
 
     # ---------------- Quick fixes
     Add-AWToolSection 'Quick fixes'
@@ -4942,10 +5914,31 @@ function Initialize-AWTools {
         Start-AWCommandTask 'System File Checker' { & sfc.exe /scannow 2>&1; "AWEXIT $LASTEXITCODE" }
     } -Remote $true
 
-    New-AWToolCard ([string][char]0xE90F) 'Repair Windows image' 'DISM /RestoreHealth repairs the component store from Windows Update. Run it when SFC cannot fix files.' 'Run DISM' $true {
+    # With Windows media in Resources\ISO the repair runs fully offline; otherwise it needs Windows Update.
+    $media = @(Get-AWRepairMedia $script:ResourcesRoot) | Select-Object -First 1
+    $useMedia = $media -and -not (Test-AWRemote)
+    $dismDesc = if ($useMedia) { "Repairs system files from $($media.Name) in your Resources folder - no internet needed. Run it when SFC cannot fix files." }
+                elseif (Test-AWOffline) { 'Repairs system files. This PC is offline: put Windows install media (ISO) for this version in Resources\ISO.' }
+                else { 'DISM /RestoreHealth repairs the component store from Windows Update. Run it when SFC cannot fix files.' }
+    $dismBlock = if (-not $useMedia -and (Test-AWOffline)) { 'Needs internet, or Windows media in Resources\ISO' } else { '' }
+    New-AWToolCard ([string][char]0xE90F) 'Repair Windows image' $dismDesc 'Run DISM' $true {
+        $m = @(Get-AWRepairMedia $script:ResourcesRoot) | Select-Object -First 1
+        if ($m -and -not (Test-AWRemote)) { Start-AWOfflineRepair 'RestoreHealth' $m; return }
         if (-not (Confirm-AW "Run DISM RestoreHealth$(Get-AWWhere)? This can take 10-30 minutes and needs internet access.")) { return }
         Start-AWCommandTask 'DISM RestoreHealth' { & dism.exe /Online /Cleanup-Image /RestoreHealth /NoRestart 2>&1; "AWEXIT $LASTEXITCODE" }
-    } -Accent 'Purple' -Remote $true
+    } -Accent 'Purple' -Remote $true -Unavailable $dismBlock
+
+    $fx = if (Test-AWRemote) { $null } else { Get-WRegValueLocal 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v3.5' 'Install' }
+    $fxDesc = if ($fx -eq 1) { '.NET Framework 3.5 is already installed on this PC.' }
+              elseif ($useMedia -and $media.Kind) { "Installs .NET 3.5 (needed by older apps and games) from the Windows media in Resources - no internet needed." }
+              else { 'Installs .NET 3.5, needed by many older apps and games. Uses Windows Update, or Windows media in Resources\ISO when offline.' }
+    $fxBlock = if ($fx -eq 1) { 'Already installed' } elseif (-not $useMedia -and (Test-AWOffline)) { 'Needs internet, or Windows media in Resources\ISO' } else { '' }
+    New-AWToolCard ([string][char]0xE943) '.NET Framework 3.5' $fxDesc 'Install' $true {
+        $m = @(Get-AWRepairMedia $script:ResourcesRoot) | Select-Object -First 1
+        if ($m -and -not (Test-AWRemote)) { Start-AWOfflineRepair 'NetFx3' $m; return }
+        if (-not (Confirm-AW "Install .NET Framework 3.5$(Get-AWWhere) from Windows Update?")) { return }
+        Start-AWCommandTask 'Install .NET 3.5' { & dism.exe /Online /Enable-Feature /FeatureName:NetFx3 /All /NoRestart 2>&1; "AWEXIT $LASTEXITCODE" }
+    } -Remote $true -Unavailable $fxBlock
 
     New-AWToolCard ([string][char]0xE895) 'Reset Windows Update' 'Stops update services, renames SoftwareDistribution and catroot2, then restarts them. Fixes stuck updates.' 'Reset' $true {
         if (-not (Confirm-AW "Reset the Windows Update components$(Get-AWWhere)?`n`nUpdate history shown in Settings will be cleared; installed updates are not affected.")) { return }
@@ -4991,9 +5984,9 @@ function Initialize-AWTools {
         Start-AWCommandTask 'DISM component cleanup' { & dism.exe /Online /Cleanup-Image /StartComponentCleanup /NoRestart 2>&1; "AWEXIT $LASTEXITCODE" }
     } -Remote $true
 
-    New-AWToolCard ([string][char]0xE777) 'Create restore point' 'Saves a System Restore checkpoint before you make bigger changes. Windows allows one every 24 hours by default.' 'Create' $true {
-        Start-AWRestorePoint
-    } -Accent 'Purple' -Remote $true
+    New-AWToolCard ([string][char]0xE777) 'Restore points' 'Create, review and delete restore points, and set how much space they may use (Recovery > Restore points).' 'Open' $false {
+        Select-AWView 'Recovery'; $ui.RecTabRP.IsChecked = $true
+    } -Accent 'Purple'
 
     $hibDesc = 'Turns off hibernation and Fast Startup and deletes hiberfil.sys. Re-enable with powercfg /h on.'
     if (-not (Test-AWRemote)) {
@@ -5020,6 +6013,211 @@ function Initialize-AWTools {
 
 $ui.LogClear.Add_Click({ $ui.LogBox.Clear() })
 $ui.LogOpen.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$script:DataDir`"" })
+#endregion
+
+#region ---------------------------------------------------------------- Health Check
+$script:HealthResults = @()
+$script:HealthChecked = $null
+
+function Get-AWStatusStyle([string]$Status) {
+    switch ($Status) {
+        'Good'    { @{ Label = 'GOOD';    Bg = '#163A44'; Border = '#2E8F86'; Fg = $script:Res.Teal } }
+        'Warning' { @{ Label = 'WARNING'; Bg = '#3A2F1E'; Border = '#8C6A2E'; Fg = $script:Res.Amber } }
+        'Problem' { @{ Label = 'PROBLEM'; Bg = '#3A1E28'; Border = '#8C3A4A'; Fg = $script:Res.Danger } }
+        'Info'    { @{ Label = 'INFO';    Bg = '#232A45'; Border = '#4A5680'; Fg = $script:Res.Muted } }
+        default   { @{ Label = 'N/A';     Bg = '#1E2440'; Border = '#36406A'; Fg = $script:Res.Dim } }
+    }
+}
+
+# Fix / follow-up button for a health row. Local-only actions are hidden while a remote PC is targeted.
+function Get-AWHealthAction([string]$Id) {
+    $defs = if ($script:ResourcesRoot) { Join-Path $script:ResourcesRoot 'defs\x64\mpam-fe.exe' } else { $null }
+    switch ($Id) {
+        'Cleaner'     { @{ Text = 'Open Cleaner'; Local = $false; Run = { Select-AWView 'Cleaner' } } }
+        'Reliability' { @{ Text = 'Reliability Monitor'; Local = $true; Run = { Start-Process perfmon.exe -ArgumentList '/rel' } } }
+        'Devices'     { @{ Text = 'Device Manager'; Local = $true; Run = { Start-Process devmgmt.msc } } }
+        'Memory'      { @{ Text = 'Test memory'; Local = $true; Run = {
+                            if (Confirm-AW "Windows Memory Diagnostic restarts the PC and tests memory before Windows starts (about 15-30 minutes).`n`nSave your work, then choose 'Restart now' in the next window. Results show up here afterwards.") { Start-Process mdsched.exe }
+                        } } }
+        'Defender'    {
+            if ($defs -and (Test-Path -LiteralPath $defs)) {
+                @{ Text = 'Update from Resources'; Local = $true; Run = {
+                    $exe = Join-Path $script:ResourcesRoot 'defs\x64\mpam-fe.exe'
+                    if (-not $script:IsAdmin) { Show-AWMessage 'Updating Defender definitions needs administrator rights.'; return }
+                    Write-AWAction 'DefenderOfflineUpdate' @($exe) @{} 'Started'
+                    Start-AWCommandTask 'Defender offline update' ([scriptblock]::Create("& '$($exe -replace "'", "''")' 2>&1; ""AWEXIT `$LASTEXITCODE"""))
+                } }
+            } else { @{ Text = 'Windows Security'; Local = $true; Run = { Start-Process 'windowsdefender://threat' } } }
+        }
+        default { $null }
+    }
+}
+
+function Show-AWHealth($Rows) {
+    $ui.HealthRows.Children.Clear()
+    $ui.HealthCounts.Children.Clear()
+    $order = @{ Problem = 0; Warning = 1; Info = 2; NA = 3; Good = 4 }
+    foreach ($r in @($Rows | Sort-Object { $order[[string]$_.Status] }, Name)) {
+        $st = Get-AWStatusStyle $r.Status
+        $row = New-Object System.Windows.Controls.Border
+        $row.CornerRadius = 10; $row.Padding = '14,10'; $row.Margin = '0,4'
+        $row.Background = New-Brush '#1C2240'; $row.BorderBrush = $window.FindResource('LineBrush'); $row.BorderThickness = 1
+        $g = New-Object System.Windows.Controls.Grid
+        foreach ($w in 'Auto', '*', 'Auto') { $c = New-Object System.Windows.Controls.ColumnDefinition; $c.Width = $w; $g.ColumnDefinitions.Add($c) }
+        $pill = New-Object System.Windows.Controls.Border
+        $pill.CornerRadius = 9; $pill.Padding = '0,3'; $pill.Width = 78; $pill.VerticalAlignment = 'Center'; $pill.BorderThickness = 1
+        $pill.Background = New-Brush $st.Bg; $pill.BorderBrush = New-Brush $st.Border
+        $pt = New-AWText $st.Label 10 $st.Fg 'Bold'; $pt.HorizontalAlignment = 'Center'; $pill.Child = $pt
+        [void]$g.Children.Add($pill)
+        $sp = New-Object System.Windows.Controls.StackPanel; $sp.Margin = '16,0,12,0'; $sp.VerticalAlignment = 'Center'
+        [void]$sp.Children.Add((New-AWText $r.Name 14 $null 'SemiBold'))
+        $d = New-AWText ([string]$r.Detail) 12.5 $script:Res.Muted; $d.TextWrapping = 'Wrap'; $d.Margin = '0,3,0,0'
+        [void]$sp.Children.Add($d)
+        [System.Windows.Controls.Grid]::SetColumn($sp, 1); [void]$g.Children.Add($sp)
+        $act = Get-AWHealthAction $r.Action
+        if ($act -and -not ($act.Local -and (Test-AWRemote)) -and ($r.Status -ne 'Good' -or $r.Action -eq 'Reliability')) {
+            $b = New-Object System.Windows.Controls.Button
+            $b.Content = $act.Text; $b.Style = $window.FindResource('BtnChip'); $b.Margin = '0'; $b.VerticalAlignment = 'Center'; $b.Tag = $act.Run
+            $b.Add_Click({ param($s, $e) try { & $s.Tag } catch { Show-AWMessage $_.Exception.Message 'Error' } })
+            [System.Windows.Controls.Grid]::SetColumn($b, 2); [void]$g.Children.Add($b)
+        }
+        $row.Child = $g
+        [void]$ui.HealthRows.Children.Add($row)
+    }
+    $cnt = @{}; foreach ($s in 'Good', 'Warning', 'Problem', 'Info', 'NA') { $cnt[$s] = @($Rows | Where-Object { $_.Status -eq $s }).Count }
+    foreach ($s in 'Problem', 'Warning', 'Good', 'Info', 'NA') {
+        if (-not $cnt[$s]) { continue }
+        $st = Get-AWStatusStyle $s
+        $chip = New-Object System.Windows.Controls.Border
+        $chip.CornerRadius = 11; $chip.Padding = '10,4'; $chip.Margin = '0,0,8,0'; $chip.BorderThickness = 1
+        $chip.Background = New-Brush $st.Bg; $chip.BorderBrush = New-Brush $st.Border
+        $chip.Child = New-AWText ("{0}  {1}" -f $cnt[$s], $st.Label) 11 $st.Fg 'Bold'
+        [void]$ui.HealthCounts.Children.Add($chip)
+    }
+    $who = if (Test-AWRemote) { $script:Target.ComputerName } else { 'this PC' }
+    $ui.HealthTitle.Text = if ($cnt.Problem) { "$($cnt.Problem) problem(s) found" } elseif ($cnt.Warning) { 'A few things need attention' } else { 'Looks healthy' }
+    $na = if ($cnt.NA) { " $($cnt.NA) check(s) aren't available on this hardware, so they're not counted as healthy." } else { '' }
+    $ui.HealthSummary.Text = "Checked $who at $((Get-Date).ToString('h:mm tt')).$na"
+}
+
+function Start-AWHealthCheck {
+    $ui.HealthRun.IsEnabled = $false
+    $ui.HealthTitle.Text = 'Checking...'
+    $ui.HealthSummary.Text = 'Reading disks, event logs, devices, battery and antivirus status. This takes a few seconds.'
+    Start-AWTask -Name 'Health check' -Work { Invoke-WTarget { Get-WHealth } } -OnComplete {
+        param($Result)
+        $ui.HealthRun.IsEnabled = $true
+        $script:HealthResults = @($Result | Where-Object { $_ -and $_.Status })
+        $script:HealthChecked = Get-Date
+        if (-not $script:HealthResults.Count) { $ui.HealthTitle.Text = 'Health check failed'; $ui.HealthSummary.Text = 'See the Activity log for details.'; return }
+        Show-AWHealth $script:HealthResults
+        $ui.HealthSave.IsEnabled = $true
+        $p = @($script:HealthResults | Where-Object { $_.Status -eq 'Problem' }).Count
+        Write-AWLog ("Health check: {0} problem(s), {1} warning(s)" -f $p, @($script:HealthResults | Where-Object { $_.Status -eq 'Warning' }).Count)
+    }
+}
+
+function Save-AWHealthReport {
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $who = if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME }
+    $dlg.FileName = 'AWiper-health-{0}-{1:yyyyMMdd-HHmm}' -f $who, (Get-Date)
+    $dlg.Filter = 'Web page (*.html)|*.html|JSON (*.json)|*.json'
+    if (-not $dlg.ShowDialog($window)) { return }
+    if ($dlg.FileName -like '*.json') {
+        ConvertTo-Json -InputObject ([ordered]@{ Computer = $who; Checked = $script:HealthChecked.ToString('o'); Results = @($script:HealthResults) }) -Depth 4 | Set-Content -LiteralPath $dlg.FileName -Encoding UTF8
+    } else {
+        $enc = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
+        $colors = @{ Good = '#1f9e8f'; Warning = '#c98a12'; Problem = '#c8344f'; Info = '#6b7499'; NA = '#8a90a8' }
+        $rows = foreach ($r in $script:HealthResults) { "<tr><td><b style='color:$($colors[[string]$r.Status])'>$(& $enc $r.Status)</b></td><td>$(& $enc $r.Name)</td><td>$(& $enc $r.Detail)</td></tr>" }
+        @"
+<!doctype html><html><head><meta charset="utf-8"><title>Health check - $(& $enc $who)</title>
+<style>body{font-family:Segoe UI,sans-serif;margin:32px;color:#1c2140}table{border-collapse:collapse;width:100%}td,th{padding:8px 10px;border-bottom:1px solid #dde;text-align:left;vertical-align:top}th{color:#667}</style></head>
+<body><h1>Health check - $(& $enc $who)</h1><p>Checked $($script:HealthChecked.ToString('f')) by AWiper $script:AppVersion. "N/A" means the data isn't available on this hardware - it is not counted as healthy.</p>
+<table><tr><th>Status</th><th>Check</th><th>Details</th></tr>
+$($rows -join "`n")
+</table></body></html>
+"@ | Set-Content -LiteralPath $dlg.FileName -Encoding UTF8
+    }
+    Write-AWLog "Health report saved to $($dlg.FileName)"
+}
+
+$ui.HealthRun.Add_Click({ Start-AWHealthCheck })
+$ui.HealthSave.Add_Click({ Save-AWHealthReport })
+#endregion
+
+#region ---------------------------------------------------------------- Online / offline status
+function Update-AWNetUI {
+    if ($script:ForceOffline) { $ui.NetText.Text = 'Offline mode'; $ui.NetIcon.Text = [string][char]0xE709; $ui.NetIcon.Foreground = $script:Res.Amber
+        $ui.NetBtn.ToolTip = 'Offline mode is on: AWiper never uses the internet and uses your Resources folder instead. Click to turn it off.' }
+    elseif ($script:Online -eq $true) { $ui.NetText.Text = 'Online'; $ui.NetIcon.Text = [string][char]0xE774; $ui.NetIcon.Foreground = $script:Res.Teal
+        $ui.NetBtn.ToolTip = 'Internet is available. Click to switch to offline mode.' }
+    elseif ($script:Online -eq $false) { $ui.NetText.Text = 'No internet'; $ui.NetIcon.Text = [string][char]0xE7BA; $ui.NetIcon.Foreground = $script:Res.Amber
+        $ui.NetBtn.ToolTip = 'No internet connection detected. Internet-only actions are disabled and offline alternatives are offered. Click to force offline mode.' }
+    else { $ui.NetText.Text = 'Checking...'; $ui.NetIcon.Foreground = $script:Res.Muted }
+}
+
+# Re-renders the parts of the UI whose options depend on internet access.
+function Update-AWOfflineFeatures {
+    Update-AWNetUI
+    Initialize-AWTools
+    if ($script:RecLoadedTabs['Deep']) { Update-AWWinfrStatus }
+    if ($script:Loaded['Rebloat']) { Update-AWRebloatView }
+}
+
+function Start-AWNetCheck {
+    if ($script:ForceOffline) { Update-AWOfflineFeatures; return }
+    $script:Online = $null; Update-AWNetUI
+    Start-AWTask -Name 'Check internet' -Work ${function:Test-AWInternet} -OnComplete {
+        param($r)
+        $script:Online = [bool](@($r) | Select-Object -Last 1)
+        Write-AWLog $(if ($script:Online) { 'Internet connection detected' } else { 'No internet connection - offline alternatives will be used' })
+        Update-AWOfflineFeatures
+    }
+}
+
+$ui.NetBtn.Add_Click({
+    $script:ForceOffline = -not $script:ForceOffline
+    $script:State.ForceOffline = $script:ForceOffline; Save-AWState
+    Write-AWLog $(if ($script:ForceOffline) { 'Offline mode turned on' } else { 'Offline mode turned off' })
+    if ($script:ForceOffline) { Update-AWOfflineFeatures } else { Start-AWNetCheck }
+})
+#endregion
+
+#region ---------------------------------------------------------------- Undo history
+function Update-AWUndoList {
+    $items = @(Get-AWUndoJournal | Where-Object { -not $_.Undone } | Sort-Object Time -Descending | Select-Object -First 60 | ForEach-Object {
+        $t = try { [datetime]::Parse($_.Time).ToString('MMM d, h:mm tt') } catch { $_.Time }
+        [pscustomobject]@{ Id = $_.Id; Label = $_.Label; Sub = "$t on $($_.Target)"; Entry = $_ }
+    })
+    $ui.UndoList.ItemsSource = $items
+    $ui.UndoBtn.IsEnabled = $items.Count -gt 0
+}
+
+function Start-AWUndo {
+    $sel = $ui.UndoList.SelectedItem
+    if (-not $sel) { Show-AWMessage 'Select a change to undo first.'; return }
+    $e = $sel.Entry
+    $here = if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME }
+    if ($e.Target -ne $here) { Show-AWMessage "This change was made on $($e.Target). Connect to that computer first (title bar), then undo it."; return }
+    if (-not (Confirm-AW "Undo: $($e.Label)?`n`nThe settings go back exactly as they were before that change.")) { return }
+    $script:PendingUndo = $e
+    Start-AWTask -Name 'Undo change' -Arguments @{ Snap = @($e.Snapshot); Keys = @($e.RemoveKeys) } -Work {
+        Invoke-WTarget { param($s, $k) Restore-WRegSnapshot $s $k } -ArgumentList @($Snap, $Keys)
+        Write-WLog 'Previous values restored'
+    } -OnComplete {
+        param($r)
+        $e = $script:PendingUndo
+        $all = @(Get-AWUndoJournal)
+        foreach ($x in $all) { if ($x.Id -eq $e.Id) { $x.Undone = $true } }
+        Save-AWUndoJournal $all
+        Write-AWAction 'Undo' @($e.Label) @{} 'Done' $e.Id
+        $script:IdleStatus = "Undone: $($e.Label) - some changes take effect after signing out"
+        Update-AWUndoList; Update-AWTweakStatus
+        if ($script:Loaded['Rebloat']) { Update-AWRebloatTweaks }
+    }
+}
+
+$ui.UndoBtn.Add_Click({ Start-AWUndo })
 #endregion
 
 #region ---------------------------------------------------------------- Recovery
@@ -5132,6 +6330,7 @@ function Start-AWBinRestore([string]$ToFolder) {
     $list = ($items | Select-Object -First 15 | ForEach-Object { "  - $($_.Name)" }) -join "`n"
     if ($items.Count -gt 15) { $list += "`n  ...and $($items.Count - 15) more" }
     if (-not (Confirm-AW "Restore $($items.Count) item(s) $where$(Get-AWWhere)?`n`n$list")) { return }
+    Write-AWAction 'RecycleBinRestore' ($items | ForEach-Object OriginalPath) @{ To = $ToFolder } 'Started'
     $jobs = @($items | ForEach-Object {
         @{ IPath = $_.IPath; RPath = $_.RPath; Name = $_.Name; Dest = $(if ($ToFolder) { Join-Path $ToFolder $_.Name } else { $_.OriginalPath }) }
     })
@@ -5276,6 +6475,7 @@ function Start-AWShadowCopy([string]$ToFolder) {
     })
     $where = if ($ToFolder) { "to`n$ToFolder" } else { 'back to their folders (older versions of changed files are saved next to the current file with the snapshot date in the name)' }
     if (-not (Confirm-AW "Copy $($items.Count) file(s) $where?`n`nNothing is overwritten.")) { return }
+    Write-AWAction 'SnapshotRestore' ($items | ForEach-Object { Join-Path $_.Folder $_.Name }) @{ To = $ToFolder } 'Started'
     Start-AWTask -Name 'Restore from snapshot' -Arguments @{ Jobs = $jobs } -Work {
         $i = 0; $ok = 0
         foreach ($j in $Jobs) {
@@ -5410,6 +6610,7 @@ function Start-AWUndelRecover {
     $poor = @($items | Where-Object { $_.Score -lt 3 }).Count
     $warn = if ($poor) { "`n`n$poor of them are rated below Good, so they may come back damaged or empty." } else { '' }
     if (-not (Confirm-AW "Recover $($items.Count) file(s) to $($dest)?$warn`n`nOriginal folders are recreated inside the destination. Nothing is overwritten.")) { return }
+    Write-AWAction 'Undelete' ($items | ForEach-Object FullPath) @{ To = $dest; Source = $u.Source } 'Started'
     if (-not (Test-Path -LiteralPath $dest)) {
         try { New-Item -ItemType Directory -Path $dest -Force | Out-Null } catch { Show-AWMessage "Could not create $($dest): $($_.Exception.Message)" 'Error'; return }
     }
@@ -5481,6 +6682,10 @@ function Update-AWWinfrStatus {
     if ($script:WinfrPath) {
         $ui.WinfrStatus.Text = 'Windows File Recovery is installed and ready.'
         $ui.WinfrBox.Background = New-Brush '#163A44'; $ui.WinfrBox.BorderBrush = New-Brush '#2E8F86'
+        $ui.WinfrInstall.Visibility = 'Collapsed'; $ui.WinfrStore.Visibility = 'Collapsed'
+    } elseif (Test-AWOffline) {
+        $ui.WinfrStatus.Text = "Windows File Recovery isn't installed, and it can only be installed from the Microsoft Store. Without internet, use the Undelete tab instead - it reads the drive directly and needs no download."
+        $ui.WinfrBox.Background = New-Brush '#3A2F1E'; $ui.WinfrBox.BorderBrush = New-Brush '#8C6A2E'
         $ui.WinfrInstall.Visibility = 'Collapsed'; $ui.WinfrStore.Visibility = 'Collapsed'
     } else {
         $ui.WinfrStatus.Text = "Deep scan uses Windows File Recovery, Microsoft's free recovery tool. It isn't installed yet. Install it to a drive other than the one you want to recover from if you can."
@@ -5576,6 +6781,7 @@ function Start-AWDeepScan {
     $filters = @($ui.DeepFilter.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $what = if ($filters.Count) { $filters -join ', ' } else { 'everything it can find' }
     if (-not (Confirm-AW "Scan $($src.Drive) for $what and save results to $dest?$warn`n`nAvoid using $($src.Drive) until this finishes.")) { return }
+    Write-AWAction 'DeepScan' @($src.Drive) @{ To = $dest; Args = ($argv -join ' ') } 'Started'
     if (-not (Test-Path -LiteralPath $dest)) { try { New-Item -ItemType Directory -Path $dest -Force | Out-Null } catch { Show-AWMessage "Could not create $($dest): $($_.Exception.Message)" 'Error'; return } }
 
     $script:DeepRunning = $true
@@ -5612,6 +6818,95 @@ function Start-AWDeepScan {
     }
 }
 
+# ---------------- Restore points
+function Update-AWRestorePoints {
+    $ui.RPAuto.IsChecked = [bool]$script:State.AutoRestorePoint
+    if (-not $script:IsAdmin) {
+        $ui.RPInfo.Text = 'Managing restore points needs administrator rights. Use "Restart as admin" in the title bar.'
+        foreach ($c in @($ui.RPCreate, $ui.RPDelete, $ui.RPEnable, $ui.RPSize5, $ui.RPSize10, $ui.RPSize15)) { $c.IsEnabled = $false }
+        return
+    }
+    $ui.RPInfo.Text = 'Reading restore points...'
+    Start-AWTask -Name 'Read restore points' -Work {
+        $points = foreach ($p in @(Get-CimInstance -Namespace root/default -ClassName SystemRestore -ErrorAction SilentlyContinue)) {
+            $created = try { [datetime]::SpecifyKind([datetime]::ParseExact(([string]$p.CreationTime).Substring(0, 14), 'yyyyMMddHHmmss', $null), 'Utc').ToLocalTime() } catch { [datetime]::MinValue }
+            [pscustomobject]@{ Sequence = [int]$p.SequenceNumber; Description = [string]$p.Description; Type = [int]$p.RestorePointType; Created = $created }
+        }
+        $vols = @{}; foreach ($v in @(Get-CimInstance Win32_Volume -ErrorAction SilentlyContinue)) { $vols[[string]$v.DeviceID] = $v }
+        $storage = foreach ($s in @(Get-CimInstance Win32_ShadowStorage -ErrorAction SilentlyContinue)) {
+            $v = $vols[[string]$s.Volume.DeviceID]
+            [pscustomobject]@{ Drive = [string]$v.DriveLetter; Used = [long]$s.UsedSpace; Max = [decimal]$s.MaxSpace; Capacity = [long]$v.Capacity }
+        }
+        $interval = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -ErrorAction SilentlyContinue).RPSessionInterval
+        [pscustomobject]@{ Points = @($points); Storage = @($storage); Enabled = ($interval -eq 1) }
+    } -OnComplete {
+        param($Result)
+        $res = @($Result | Where-Object { $_ -and $null -ne $_.Points }) | Select-Object -Last 1
+        if (-not $res) { $ui.RPInfo.Text = 'Could not read restore points - see Activity log.'; return }
+        $types = @{ 0 = 'App installed'; 1 = 'App removed'; 7 = 'Scheduled'; 10 = 'Driver installed'; 12 = 'Settings change'; 13 = 'Cancelled operation' }
+        $list = @($res.Points | Sort-Object Created -Descending | ForEach-Object {
+            [pscustomobject]@{ Sequence = $_.Sequence; Description = $_.Description; Created = $_.Created
+                CreatedText = $_.Created.ToString('ddd MMM d yyyy, h:mm tt'); TypeText = $(if ($types.ContainsKey($_.Type)) { $types[$_.Type] } else { "Windows ($($_.Type))" }) }
+        })
+        $ui.RPList.ItemsSource = $list
+        $sys = @($res.Storage | Where-Object { $_.Drive -eq $env:SystemDrive }) | Select-Object -First 1
+        $on = $res.Enabled -and $sys
+        $ui.RPProtect.Text = if ($on) { "System Protection is on for $($env:SystemDrive)." } else { "System Protection is off for $($env:SystemDrive), so Windows can't create restore points or previous versions." }
+        $ui.RPProtect.Foreground = if ($on) { $script:Res.Teal } else { $script:Res.Amber }
+        $ui.RPEnable.Visibility = if ($on) { 'Collapsed' } else { 'Visible' }
+        $ui.RPStorage.Text = if ($sys) {
+            $max = if ($sys.Max -ge [decimal]::MaxValue / 2 -or $sys.Max -ge 1e18) { 'no limit' } else { '{0} ({1:0}% of the drive)' -f (Format-AWSize ([long]$sys.Max)), ($sys.Max * 100 / [Math]::Max(1, $sys.Capacity)) }
+            "$(Format-AWSize $sys.Used) used on $($env:SystemDrive). Limit: $max. Older points are deleted automatically when the limit is reached."
+        } else { 'No space is reserved for restore points yet.' }
+        foreach ($c in @($ui.RPCreate, $ui.RPDelete, $ui.RPSize5, $ui.RPSize10, $ui.RPSize15)) { $c.IsEnabled = $true }
+        $ui.RPInfo.Text = if ($list.Count) { "$($list.Count) restore point(s). Select one or more to delete them." } else { 'No restore points yet.' }
+    }
+}
+
+function Remove-AWRestorePoints {
+    $sel = @($ui.RPList.SelectedItems)
+    if ($sel.Count -eq 0) { Show-AWMessage 'Select the restore points to delete first.'; return }
+    $names = ($sel | ForEach-Object { "  - $($_.CreatedText): $($_.Description)" }) -join "`n"
+    if (-not (Confirm-AW "Permanently delete $($sel.Count) restore point(s)?`n`n$names`n`nYou won't be able to roll back to them, and their previous versions of files go too.")) { return }
+    $ok = 0
+    foreach ($p in $sel) {
+        $rc = [AWiper.Native]::SRRemoveRestorePoint($p.Sequence)
+        if ($rc -eq 0) { $ok++; Write-AWLog "Deleted restore point #$($p.Sequence) ($($p.Description))" }
+        else { Write-AWLog "Could not delete restore point #$($p.Sequence) (error $rc)" 'ERROR' }
+    }
+    Write-AWAction 'DeleteRestorePoints' ($sel | ForEach-Object { "#$($_.Sequence) $($_.Description)" }) @{} "Deleted $ok of $($sel.Count)"
+    Update-AWRestorePoints
+}
+
+function Set-AWRestoreSpace([int]$Percent) {
+    if (-not (Confirm-AW "Let restore points use up to $Percent% of $($env:SystemDrive)? If the new limit is smaller than what's used now, Windows deletes the oldest points to fit.")) { return }
+    Write-AWAction 'RestorePointSpace' @("$Percent%") @{} 'Started'
+    $saved = $script:Target; $script:Target = $null
+    try {
+        Start-AWCommandTask 'Resize restore point space' ([scriptblock]::Create("& vssadmin.exe resize shadowstorage /for=$($env:SystemDrive) /on=$($env:SystemDrive) /maxsize=$Percent% 2>&1; ""AWEXIT `$LASTEXITCODE"""))
+    } finally { $script:Target = $saved }
+}
+
+$ui.RPRefresh.Add_Click({ Update-AWRestorePoints })
+$ui.RPOpen.Add_Click({ Start-Process rstrui.exe })
+$ui.RPDelete.Add_Click({ Remove-AWRestorePoints })
+$ui.RPCreate.Add_Click({
+    $saved = $script:Target; $script:Target = $null
+    try { Start-AWRestorePoint $ui.RPDesc.Text.Trim() } finally { $script:Target = $saved }
+    $ui.RPDesc.Text = ''
+})
+$ui.RPEnable.Add_Click({
+    try {
+        $r = Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName Enable -Arguments @{ Drive = "$($env:SystemDrive)\" } -ErrorAction Stop
+        if ($r.ReturnValue -eq 0) { Write-AWLog "System Protection turned on for $($env:SystemDrive)"; Write-AWAction 'EnableSystemProtection' @($env:SystemDrive) @{} 'Done' }
+        else { Write-AWLog "Turning on System Protection returned code $($r.ReturnValue)" 'WARN' }
+    } catch { Show-AWMessage "Could not turn on System Protection: $($_.Exception.Message)" 'Error' }
+    Update-AWRestorePoints
+})
+foreach ($b in @($ui.RPSize5, $ui.RPSize10, $ui.RPSize15)) { $b.Add_Click({ param($s, $e) Set-AWRestoreSpace ([int]$s.Tag) }) }
+$ui.RPAuto.Add_Checked({ $script:State.AutoRestorePoint = $true; Save-AWState })
+$ui.RPAuto.Add_Unchecked({ $script:State.AutoRestorePoint = $false; Save-AWState })
+
 # ---------------- Tabs, remote handling, wiring
 function Update-AWRecoveryButtons {
     $remote = Test-AWRemote
@@ -5621,8 +6916,9 @@ function Update-AWRecoveryButtons {
     $ui.RecTabShadow.IsEnabled = -not $remote
     $ui.RecTabDeep.IsEnabled = -not $remote
     $ui.RecTabUndel.IsEnabled = -not $remote
+    $ui.RecTabRP.IsEnabled = -not $remote
     $tip = if ($remote) { 'Only available on this PC' } else { $null }
-    foreach ($c in @($ui.RecTabShadow, $ui.RecTabDeep, $ui.RecTabUndel, $ui.BinRestoreTo, $ui.BinOpen)) {
+    foreach ($c in @($ui.RecTabShadow, $ui.RecTabDeep, $ui.RecTabUndel, $ui.RecTabRP, $ui.BinRestoreTo, $ui.BinOpen)) {
         $c.ToolTip = $tip; [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($c, $true)
     }
     if ($remote -and -not $ui.RecTabBin.IsChecked) { $ui.RecTabBin.IsChecked = $true }
@@ -5633,10 +6929,12 @@ function Show-AWRecoveryTab([string]$Tab) {
     $ui.RecPanelShadow.Visibility = if ($Tab -eq 'Shadow') { 'Visible' } else { 'Collapsed' }
     $ui.RecPanelDeep.Visibility   = if ($Tab -eq 'Deep')   { 'Visible' } else { 'Collapsed' }
     $ui.RecPanelUndel.Visibility  = if ($Tab -eq 'Undel')  { 'Visible' } else { 'Collapsed' }
+    $ui.RecPanelRP.Visibility     = if ($Tab -eq 'RP')     { 'Visible' } else { 'Collapsed' }
     if (-not $script:RecLoadedTabs[$Tab]) {
         $script:RecLoadedTabs[$Tab] = $true
         if ($Tab -eq 'Shadow') { Update-AWShadowList }
         if ($Tab -eq 'Deep')   { Update-AWWinfrStatus }
+        if ($Tab -eq 'RP')     { Update-AWRestorePoints }
     }
 }
 
@@ -5647,13 +6945,14 @@ function Initialize-AWRecovery {
     Update-AWRecoveryButtons
     Update-AWRecoveryDrives
     Update-AWBinList
-    if ($ui.RecTabShadow.IsChecked) { Show-AWRecoveryTab 'Shadow' } elseif ($ui.RecTabDeep.IsChecked) { Show-AWRecoveryTab 'Deep' } elseif ($ui.RecTabUndel.IsChecked) { Show-AWRecoveryTab 'Undel' }
+    if ($ui.RecTabShadow.IsChecked) { Show-AWRecoveryTab 'Shadow' } elseif ($ui.RecTabDeep.IsChecked) { Show-AWRecoveryTab 'Deep' } elseif ($ui.RecTabUndel.IsChecked) { Show-AWRecoveryTab 'Undel' } elseif ($ui.RecTabRP.IsChecked) { Show-AWRecoveryTab 'RP' }
 }
 
 $ui.RecTabBin.Add_Checked({ Show-AWRecoveryTab 'Bin' })
 $ui.RecTabShadow.Add_Checked({ Show-AWRecoveryTab 'Shadow' })
 $ui.RecTabDeep.Add_Checked({ Show-AWRecoveryTab 'Deep' })
 $ui.RecTabUndel.Add_Checked({ Show-AWRecoveryTab 'Undel' })
+$ui.RecTabRP.Add_Checked({ Show-AWRecoveryTab 'RP' })
 
 $ui.BinSearch.Add_TextChanged({ Update-AWBinView })
 $ui.BinRefresh.Add_Click({ Update-AWBinList })
@@ -5766,6 +7065,8 @@ $window.Add_Loaded({
         Initialize-AWTools
         Initialize-AWTweaks
         Dismount-AWShadows   # links left behind by a previous session that didn't close cleanly
+        Update-AWNetUI
+        Start-AWNetCheck
     } catch { Write-AWLog "Startup: $($_.Exception.Message)" 'ERROR' }
     $script:Timer.Start()
     Write-AWLog ("AWiper {0} started - {1} - PowerShell {2}" -f $script:AppVersion, $(if ($script:IsAdmin) { 'administrator' } else { 'standard user' }), $PSVersionTable.PSVersion)
