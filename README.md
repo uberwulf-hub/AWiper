@@ -42,6 +42,7 @@ The right-hand panel lists the debloat tweaks currently in effect and sets the c
 - **Drive check** — every drive gets a recoverability rating from its media type, bus and TRIM setting. Internal SSDs with TRIM (the Windows default) usually erase deleted data within minutes; USB sticks, SD cards and hard disks are good candidates.
 - **Recycle Bin** — reads the `$Recycle.Bin` folders directly, so it shows every user's deleted items (as admin) and works on remote PCs. Restore to the original location or another folder; nothing is ever overwritten.
 - **Previous versions** — lists Volume Shadow Copy snapshots (System Protection / restore points), opens one in Explorer, or compares a folder against a snapshot to list files that have since been deleted or changed, then restores them.
+- **Undelete** — AWiper's own NTFS undelete. It reads the drive's master file table directly (read-only, needs admin), lists deleted files with their original folders (including deleted folders), and rates each one — *Excellent* (data stored in the file record), *Good* (all clusters still free), *Poor* (partly overwritten), *Overwritten*. Recovered files keep their folder layout and timestamps, must go to a different drive, and never overwrite anything. It can also scan a raw NTFS volume image (`.img`/`.dd`) — the safe way to work on a failing drive.
 - **Deep scan** — a front-end for Microsoft's free [Windows File Recovery](https://apps.microsoft.com/detail/9N26S50LN705) (`winfr`): installs it if needed, builds the command, refuses to save to the drive being scanned, and streams progress to the activity log.
 
 ## Remote computers
@@ -63,6 +64,13 @@ When a remote computer is targeted, these run on it: Tools (except Explorer, Rec
 - Files removed from the Space Map and Large Files views go to the Recycle Bin.
 - Browser history, cookies and saved passwords are never touched.
 - Debloat asks for confirmation and offers a restore point first.
+
+## Tests
+
+```powershell
+.\tests\Test-UndeleteSynthetic.ps1                       # no admin: builds a tiny NTFS image and checks the undelete engine
+.\tests\Test-UndeleteLive.ps1 -Drive H: -Dest C:\Temp\R   # admin: deletes a test file on H:, recovers it, compares hashes
+```
 
 ## Requirements
 

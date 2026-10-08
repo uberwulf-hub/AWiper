@@ -10,7 +10,8 @@
       * Space Map    - SpaceMonger-style nested treemap of any drive or folder (drill down, recycle)
       * Large Files  - the 1,000 largest files from the last scan, searchable, recycle or export
       * Recovery     - restore from any user's Recycle Bin, find deleted files in shadow-copy snapshots,
-                       deep scan with Windows File Recovery, per-drive recoverability (SSD/TRIM) check
+                       native NTFS undelete (reads the MFT directly), deep scan with Windows File Recovery,
+                       per-drive recoverability (SSD/TRIM) check
       * Startup      - enable / disable startup entries (same StartupApproved switches Task Manager uses)
       * Programs     - installed software list with size, search and uninstall
       * Debloat      - remove preinstalled Store apps, turn off ads, suggestions, Copilot and other extras
@@ -47,7 +48,7 @@
 
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.3.0
+    Version : 1.4.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -60,7 +61,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.3.0'
+$script:AppVersion = '1.4.0'
 
 #region ---------------------------------------------------------------- Elevation / STA
 function Test-AWAdmin {
@@ -424,6 +425,548 @@ namespace AWiper
         {
             var r = new TreeRect(); r.Node = n; r.X = x; r.Y = y; r.W = w; r.H = h; return r;
         }
+    }
+
+    // ------------------------------------------------------------------ NTFS undelete
+    public class DeletedFile
+    {
+        public bool IsChecked { get; set; }
+        public long Record { get; set; }
+        public string Name { get; set; }
+        public string Folder { get; set; }
+        public long Size { get; set; }
+        public DateTime Created { get; set; }
+        public DateTime Modified { get; set; }
+        public string Chance { get; set; }
+        public int Score { get; set; }
+        public string Note { get; set; }
+        public bool Resident { get; set; }
+        public bool Unsupported { get; set; }
+        public byte[] ResidentData;
+        public List<long[]> Runs;      // { lcn (-1 = sparse), cluster count }
+        public string SizeText { get { return Fmt.Size(Size); } }
+        public string ModifiedText { get { return Modified == DateTime.MinValue ? "" : Modified.ToString("yyyy-MM-dd HH:mm"); } }
+        public string FullPath { get { return Folder.EndsWith("\\") ? Folder + Name : Folder + "\\" + Name; } }
+    }
+
+    // Read-only scanner for deleted files on an NTFS volume (\\.\C:) or a raw NTFS volume image.
+    // It reads the boot sector, follows $MFT's data runs, parses every FILE record, and keeps
+    // records whose in-use flag is clear. Recoverability is rated against the live cluster bitmap.
+    // The device is only ever opened with GENERIC_READ.
+    public class NtfsUndelete : IDisposable
+    {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sec, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool ReadFile(Microsoft.Win32.SafeHandles.SafeFileHandle h, byte[] buffer, int toRead, out int read, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetFilePointerEx(Microsoft.Win32.SafeHandles.SafeFileHandle h, long distance, out long newPos, uint method);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(Microsoft.Win32.SafeHandles.SafeFileHandle h, uint code, byte[] inBuf, int inSize, byte[] outBuf, int outSize, out int returned, IntPtr overlapped);
+
+        private class DirEntry { public string Name; public long Parent; public int ParentSeq; public int Seq; public bool InUse; }
+
+        public volatile bool Cancel;
+        public long RecordsTotal;
+        public long RecordsScanned;
+        public long DeletedFound;
+        public bool Completed;
+        public string Error;
+        public string Source;
+        public bool IsImage;
+        public int BytesPerCluster;
+        public int BytesPerSector;
+        public long TotalClusters;
+
+        private Microsoft.Win32.SafeHandles.SafeFileHandle handle;
+        private int recordSize;
+        private long mftLcn;
+        private List<long[]> mftRuns;
+        private byte[] bitmap;
+        private Dictionary<long, DirEntry> dirs = new Dictionary<long, DirEntry>();
+        private Dictionary<long, string> pathCache = new Dictionary<long, string>();
+        private List<DeletedFile> all = new List<DeletedFile>();
+        private List<long> parents = new List<long>();     // parallel to 'all': parent record | (seq << 48)
+        private string rootLabel;
+
+        // source: "C:" for a live volume, or the full path of a raw NTFS volume image.
+        public NtfsUndelete(string source)
+        {
+            Source = source;
+            IsImage = !(source.Length == 2 && source[1] == ':');
+            rootLabel = IsImage ? "[image]" : source.ToUpperInvariant();
+        }
+
+        public void Open()
+        {
+            string path = IsImage ? Source : "\\\\.\\" + Source;
+            handle = CreateFile(path, 0x80000000 /* GENERIC_READ only */, 0x1 | 0x2, IntPtr.Zero, 3, 0, IntPtr.Zero);
+            if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Could not open " + path + " for reading");
+
+            byte[] boot = new byte[4096];
+            ReadAt(0, boot, boot.Length);
+            if (System.Text.Encoding.ASCII.GetString(boot, 3, 8) != "NTFS    ") throw new InvalidOperationException("This is not an NTFS volume.");
+            BytesPerSector = BitConverter.ToUInt16(boot, 0x0B);
+            int spc = boot[0x0D];
+            if (spc > 0x80) spc = 1 << (256 - spc);
+            BytesPerCluster = BytesPerSector * spc;
+            TotalClusters = BitConverter.ToInt64(boot, 0x28) / spc;
+            mftLcn = BitConverter.ToInt64(boot, 0x30);
+            int cpr = (sbyte)boot[0x40];
+            recordSize = cpr > 0 ? cpr * BytesPerCluster : 1 << -cpr;
+            if (BytesPerSector < 512 || BytesPerCluster < BytesPerSector || recordSize < 512 || recordSize > 65536)
+                throw new InvalidOperationException("Unexpected NTFS geometry in the boot sector.");
+
+            byte[] rec0 = ReadAligned(mftLcn * BytesPerCluster, recordSize);
+            if (!Fixup(rec0)) throw new InvalidOperationException("The $MFT record is damaged.");
+            DataInfo d = ParseRecord(rec0).Data;
+            if (d == null || d.Runs == null) throw new InvalidOperationException("Could not locate the master file table.");
+            mftRuns = d.Runs;
+            RecordsTotal = d.Size / recordSize;
+            LoadBitmap();
+        }
+
+        // ---------------- raw I/O (offsets and lengths are kept sector-aligned)
+        private void ReadAt(long offset, byte[] buffer, int count)
+        {
+            long pos;
+            if (!SetFilePointerEx(handle, offset, out pos, 0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            int done = 0;
+            while (done < count)
+            {
+                int read;
+                byte[] target = done == 0 ? buffer : new byte[count - done];
+                if (!ReadFile(handle, target, count - done, out read, IntPtr.Zero)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                if (read == 0) { Array.Clear(buffer, done, count - done); return; }
+                if (done > 0) Buffer.BlockCopy(target, 0, buffer, done, read);
+                done += read;
+            }
+        }
+
+        private byte[] ReadAligned(long offset, int count)
+        {
+            long start = offset - (offset % BytesPerSector);
+            long end = offset + count;
+            if (end % BytesPerSector != 0) end += BytesPerSector - (end % BytesPerSector);
+            byte[] tmp = new byte[end - start];
+            ReadAt(start, tmp, tmp.Length);
+            byte[] result = new byte[count];
+            Buffer.BlockCopy(tmp, (int)(offset - start), result, 0, count);
+            return result;
+        }
+
+        // Live allocation state. For an image file it falls back to the volume's own $Bitmap file.
+        public void LoadBitmap()
+        {
+            long bytes = (TotalClusters + 7) / 8;
+            bitmap = new byte[bytes];
+            if (IsImage) { LoadBitmapFromFile(); return; }
+            long start = 0;
+            const int chunk = 8 * 1024 * 1024;
+            while (start < TotalClusters)
+            {
+                byte[] input = BitConverter.GetBytes(start);
+                byte[] output = new byte[16 + chunk];
+                int returned;
+                bool ok = DeviceIoControl(handle, 0x0009006F /* FSCTL_GET_VOLUME_BITMAP */, input, 8, output, output.Length, out returned, IntPtr.Zero);
+                int err = Marshal.GetLastWin32Error();
+                if (!ok && err != 234 /* ERROR_MORE_DATA */) throw new System.ComponentModel.Win32Exception(err, "Could not read the volume bitmap");
+                long startLcn = BitConverter.ToInt64(output, 0);
+                int got = returned - 16;
+                long at = startLcn / 8;
+                if (got <= 0 || at >= bitmap.Length) break;
+                Buffer.BlockCopy(output, 16, bitmap, (int)at, (int)Math.Min(got, bitmap.Length - at));
+                if (ok) break;
+                start = startLcn + (long)got * 8;
+            }
+        }
+
+        private void LoadBitmapFromFile()
+        {
+            byte[] rec = ReadRecord(6);
+            DataInfo d = rec == null ? null : ParseRecord(rec).Data;
+            if (d == null || d.Runs == null) return;   // leave as "all free"
+            long pos = 0;
+            foreach (long[] run in d.Runs)
+            {
+                if (run[0] < 0) { pos += run[1] * BytesPerCluster; continue; }
+                for (long c = 0; c < run[1] && pos < bitmap.Length; c++)
+                {
+                    byte[] cl = new byte[BytesPerCluster];
+                    ReadAt((run[0] + c) * BytesPerCluster, cl, cl.Length);
+                    int n = (int)Math.Min(cl.Length, bitmap.Length - pos);
+                    Buffer.BlockCopy(cl, 0, bitmap, (int)pos, n);
+                    pos += n;
+                }
+            }
+        }
+
+        private bool IsAllocated(long lcn)
+        {
+            if (lcn < 0 || (lcn >> 3) >= bitmap.Length) return true;
+            return (bitmap[lcn >> 3] & (1 << (int)(lcn & 7))) != 0;
+        }
+
+        private byte[] ReadRecord(long number)
+        {
+            long vcnByte = number * recordSize;
+            long pos = 0;
+            foreach (long[] run in mftRuns)
+            {
+                long len = run[1] * BytesPerCluster;
+                if (vcnByte < pos + len)
+                {
+                    if (run[0] < 0) return null;
+                    byte[] r = ReadAligned(run[0] * BytesPerCluster + (vcnByte - pos), recordSize);
+                    return Fixup(r) ? r : null;
+                }
+                pos += len;
+            }
+            return null;
+        }
+
+        // ---------------- record parsing
+        private bool Fixup(byte[] r)
+        {
+            if (r.Length < 48 || BitConverter.ToUInt32(r, 0) != 0x454C4946 /* "FILE" */) return false;
+            int usaOfs = BitConverter.ToUInt16(r, 4), usaCount = BitConverter.ToUInt16(r, 6);
+            if (usaOfs + usaCount * 2 > r.Length) return false;
+            for (int i = 1; i < usaCount; i++)
+            {
+                int p = i * 512 - 2;               // the update-sequence stride is always 512 bytes
+                if (p + 1 >= r.Length) break;
+                if (r[p] != r[usaOfs] || r[p + 1] != r[usaOfs + 1]) return false;
+                r[p] = r[usaOfs + 2 * i]; r[p + 1] = r[usaOfs + 2 * i + 1];
+            }
+            return true;
+        }
+
+        private class DataInfo
+        {
+            public long Size; public bool Resident; public byte[] Bytes; public List<long[]> Runs;
+            public bool Compressed; public bool Encrypted; public bool Partial;
+        }
+        private class RecordInfo
+        {
+            public bool InUse; public bool IsDir; public int Seq; public long BaseRef;
+            public string Name; public int NameSpace = 99; public long Parent; public int ParentSeq;
+            public DateTime Created = DateTime.MinValue; public DateTime Modified = DateTime.MinValue;
+            public DataInfo Data; public bool HasAttrList;
+        }
+
+        private static DateTime FromFt(long ft)
+        {
+            if (ft <= 0 || ft > 2650467743999999999L) return DateTime.MinValue;
+            try { return DateTime.FromFileTime(ft); } catch { return DateTime.MinValue; }
+        }
+
+        private RecordInfo ParseRecord(byte[] r)
+        {
+            var info = new RecordInfo();
+            int flags = BitConverter.ToUInt16(r, 0x16);
+            info.InUse = (flags & 1) != 0;
+            info.IsDir = (flags & 2) != 0;
+            info.Seq = BitConverter.ToUInt16(r, 0x10);
+            info.BaseRef = BitConverter.ToInt64(r, 0x20) & 0xFFFFFFFFFFFFL;
+            int a = BitConverter.ToUInt16(r, 0x14);
+            while (a + 16 <= r.Length)
+            {
+                uint type = BitConverter.ToUInt32(r, a);
+                if (type == 0xFFFFFFFF) break;
+                int len = BitConverter.ToInt32(r, a + 4);
+                if (len < 16 || a + len > r.Length) break;
+                bool nonRes = r[a + 8] != 0;
+                int nameLen = r[a + 9];
+                if (!nonRes && (type == 0x10 || type == 0x30))
+                {
+                    int vlen = BitConverter.ToInt32(r, a + 0x10), v = a + BitConverter.ToUInt16(r, a + 0x14);
+                    if (v + vlen <= r.Length)
+                    {
+                        if (type == 0x10 && vlen >= 32)
+                        {
+                            info.Created = FromFt(BitConverter.ToInt64(r, v));
+                            info.Modified = FromFt(BitConverter.ToInt64(r, v + 8));
+                        }
+                        else if (type == 0x30 && vlen >= 66)
+                        {
+                            int nl = r[v + 64], ns = r[v + 65];
+                            // Prefer the long (Win32 / POSIX) name over the 8.3 DOS alias.
+                            int rank = ns == 2 ? 3 : (ns == 0 ? 2 : 1);
+                            if (v + 66 + nl * 2 <= r.Length && rank < info.NameSpace)
+                            {
+                                info.NameSpace = rank;
+                                info.Name = System.Text.Encoding.Unicode.GetString(r, v + 66, nl * 2);
+                                long pref = BitConverter.ToInt64(r, v);
+                                info.Parent = pref & 0xFFFFFFFFFFFFL;
+                                info.ParentSeq = (int)((pref >> 48) & 0xFFFF);
+                            }
+                        }
+                    }
+                }
+                else if (type == 0x20) info.HasAttrList = true;
+                else if (type == 0x80 && nameLen == 0 && info.Data == null)
+                {
+                    var d = new DataInfo();
+                    int aflags = BitConverter.ToUInt16(r, a + 0x0C);
+                    d.Compressed = (aflags & 0x00FF) != 0;
+                    d.Encrypted = (aflags & 0x4000) != 0;
+                    if (!nonRes)
+                    {
+                        int vlen = BitConverter.ToInt32(r, a + 0x10), v = a + BitConverter.ToUInt16(r, a + 0x14);
+                        if (v + vlen <= r.Length && vlen >= 0)
+                        {
+                            d.Resident = true; d.Size = vlen; d.Bytes = new byte[vlen];
+                            Buffer.BlockCopy(r, v, d.Bytes, 0, vlen);
+                        }
+                    }
+                    else
+                    {
+                        long startVcn = BitConverter.ToInt64(r, a + 0x10);
+                        d.Partial = startVcn != 0;
+                        d.Size = BitConverter.ToInt64(r, a + 0x30);
+                        d.Runs = DecodeRuns(r, a + BitConverter.ToUInt16(r, a + 0x20), a + len);
+                        if (d.Runs != null)
+                        {
+                            long clusters = 0;
+                            foreach (long[] run in d.Runs) clusters += run[1];
+                            if (clusters * BytesPerCluster < d.Size) d.Partial = true;   // rest lives in an extension record
+                        }
+                    }
+                    info.Data = d;
+                }
+                a += len;
+            }
+            return info;
+        }
+
+        private List<long[]> DecodeRuns(byte[] r, int p, int end)
+        {
+            var runs = new List<long[]>();
+            long lcn = 0;
+            while (p < end && p < r.Length)
+            {
+                int h = r[p];
+                if (h == 0) break;
+                int lenSize = h & 0x0F, offSize = h >> 4;
+                p++;
+                if (lenSize == 0 || lenSize > 8 || offSize > 8 || p + lenSize + offSize > r.Length) return null;
+                long len = 0;
+                for (int i = 0; i < lenSize; i++) len |= (long)r[p + i] << (8 * i);
+                p += lenSize;
+                if (offSize == 0) runs.Add(new long[] { -1, len });
+                else
+                {
+                    long off = 0;
+                    for (int i = 0; i < offSize; i++) off |= (long)r[p + i] << (8 * i);
+                    if (offSize < 8 && (r[p + offSize - 1] & 0x80) != 0) off |= -1L << (8 * offSize);
+                    lcn += off;
+                    if (lcn < 0 || lcn + len > TotalClusters || len <= 0) return null;
+                    runs.Add(new long[] { lcn, len });
+                }
+                p += offSize;
+            }
+            return runs;
+        }
+
+        // ---------------- scanning
+        public void Scan()
+        {
+            try
+            {
+                long number = 0;
+                int perChunk = Math.Max(1, (4 * 1024 * 1024) / recordSize);
+                foreach (long[] run in mftRuns)
+                {
+                    if (run[0] < 0) { number += run[1] * BytesPerCluster / recordSize; continue; }
+                    long runBytes = run[1] * BytesPerCluster;
+                    for (long off = 0; off < runBytes && number < RecordsTotal; )
+                    {
+                        if (Cancel) return;
+                        int bytes = (int)Math.Min((long)perChunk * recordSize, runBytes - off);
+                        byte[] buf = new byte[bytes];
+                        ReadAt(run[0] * BytesPerCluster + off, buf, bytes);
+                        for (int i = 0; i + recordSize <= bytes && number < RecordsTotal; i += recordSize, number++)
+                        {
+                            byte[] rec = new byte[recordSize];
+                            Buffer.BlockCopy(buf, i, rec, 0, recordSize);
+                            Process(rec, number);
+                            RecordsScanned = number + 1;
+                        }
+                        off += bytes;
+                    }
+                }
+                BuildPaths();
+                Completed = !Cancel;
+            }
+            catch (Exception ex) { Error = ex.Message; }
+        }
+
+        private void Process(byte[] rec, long number)
+        {
+            if (!Fixup(rec)) return;
+            RecordInfo info = ParseRecord(rec);
+            if (info.BaseRef != 0) return;               // extension record of another file
+            if (info.IsDir)
+            {
+                if (info.Name != null || number == 5)
+                    dirs[number] = new DirEntry { Name = number == 5 ? "" : info.Name, Parent = info.Parent, ParentSeq = info.ParentSeq, Seq = info.Seq, InUse = info.InUse };
+                return;
+            }
+            if (info.InUse || number < 24 || info.Name == null) return;
+            if (all.Count >= 1000000) return;
+
+            var f = new DeletedFile();
+            f.Record = number; f.Name = info.Name; f.Created = info.Created; f.Modified = info.Modified;
+            DataInfo d = info.Data;
+            if (d == null)
+            {
+                if (!info.HasAttrList) return;
+                f.Chance = "Poor"; f.Score = 1; f.Note = "Data is described in another record"; f.Unsupported = true;
+            }
+            else
+            {
+                f.Size = d.Size;
+                if (d.Resident) { f.Resident = true; f.ResidentData = d.Bytes; }
+                else f.Runs = d.Runs;
+                if (d.Encrypted) { f.Unsupported = true; f.Note = "Encrypted (EFS)"; }
+                else if (d.Compressed) { f.Unsupported = true; f.Note = "NTFS-compressed"; }
+                else if (!d.Resident && d.Runs == null) { f.Unsupported = true; f.Note = "Damaged record"; }
+                else if (d.Partial) f.Note = "Very fragmented - may be incomplete";
+            }
+            all.Add(f);
+            parents.Add(info.Parent | ((long)info.ParentSeq << 48));
+            DeletedFound++;
+        }
+
+        private string PathFor(long parent, int parentSeq, int depth)
+        {
+            if (parent == 5) return rootLabel + "\\";
+            long key = parent | ((long)parentSeq << 48);
+            string cached;
+            if (pathCache.TryGetValue(key, out cached)) return cached;
+            DirEntry d;
+            string result;
+            if (depth > 64 || !dirs.TryGetValue(parent, out d)) result = rootLabel + "\\[unknown folder]\\";
+            else if (d.InUse ? d.Seq != parentSeq : Math.Abs(d.Seq - parentSeq) > 1) result = rootLabel + "\\[folder no longer exists]\\";
+            else result = PathFor(d.Parent, d.ParentSeq, depth + 1) + d.Name + (d.InUse ? "" : " [deleted]") + "\\";
+            pathCache[key] = result;
+            return result;
+        }
+
+        private void BuildPaths()
+        {
+            for (int i = 0; i < all.Count; i++)
+            {
+                long p = parents[i];
+                string folder = PathFor(p & 0xFFFFFFFFFFFFL, (int)((p >> 48) & 0xFFFF), 0);
+                all[i].Folder = folder.Length > 3 ? folder.TrimEnd('\\') : folder;
+                Rate(all[i]);
+            }
+        }
+
+        private void Rate(DeletedFile f)
+        {
+            if (f.Unsupported) { f.Chance = "Not supported"; f.Score = 1; return; }
+            if (f.Size == 0) { f.Chance = "Empty"; f.Score = 0; return; }
+            if (f.Resident) { f.Chance = "Excellent"; f.Score = 4; if (f.Note == null) f.Note = "Stored inside the file table"; return; }
+            long total = 0, used = 0;
+            foreach (long[] run in f.Runs)
+            {
+                if (run[0] < 0) continue;
+                for (long c = 0; c < run[1]; c++) { total++; if (IsAllocated(run[0] + c)) used++; }
+            }
+            if (total == 0) { f.Chance = "Empty"; f.Score = 0; }
+            else if (used == 0) { f.Chance = f.Note == null ? "Good" : "Fair"; f.Score = f.Note == null ? 3 : 2; }
+            else if (used < total)
+            {
+                f.Chance = "Poor"; f.Score = 1;
+                f.Note = (used * 100 / total) + "% has been overwritten";
+            }
+            else { f.Chance = "Overwritten"; f.Score = 0; f.Note = "Its space is in use by other files"; }
+        }
+
+        // Re-reads cluster allocation (call right before recovering) and re-rates every result.
+        public void Refresh()
+        {
+            LoadBitmap();
+            foreach (DeletedFile f in all) Rate(f);
+        }
+
+        public List<DeletedFile> Filter(string query, int minScore, int max, out int matched)
+        {
+            var list = new List<DeletedFile>();
+            matched = 0;
+            string q = string.IsNullOrEmpty(query) ? null : query.ToLowerInvariant();
+            foreach (DeletedFile f in all)
+            {
+                if (f.Score < minScore) continue;
+                if (q != null && f.Name.ToLowerInvariant().IndexOf(q) < 0 && (f.Folder == null || f.Folder.ToLowerInvariant().IndexOf(q) < 0)) continue;
+                matched++;
+                list.Add(f);
+            }
+            list.Sort(delegate (DeletedFile a, DeletedFile b)
+            {
+                int c = b.Score.CompareTo(a.Score);
+                return c != 0 ? c : b.Modified.CompareTo(a.Modified);
+            });
+            if (list.Count > max) list.RemoveRange(max, list.Count - max);
+            return list;
+        }
+
+        public int CountAtLeast(int minScore)
+        {
+            int n = 0;
+            foreach (DeletedFile f in all) if (f.Score >= minScore) n++;
+            return n;
+        }
+
+        // Copies a deleted file's data out to destPath (on another volume). Returns null on success,
+        // or a short warning. Never overwrites: the destination must not exist.
+        public string Recover(DeletedFile f, string destPath)
+        {
+            if (f.Unsupported) throw new InvalidOperationException(f.Note ?? "This file can't be recovered by AWiper.");
+            bool anyData = false;
+            using (var fs = new FileStream(destPath, FileMode.CreateNew, FileAccess.Write))
+            {
+                if (f.Resident)
+                {
+                    fs.Write(f.ResidentData, 0, f.ResidentData.Length);
+                    anyData = f.ResidentData.Length > 0;
+                }
+                else
+                {
+                    long remaining = f.Size;
+                    int chunkClusters = Math.Max(1, (1024 * 1024) / BytesPerCluster);
+                    byte[] buf = new byte[chunkClusters * BytesPerCluster];
+                    foreach (long[] run in f.Runs)
+                    {
+                        for (long c = 0; c < run[1] && remaining > 0; c += chunkClusters)
+                        {
+                            int n = (int)Math.Min(chunkClusters, run[1] - c);
+                            int bytes = n * BytesPerCluster;
+                            if (run[0] < 0) Array.Clear(buf, 0, bytes);
+                            else ReadAt((run[0] + c) * BytesPerCluster, buf, bytes);
+                            int write = (int)Math.Min(bytes, remaining);
+                            if (!anyData) for (int i = 0; i < write; i++) if (buf[i] != 0) { anyData = true; break; }
+                            fs.Write(buf, 0, write);
+                            remaining -= write;
+                        }
+                        if (remaining <= 0) break;
+                    }
+                    if (remaining > 0) fs.SetLength(f.Size);
+                }
+            }
+            try
+            {
+                if (f.Created != DateTime.MinValue) File.SetCreationTime(destPath, f.Created);
+                if (f.Modified != DateTime.MinValue) File.SetLastWriteTime(destPath, f.Modified);
+            }
+            catch { }
+            if (!anyData && f.Size > 0) return "contains only zeros - the drive has probably already erased it (TRIM)";
+            return f.Note;
+        }
+
+        public void Dispose() { if (handle != null) handle.Dispose(); }
     }
 
     // Windows Credential Manager (generic credentials), used for saved remote connections.
@@ -1992,6 +2535,7 @@ $script:Tweaks = @(
                   <StackPanel Orientation="Horizontal">
                     <RadioButton x:Name="RecTabBin"    Style="{StaticResource SegBtn}" GroupName="RecTab" IsChecked="True" Content="Recycle Bin"/>
                     <RadioButton x:Name="RecTabShadow" Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Previous versions"/>
+                    <RadioButton x:Name="RecTabUndel"  Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Undelete"/>
                     <RadioButton x:Name="RecTabDeep"   Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Deep scan"/>
                   </StackPanel>
                 </Border>
@@ -2115,6 +2659,73 @@ $script:Tweaks = @(
                   </DockPanel>
                 </Border>
               </Grid>
+
+              <!-- Undelete (native NTFS file-table scan) -->
+              <Border x:Name="RecPanelUndel" Style="{StaticResource Card}" Padding="14,12" Visibility="Collapsed">
+                <DockPanel>
+                  <Grid DockPanel.Dock="Top" Margin="0,0,0,10">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <WrapPanel x:Name="UndelSources" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="UndelStatus" Grid.Column="1" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="8,0,12,0"/>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                      <Button x:Name="UndelImage" Content="Scan an image file..." Style="{StaticResource BtnChip}"
+                              ToolTip="Scan a raw NTFS volume image (.img / .dd / .bin), for example one made from a failing drive"/>
+                      <Button x:Name="UndelStop" Content="Stop" Style="{StaticResource BtnChip}" IsEnabled="False"/>
+                      <Button x:Name="UndelScan" Style="{StaticResource BtnAccent}" Padding="16,7" FontSize="12">
+                        <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE721;" Style="{StaticResource Icon}" Margin="0,0,8,0"/><TextBlock Text="Scan for deleted files"/></StackPanel>
+                      </Button>
+                    </StackPanel>
+                  </Grid>
+                  <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="300"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                    <TextBox x:Name="UndelSearch" Tag="Filter by name or folder..."/>
+                    <CheckBox x:Name="UndelLikely" Grid.Column="1" Content="Only files that look recoverable" IsChecked="True" Margin="14,0,0,0"/>
+                    <TextBlock x:Name="UndelInfo" Grid.Column="2" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0,0,0" TextTrimming="CharacterEllipsis"/>
+                  </Grid>
+                  <Grid DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <TextBlock Text="SAVE TO" Style="{StaticResource Caps}" Margin="4,0,10,0" VerticalAlignment="Center"/>
+                    <TextBox x:Name="UndelDest" Grid.Column="1" Tag="A folder on a different drive, e.g. E:\Recovered"/>
+                    <Button x:Name="UndelBrowse" Grid.Column="2" Style="{StaticResource BtnIcon}" Content="&#xE838;" ToolTip="Browse" Margin="8,0,10,0"/>
+                    <Button x:Name="UndelRecover" Grid.Column="3" Content="Recover checked" Style="{StaticResource BtnAccent}" Padding="14,6" FontSize="12"/>
+                  </Grid>
+                  <TextBlock x:Name="UndelDestMsg" DockPanel.Dock="Bottom" Text="" Foreground="{StaticResource DangerBrush}" FontSize="12" Margin="4,8,0,0" TextWrapping="Wrap" Visibility="Collapsed"/>
+                  <ListView x:Name="UndelList">
+                    <ListView.View>
+                      <GridView>
+                        <GridViewColumn Header="" Width="44">
+                          <GridViewColumn.CellTemplate><DataTemplate><CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}" Margin="4,0,0,0"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Name" Width="220">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding FullPath}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Chance" Width="100">
+                          <GridViewColumn.CellTemplate><DataTemplate>
+                            <TextBlock x:Name="Ch" Text="{Binding Chance}" FontWeight="SemiBold" Foreground="#F5B94B"/>
+                            <DataTemplate.Triggers>
+                              <DataTrigger Binding="{Binding Chance}" Value="Excellent"><Setter TargetName="Ch" Property="Foreground" Value="#19C3B1"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Chance}" Value="Good"><Setter TargetName="Ch" Property="Foreground" Value="#19C3B1"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Chance}" Value="Overwritten"><Setter TargetName="Ch" Property="Foreground" Value="#F2617A"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Chance}" Value="Empty"><Setter TargetName="Ch" Property="Foreground" Value="#5F6890"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Chance}" Value="Not supported"><Setter TargetName="Ch" Property="Foreground" Value="#5F6890"/></DataTrigger>
+                            </DataTemplate.Triggers>
+                          </DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Size" Width="90">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Modified" Width="130" DisplayMemberBinding="{Binding ModifiedText}"/>
+                        <GridViewColumn Header="Original folder" Width="330">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Folder}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Notes" Width="220">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                      </GridView>
+                    </ListView.View>
+                  </ListView>
+                </DockPanel>
+              </Border>
 
               <!-- Deep scan (Windows File Recovery) -->
               <Grid x:Name="RecPanelDeep" Visibility="Collapsed">
@@ -2641,6 +3252,13 @@ $script:Timer.Add_Tick({
                 $ui.StatusProgress.Value = [Math]::Min(99, $s.BytesScanned * 100.0 / $script:ScanExpected)
             } else { $ui.StatusProgress.IsIndeterminate = $true }
             $ui.StatusProgress.Visibility = 'Visible'
+        }
+        elseif ($script:UndelRunning -and $script:Undelete -and $script:Undelete.RecordsTotal -gt 0) {
+            $u = $script:Undelete
+            $msg = 'Reading the file table: {0:N0} of {1:N0} records - {2:N0} deleted files found' -f $u.RecordsScanned, $u.RecordsTotal, $u.DeletedFound
+            Set-AWStatus $msg; $ui.UndelStatus.Text = $msg
+            $ui.StatusProgress.Visibility = 'Visible'; $ui.StatusProgress.IsIndeterminate = $false
+            $ui.StatusProgress.Value = [Math]::Min(100, $u.RecordsScanned * 100.0 / $u.RecordsTotal)
         }
         elseif ($script:Jobs.Count -gt 0) {
             Set-AWStatus $Sync.Status
@@ -4476,6 +5094,7 @@ function Update-AWRecoveryDrives {
         $ui.RecDrives.Children.Clear()
         foreach ($d in $script:RecDrives) { [void]$ui.RecDrives.Children.Add((New-AWRecDriveCard $d)) }
         Initialize-AWDeepSources
+        Initialize-AWUndelSources
     }
 }
 
@@ -4681,6 +5300,180 @@ function Start-AWShadowCopy([string]$ToFolder) {
     }
 }
 
+# ---------------- Undelete (native NTFS file-table scan)
+$script:Undelete = $null
+$script:UndelSource = $null
+$script:UndelRunning = $false
+
+function Initialize-AWUndelSources {
+    $ui.UndelSources.Children.Clear()
+    $prev = $script:UndelSource
+    foreach ($d in @($script:RecDrives | Where-Object { $_.FS -eq 'NTFS' })) {
+        $rb = New-Object System.Windows.Controls.RadioButton
+        $rb.Style = $window.FindResource('SegBtn'); $rb.GroupName = 'UndelSrc'; $rb.Tag = $d.Drive
+        $rb.Content = '{0}  {1}' -f $d.Drive, $(if ($d.Label) { $d.Label } else { 'NTFS' })
+        $rb.ToolTip = (Get-AWDriveVerdict $d).Text
+        $rb.IsEnabled = $script:IsAdmin
+        $rb.Add_Checked({ param($s, $e) $script:UndelSource = $s.Tag; Update-AWUndelDest })
+        $wrap = New-Object System.Windows.Controls.Border
+        $wrap.Background = $window.FindResource('FieldBrush'); $wrap.BorderBrush = $window.FindResource('LineBrush')
+        $wrap.BorderThickness = 1; $wrap.CornerRadius = 10; $wrap.Padding = 3; $wrap.Margin = '0,0,8,0'
+        $wrap.Child = $rb
+        [void]$ui.UndelSources.Children.Add($wrap)
+        if ($d.Drive -eq $prev) { $rb.IsChecked = $true }
+    }
+    if (-not $script:IsAdmin -and -not $script:UndelRunning -and -not $script:Undelete) {
+        $ui.UndelStatus.Text = 'Scanning a drive needs administrator rights (use "Restart as admin"). You can still scan an image file.'
+    }
+    Update-AWUndelButtons
+}
+
+function Update-AWUndelButtons {
+    $ui.UndelScan.IsEnabled = -not $script:UndelRunning -and $script:IsAdmin -and [bool]$script:UndelSource
+    $ui.UndelImage.IsEnabled = -not $script:UndelRunning
+    $ui.UndelStop.IsEnabled = $script:UndelRunning
+    $ui.UndelRecover.IsEnabled = -not $script:UndelRunning -and $script:Undelete -and $script:Undelete.Completed
+}
+
+# Returns an error message when the destination is unsafe, otherwise ''.
+function Test-AWUndelDest {
+    $dest = $ui.UndelDest.Text.Trim()
+    if (-not $dest) { return 'Choose a folder on a different drive to save recovered files to.' }
+    if ($dest -notmatch '^[A-Za-z]:\\' -and $dest -notmatch '^\\\\') { return 'Enter a full path, like E:\Recovered.' }
+    $u = $script:Undelete
+    if ($u -and -not $u.IsImage) {
+        $sv = [AWiper.Native]::VolumeId("$($u.Source)\")
+        $dv = [AWiper.Native]::VolumeId($dest)
+        if ($sv -and $dv -and $sv -eq $dv) { return "That folder is on $($u.Source), the drive being recovered. Writing there can overwrite the very files you want back - pick a folder on a different drive." }
+    }
+    ''
+}
+
+function Update-AWUndelDest {
+    $msg = if ($ui.UndelDest.Text.Trim()) { Test-AWUndelDest } else { '' }
+    $ui.UndelDestMsg.Text = $msg
+    $ui.UndelDestMsg.Visibility = if ($msg) { 'Visible' } else { 'Collapsed' }
+    Update-AWUndelButtons
+}
+
+function Update-AWUndelView {
+    $u = $script:Undelete
+    if (-not $u -or -not $u.Completed) { return }
+    $matched = 0
+    $min = if ($ui.UndelLikely.IsChecked) { 2 } else { 0 }
+    $list = $u.Filter($ui.UndelSearch.Text.Trim(), $min, 5000, [ref]$matched)
+    $ui.UndelList.ItemsSource = $list
+    $more = if ($matched -gt 5000) { ' - showing the 5,000 most promising' } else { '' }
+    $ui.UndelInfo.Text = '{0:N0} match(es){1}' -f $matched, $more
+}
+
+function Start-AWUndelScan([string]$Source) {
+    if ($script:UndelRunning -or -not $Source) { return }
+    if ($script:Undelete) { $script:Undelete.Dispose(); $script:Undelete = $null }
+    $u = New-Object AWiper.NtfsUndelete $Source
+    $script:Undelete = $u
+    $script:UndelRunning = $true
+    $ui.UndelList.ItemsSource = $null; $ui.UndelInfo.Text = ''
+    $label = if ($u.IsImage) { Split-Path $Source -Leaf } else { $Source }
+    $ui.UndelStatus.Text = "Opening $label..."
+    Update-AWUndelButtons; Update-AWUndelDest
+    Write-AWLog "Undelete: scanning $Source (read-only)"
+    Start-AWTask -Name "Undelete scan of $label" -Arguments @{ U = $u } -Work {
+        try { $U.Open() } catch { $U.Error = $_.Exception.Message; return }
+        $U.Scan()
+    } -OnComplete {
+        param($r)
+        $script:UndelRunning = $false
+        $u = $script:Undelete
+        if ($u.Error) {
+            $ui.UndelStatus.Text = "Scan failed: $($u.Error)"
+            Write-AWLog "Undelete scan failed: $($u.Error)" 'ERROR'
+        } elseif ($u.Completed) {
+            $good = $u.CountAtLeast(2)
+            $ui.UndelStatus.Text = '{0:N0} deleted files found, {1:N0} look recoverable' -f $u.DeletedFound, $good
+            Write-AWLog ('Undelete: {0:N0} records read, {1:N0} deleted files, {2:N0} look recoverable' -f $u.RecordsScanned, $u.DeletedFound, $good)
+            $script:IdleStatus = 'Undelete scan complete'
+            Update-AWUndelView
+        } else { $ui.UndelStatus.Text = 'Scan stopped.' }
+        Update-AWUndelButtons
+    }
+}
+
+function Start-AWUndelRecover {
+    $u = $script:Undelete
+    if (-not $u -or -not $u.Completed) { return }
+    $items = @(@($ui.UndelList.ItemsSource) | Where-Object { $_ -and $_.IsChecked })
+    if ($items.Count -eq 0) { Show-AWMessage 'Check the files you want to recover first.'; return }
+    $bad = Test-AWUndelDest
+    if ($bad) { Show-AWMessage $bad; return }
+    $dest = $ui.UndelDest.Text.Trim()
+    $poor = @($items | Where-Object { $_.Score -lt 3 }).Count
+    $warn = if ($poor) { "`n`n$poor of them are rated below Good, so they may come back damaged or empty." } else { '' }
+    if (-not (Confirm-AW "Recover $($items.Count) file(s) to $($dest)?$warn`n`nOriginal folders are recreated inside the destination. Nothing is overwritten.")) { return }
+    if (-not (Test-Path -LiteralPath $dest)) {
+        try { New-Item -ItemType Directory -Path $dest -Force | Out-Null } catch { Show-AWMessage "Could not create $($dest): $($_.Exception.Message)" 'Error'; return }
+    }
+    $ui.UndelRecover.IsEnabled = $false
+    Start-AWTask -Name 'Recover deleted files' -Arguments @{ U = $u; Items = $items; Dest = $dest } -Work {
+        $U.Refresh()     # re-check allocation right before reading
+        $i = 0; $ok = 0
+        $bad = [System.IO.Path]::GetInvalidFileNameChars()
+        foreach ($f in $Items) {
+            $Sync.Status = "Recovering $($f.Name)..."; $Sync.Progress = [int]($i * 100 / $Items.Count); $i++
+            try {
+                # Rebuild the original folder layout under the destination: C:\Users\x\a.txt -> Dest\Users\x\a.txt
+                $rel = ($f.Folder -replace '^(\[image\]|[A-Za-z]:)\\?', '')
+                $parts = @($rel -split '\\' | Where-Object { $_ } | ForEach-Object { -join ($_.ToCharArray() | ForEach-Object { if ($bad -contains $_) { '_' } else { $_ } }) })
+                $dir = if ($parts.Count) { Join-Path $Dest ($parts -join '\') } else { $Dest }
+                if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                $name = -join ($f.Name.ToCharArray() | ForEach-Object { if ($bad -contains $_) { '_' } else { $_ } })
+                $target = Join-Path $dir $name
+                $n = 1
+                while (Test-Path -LiteralPath $target) {
+                    $target = Join-Path $dir ('{0} (recovered{1}){2}' -f [System.IO.Path]::GetFileNameWithoutExtension($name), $(if ($n -gt 1) { " $n" } else { '' }), [System.IO.Path]::GetExtension($name)); $n++
+                }
+                $note = $U.Recover($f, $target)
+                if ($note -match 'zeros') { Write-WLog "Recovered $target - but it $note" 'WARN' }
+                elseif ($note) { Write-WLog "Recovered $target ($note)" }
+                else { Write-WLog "Recovered $target" }
+                $ok++
+            } catch { Write-WLog "Could not recover $($f.Name): $($_.Exception.Message)" 'ERROR' }
+        }
+        "Recovered $ok of $($Items.Count) file(s)"
+    } -OnComplete {
+        param($r)
+        $msg = @($r | Where-Object { $_ -is [string] }) | Select-Object -Last 1
+        $script:IdleStatus = if ($msg) { "$msg - see Activity log" } else { 'Recovery finished - see Activity log' }
+        Update-AWUndelButtons
+        Update-AWUndelView
+        if (Confirm-AW "$msg.`n`nOpen the destination folder?") { Open-AWExplorer $ui.UndelDest.Text.Trim() }
+    }
+}
+
+$ui.UndelScan.Add_Click({
+    $v = Get-AWDriveVerdict (@($script:RecDrives | Where-Object { $_.Drive -eq $script:UndelSource }) | Select-Object -First 1)
+    if ($v.Level -eq 'Bad' -and -not (Confirm-AW "$($v.Text)`n`nScan anyway?")) { return }
+    Start-AWUndelScan $script:UndelSource
+})
+$ui.UndelImage.Add_Click({
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = 'Choose a raw NTFS volume image'
+    $dlg.Filter = 'Disk images (*.img;*.dd;*.raw;*.bin;*.001)|*.img;*.dd;*.raw;*.bin;*.001|All files (*.*)|*.*'
+    if ($dlg.ShowDialog() -eq 'OK') { Start-AWUndelScan $dlg.FileName }
+})
+$ui.UndelStop.Add_Click({ if ($script:Undelete) { $script:Undelete.Cancel = $true } })
+$ui.UndelSearch.Add_TextChanged({ Update-AWUndelView })
+$ui.UndelLikely.Add_Checked({ Update-AWUndelView })
+$ui.UndelLikely.Add_Unchecked({ Update-AWUndelView })
+$ui.UndelDest.Add_TextChanged({ Update-AWUndelDest })
+$ui.UndelBrowse.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Save recovered files here (must be on a different drive)'
+    $dlg.ShowNewFolderButton = $true
+    if ($dlg.ShowDialog() -eq 'OK') { $ui.UndelDest.Text = $dlg.SelectedPath }
+})
+$ui.UndelRecover.Add_Click({ Start-AWUndelRecover })
+
 # ---------------- Deep scan (Windows File Recovery front-end)
 function Update-AWWinfrStatus {
     $cmd = Get-Command winfr.exe -ErrorAction SilentlyContinue
@@ -4827,8 +5620,9 @@ function Update-AWRecoveryButtons {
     $ui.BinOpen.IsEnabled = -not $remote
     $ui.RecTabShadow.IsEnabled = -not $remote
     $ui.RecTabDeep.IsEnabled = -not $remote
+    $ui.RecTabUndel.IsEnabled = -not $remote
     $tip = if ($remote) { 'Only available on this PC' } else { $null }
-    foreach ($c in @($ui.RecTabShadow, $ui.RecTabDeep, $ui.BinRestoreTo, $ui.BinOpen)) {
+    foreach ($c in @($ui.RecTabShadow, $ui.RecTabDeep, $ui.RecTabUndel, $ui.BinRestoreTo, $ui.BinOpen)) {
         $c.ToolTip = $tip; [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($c, $true)
     }
     if ($remote -and -not $ui.RecTabBin.IsChecked) { $ui.RecTabBin.IsChecked = $true }
@@ -4838,6 +5632,7 @@ function Show-AWRecoveryTab([string]$Tab) {
     $ui.RecPanelBin.Visibility    = if ($Tab -eq 'Bin')    { 'Visible' } else { 'Collapsed' }
     $ui.RecPanelShadow.Visibility = if ($Tab -eq 'Shadow') { 'Visible' } else { 'Collapsed' }
     $ui.RecPanelDeep.Visibility   = if ($Tab -eq 'Deep')   { 'Visible' } else { 'Collapsed' }
+    $ui.RecPanelUndel.Visibility  = if ($Tab -eq 'Undel')  { 'Visible' } else { 'Collapsed' }
     if (-not $script:RecLoadedTabs[$Tab]) {
         $script:RecLoadedTabs[$Tab] = $true
         if ($Tab -eq 'Shadow') { Update-AWShadowList }
@@ -4852,12 +5647,13 @@ function Initialize-AWRecovery {
     Update-AWRecoveryButtons
     Update-AWRecoveryDrives
     Update-AWBinList
-    if ($ui.RecTabShadow.IsChecked) { Show-AWRecoveryTab 'Shadow' } elseif ($ui.RecTabDeep.IsChecked) { Show-AWRecoveryTab 'Deep' }
+    if ($ui.RecTabShadow.IsChecked) { Show-AWRecoveryTab 'Shadow' } elseif ($ui.RecTabDeep.IsChecked) { Show-AWRecoveryTab 'Deep' } elseif ($ui.RecTabUndel.IsChecked) { Show-AWRecoveryTab 'Undel' }
 }
 
 $ui.RecTabBin.Add_Checked({ Show-AWRecoveryTab 'Bin' })
 $ui.RecTabShadow.Add_Checked({ Show-AWRecoveryTab 'Shadow' })
 $ui.RecTabDeep.Add_Checked({ Show-AWRecoveryTab 'Deep' })
+$ui.RecTabUndel.Add_Checked({ Show-AWRecoveryTab 'Undel' })
 
 $ui.BinSearch.Add_TextChanged({ Update-AWBinView })
 $ui.BinRefresh.Add_Click({ Update-AWBinList })
@@ -4981,6 +5777,7 @@ $window.Add_Loaded({
 $window.Add_Closing({
     if ($script:Scanner) { $script:Scanner.Cancel = $true }
     if ($Sync.WinfrPid) { Stop-Process -Id $Sync.WinfrPid -Force -ErrorAction SilentlyContinue }
+    if ($script:Undelete) { $script:Undelete.Cancel = $true }
     Dismount-AWShadows
     $script:Timer.Stop()
     Update-AWLogView
