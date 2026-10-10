@@ -5,11 +5,11 @@ System cleanup, health check, debloat, recovery and repair toolkit for Windows, 
 | View         | What it does |
 |--------------|--------------|
 | Dashboard    | Drive usage gauges, system summary, quick actions |
-| Health Check | Disks, crashes, hardware errors, stability index, device problems, battery wear, antivirus, pending restart, local network |
+| Health Check | Checks (disks incl. NVMe health, crashes, hardware errors, stability, devices, battery, antivirus...), Events, Startup time, Security, Privacy |
 | Cleaner      | Analyze / clean temp files, caches, error reports, crash dumps, update and Delivery Optimization caches, Recycle Bin |
 | Space Map    | SpaceMonger-style nested treemap of any drive or folder (drill down, recycle) |
 | Large Files  | The 1,000 largest files from the last scan — searchable, recycle or export |
-| Recovery     | Recycle Bin restore, previous versions, native NTFS undelete, restore points, deep scan with Windows File Recovery |
+| Recovery     | Recycle Bin restore, previous versions, native NTFS undelete, restore points, versioned folder backup, deep scan with Windows File Recovery |
 | Startup      | Enable / disable startup entries (same `StartupApproved` switches Task Manager uses) |
 | Programs     | Installed software list with size, search and uninstall |
 | Drivers      | Installed drivers with vendor, age and problems; updates from Windows Update; vendor and PC-maker download pages; driver backup / restore |
@@ -20,7 +20,14 @@ System cleanup, health check, debloat, recovery and repair toolkit for Windows, 
 
 ### Health Check
 
-A read-only check that works offline and on remote PCs: disk health and reliability counters, SATA SMART failure prediction, free space, blue screens and unexpected shutdowns (30 days), WHEA hardware errors, the last memory-test result, Reliability Monitor's stability index, devices with driver problems, battery wear, Defender status and definition age (or a third-party antivirus), pending restart and uptime, and whether the local gateway answers. Each row has a status, the evidence and — where it helps — a button (Cleaner, Reliability Monitor, memory test, Device Manager, Defender update). Checks whose data isn't available on the hardware show **N/A** and are never counted as healthy. Reports save as HTML or JSON.
+A read-only check that works offline and on remote PCs: disk health and reliability counters, SATA SMART failure prediction, free space, blue screens and unexpected shutdowns (30 days), WHEA hardware errors, the last memory-test result, Reliability Monitor's stability index, devices with driver problems, battery wear, Defender status and definition age (or a third-party antivirus), pending restart and uptime, and whether the local gateway answers. Each row has a status, the evidence and — where it helps — a button (Cleaner, Reliability Monitor, memory test, Device Manager, Defender update). Checks whose data isn't available on the hardware show **N/A** and are never counted as healthy. Reports save as HTML or JSON. NVMe drives are read through their own SMART / health log (percentage used, spare capacity, temperature, media errors, unsafe shutdowns, data written) via the in-box Windows driver — no extra software.
+
+The other Health Check tabs:
+
+- **Events** — groups the last 7 or 30 days of event-log trouble (blue screens, unexpected restarts, disk and file-system errors, hardware errors, crashing apps and services, failed updates, time-sync and Group Policy failures, failed sign-ins) with what each means and what to do. **Create support bundle** zips the System / Application logs, system and network info, drivers, programs and AWiper's reports for a technician.
+- **Startup time** — a chart of recent startups (time to desktop vs. settling) and the apps, drivers and services Windows says slowed them, linked to the Startup manager (needs admin).
+- **Security** — about 20 checks (firewall, Defender, SMB1, LLMNR, Guest, admins, Remote Desktop / NLA, PowerShell logging, AutoRun, UAC, LSA protection, Credential Guard, BitLocker, LAPS, shares, open ports, expiring certificates, USB storage). A short list of safe, reversible fixes can be applied — each goes into the undo history; settings enforced by Group Policy are labelled.
+- **Privacy** — which apps last used the camera, microphone or location (and whether they're using them now), plus a report-only sweep for forced browser extensions, hijacked search / home-page policies, unsigned startup programs and scheduled tasks in user folders, proxies and hosts-file redirects.
 
 ### Drivers
 
@@ -35,9 +42,12 @@ Lists every installed driver with the company it comes from, its version and dat
 
 A view-only look at the firmware: maker, version and age, UEFI or legacy boot, Secure Boot, TPM version and state, virtualization-based security, CPU virtualization (VT-x / AMD-V), and the UEFI boot order. On Dell, HP and Lenovo business PCs, which publish their setup options to Windows, **every BIOS setup option and its current value** is listed too. Exports to CSV or JSON. **Restart into BIOS setup** reboots straight into the UEFI setup screen. AWiper never changes BIOS settings.
 
+**BIOS updates** — **Find BIOS update** opens the PC maker's support page for this exact model (or the motherboard maker's for custom-built PCs), **Check Windows Update** shows whether Windows Update already offers a BIOS / firmware update, and when BitLocker is on, **Suspend BitLocker for 1 restart** prevents the recovery-key prompt after flashing.
+
 ### Tools
 
-- **Offline kit** — find, create, verify and hash a Resources folder (see [Offline use](#offline-use))
+- **Offline kit** — find, create, verify and hash a Resources folder (see [Offline use](#offline-use)); update Defender from `Resources\defs`.
+- **Fleet** — inventory several PCs over WinRM (hardware, serial, BIOS, Windows build, security state, programs) into one HTML / CSV / JSON report, with changes since the previous run.
 - **Quick fixes** — flush DNS, Group Policy update (`gpupdate /force`), restart Explorer, reset default app associations, empty Recycle Bin
 - **Repair** — System File Checker (`sfc /scannow`), DISM `/RestoreHealth` (from Windows Update, or offline from Windows media), .NET Framework 3.5, reset Windows Update, repair the Configuration Manager client (Software Center)
 - **Maintenance** — component store cleanup, restore points, disable hibernation, Disk Cleanup, Storage Sense
@@ -64,6 +74,7 @@ The right-hand panel lists the debloat tweaks currently in effect and sets the c
 - **Recycle Bin** — reads the `$Recycle.Bin` folders directly, so it shows every user's deleted items (as admin) and works on remote PCs. Restore to the original location or another folder; nothing is ever overwritten.
 - **Previous versions** — lists Volume Shadow Copy snapshots (System Protection / restore points), opens one in Explorer, or compares a folder against a snapshot to list files that have since been deleted or changed, then restores them.
 - **Undelete** — AWiper's own NTFS undelete. It reads the drive's master file table directly (read-only, needs admin), lists deleted files with their original folders (including deleted folders), and rates each one — *Excellent* (data stored in the file record), *Good* (all clusters still free), *Poor* (partly overwritten), *Overwritten*. Recovered files keep their folder layout and timestamps, must go to a different drive, and never overwrite anything. It can also scan a raw NTFS volume image (`.img`/`.dd`) — the safe way to work on a failing drive.
+- **Backup** — keeps chosen folders (one click adds Documents, Pictures, Desktop, Videos, Music) mirrored on an external drive under `AWiper-Backup\<PC>`, and moves files that change or get deleted into dated version folders first (keeps the last N runs). The drive is identified by its volume ID, so a different drive that later takes the same letter is never written to. Optional daily schedule (a scheduled task running `AWiper.ps1 -Backup -Yes`).
 - **Restore points** — list, create (without Windows' one-per-24-hours limit), delete, turn System Protection on, and set how much space restore points may use. Optionally creates one automatically before removing apps or applying tweaks.
 - **Deep scan** — a front-end for Microsoft's free [Windows File Recovery](https://apps.microsoft.com/detail/9N26S50LN705) (`winfr`): installs it if needed, builds the command, refuses to save to the drive being scanned, and streams progress to the activity log. Offline, AWiper points you to Undelete instead.
 
@@ -94,6 +105,8 @@ Any of these parameters runs AWiper without a window — from a script, a schedu
 .\AWiper.ps1 -Config .\monthly.json -Yes                    # everything from a profile
 .\AWiper.ps1 -ComputerName PC042 -UseSavedCredential -Clean WinTemp,WerSys -Yes
 .\AWiper.ps1 -CheckDrivers                                  # driver problems, Windows Update driver offers, maker page
+.\AWiper.ps1 -Inventory PC01,PC02,localhost                 # fleet inventory report + changes since last run
+.\AWiper.ps1 -Backup -Yes                                   # run the backup set up in the window
 .\AWiper.ps1 -ListRules    # also -ListTweaks, -ListApps
 ```
 
@@ -117,7 +130,7 @@ Click **This PC** in the title bar to target another computer by hostname, FQDN 
 
 The remote PC needs PowerShell remoting enabled (`Enable-PSRemoting -Force`) and your account must be an administrator there.
 
-When a remote computer is targeted, these run on it: Health Check, the driver list and update check, the BIOS view, Tools (except Explorer, Recycle Bin, Disk Cleanup, Storage Sense, and offline media repair), machine-wide Cleaner rules, Debloat apps and machine-wide tweaks, the Programs list and Recycle Bin restore. Per-user items, Dashboard, Space Map, Large Files and Startup stay on this PC and are labelled as such.
+When a remote computer is targeted, these run on it: Health Check (and its Events, Startup time and Security tabs), the driver list and update check, the BIOS view, Tools (except Explorer, Recycle Bin, Disk Cleanup, Storage Sense, and offline media repair), machine-wide Cleaner rules, Debloat apps and machine-wide tweaks, the Programs list and Recycle Bin restore. Per-user items, Dashboard, Space Map, Large Files and Startup stay on this PC and are labelled as such.
 
 ## Safety and audit trail
 
@@ -132,6 +145,7 @@ When a remote computer is targeted, these run on it: Health Check, the driver li
 
 ```powershell
 .\tests\Test-Cli.ps1                                      # no admin: exercises the headless mode
+.\tests\Test-Backup.ps1                                   # no admin: backup versions, mirror and drive guard
 .\tests\Test-UndeleteSynthetic.ps1                        # no admin: builds a tiny NTFS image and checks the undelete engine
 .\tests\Test-UndeleteLive.ps1 -Drive H: -Dest C:\Temp\R   # admin: deletes a test file on H:, recovers it, compares hashes
 ```

@@ -33,5 +33,6 @@ $r = Invoke-AW @('-Analyze', '-Clean', 'UserTemp'); Check 'Analyze reports a siz
 $r = Invoke-AW @('-ApplyTweak', 'FileExt'); Check 'Without -Yes changes are only previewed' ($r.Out -match 'would apply' -and $r.Out -match 'preview only')
 
 $r = Invoke-AW @('-CheckDrivers', '-Offline'); Check 'CheckDrivers lists the PC and its maker page (offline)' ($r.Code -eq 0 -and $r.Out -match 'BIOS' -and $r.Out -match 'driver page') "exit $($r.Code)"
+$r = Invoke-AW @('-Inventory', 'localhost'); Check 'Inventory writes a report for this PC' ($r.Code -eq 0 -and $r.Out -match 'report\.html') "exit $($r.Code)"
 
 if ($fail) { Write-Host "$fail check(s) failed" -ForegroundColor Red; exit 1 } else { Write-Host 'All checks passed' -ForegroundColor Green }

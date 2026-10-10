@@ -6,13 +6,14 @@
     AWiper bundles the most useful parts of tools like CCleaner and SpaceMonger:
 
       * Dashboard    - drive usage gauges, system summary, quick actions
-      * Health Check - disks, crashes, hardware errors, stability, devices, battery, antivirus, pending
-                       restart, local network - read-only, works offline, never counts missing data as healthy
+      * Health Check - disks (incl. the NVMe health log), crashes, hardware errors, stability, devices, battery,
+                       antivirus, pending restart, network; tabs for event-log triage + support bundle, startup-time
+                       history, a security scorecard with reversible fixes, and camera / mic / location use + adware sweep
       * Cleaner      - analyze / clean temp files, caches, update leftovers, dumps, recycle bin
       * Space Map    - SpaceMonger-style nested treemap of any drive or folder (drill down, recycle)
       * Large Files  - the 1,000 largest files from the last scan, searchable, recycle or export
       * Recovery     - restore from any user's Recycle Bin, find deleted files in shadow-copy snapshots,
-                       native NTFS undelete (reads the MFT directly), restore-point manager, deep scan with
+                       native NTFS undelete (reads the MFT directly), restore-point manager, versioned folder backup, deep scan with
                        Windows File Recovery, per-drive recoverability (SSD/TRIM) check
       * Startup      - enable / disable startup entries (same StartupApproved switches Task Manager uses)
       * Programs     - installed software list with size, search and uninstall
@@ -83,6 +84,13 @@
 .PARAMETER CheckDrivers
     Headless: list devices with driver problems, driver updates Windows Update offers, and old third-party drivers.
 
+.PARAMETER Backup
+    Headless: run the folder backup set up in Recovery > Backup (what the daily schedule runs). Needs -Yes.
+
+.PARAMETER Inventory
+    Headless: fleet inventory of these PCs over WinRM (saved credentials are used). Writes an HTML / CSV / JSON report
+    to %LOCALAPPDATA%\AWiper\Inventory and lists changes since the previous run.
+
 .PARAMETER ComputerName
     Headless: run against another PC over WinRM. Use with -Credential or -UseSavedCredential.
 
@@ -119,7 +127,7 @@
 
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.6.0
+    Version : 1.7.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -143,6 +151,8 @@ param(
     [switch]$ListTweaks,
     [switch]$ListApps,
     [switch]$CheckDrivers,           # list driver problems and updates Windows Update offers
+    [switch]$Backup,                 # run the folder backup set up in the window (used by the schedule)
+    [string[]]$Inventory,            # fleet inventory of these PCs (names / addresses, 'localhost' for this one)
     [string]$ComputerName,           # run against a remote PC over WinRM
     [pscredential]$Credential,
     [switch]$UseSavedCredential,     # use credentials saved for -ComputerName in Credential Manager
@@ -154,9 +164,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.6.0'
+$script:AppVersion = '1.7.0'
 $script:CliMode = [bool]($Config -or $Analyze -or $Clean -or $HealthCheck -or $ApplyTweak -or $RevertTweak -or $RemoveApp -or
-                         $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps -or $CheckDrivers)
+                         $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps -or $CheckDrivers -or $Backup -or $Inventory)
 
 # Under App Control / AppLocker, unsigned scripts run in ConstrainedLanguage mode, which blocks WPF,
 # embedded C# and most .NET/COM use. Explain instead of failing with a wall of red text.
@@ -309,6 +319,20 @@ namespace AWiper
         public bool HasUpdate { get; set; }
         public string DateText { get { return Date == DateTime.MinValue ? "" : Date.ToString("yyyy-MM-dd"); } }
         public int SortRank { get { return ErrorCode != 0 ? 0 : (HasUpdate ? 1 : 2); } }
+    }
+
+    public class SecItem
+    {
+        public bool IsChecked { get; set; }
+        public string Id { get; set; }
+        public string Name { get; set; }
+        public string Status { get; set; }
+        public string Detail { get; set; }
+        public string Fix { get; set; }
+        public bool Policy { get; set; }
+        public bool CanFix { get { return !string.IsNullOrEmpty(Fix); } }
+        public string StatusText { get { return Status == "NA" ? "N/A" : Status; } }
+        public string PolicyText { get { return Policy ? "policy" : ""; } }
     }
 
     public class RecycleEntry
@@ -559,6 +583,73 @@ namespace AWiper
         private static TreeRect Make(DiskNode n, double x, double y, double w, double h)
         {
             var r = new TreeRect(); r.Node = n; r.X = x; r.Y = y; r.W = w; r.H = h; return r;
+        }
+    }
+
+    // ------------------------------------------------------------------ NVMe SMART / health log
+    // Reads log page 0x02 (SMART / Health Information) through the in-box StorNVMe driver with
+    // IOCTL_STORAGE_QUERY_PROPERTY + StorageDeviceProtocolSpecificProperty. Read-only; needs admin.
+    public class NvmeHealth
+    {
+        public int Disk; public int CriticalWarning; public int TemperatureC; public int AvailableSpare; public int SpareThreshold;
+        public int PercentUsed; public double ReadTB; public double WrittenTB; public long PowerCycles; public long PowerOnHours;
+        public long UnsafeShutdowns; public long MediaErrors; public long ErrorLogEntries; public long WarningTempMinutes; public long CriticalTempMinutes;
+    }
+
+    public static class StorageHealth
+    {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sec, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(Microsoft.Win32.SafeHandles.SafeFileHandle h, uint code, byte[] inBuf, int inSize, byte[] outBuf, int outSize, out int returned, IntPtr overlapped);
+
+        public static NvmeHealth ReadNvme(int diskNumber)
+        {
+            const int headerSize = 8, protocolSize = 40, logSize = 512;
+            byte[] buf = new byte[headerSize + protocolSize + logSize];
+            BitConverter.GetBytes(50).CopyTo(buf, 0);              // StorageDeviceProtocolSpecificProperty
+            BitConverter.GetBytes(0).CopyTo(buf, 4);               // PropertyStandardQuery
+            BitConverter.GetBytes(3).CopyTo(buf, 8);               // ProtocolTypeNvme
+            BitConverter.GetBytes(2).CopyTo(buf, 12);              // NVMeDataTypeLogPage
+            BitConverter.GetBytes(2).CopyTo(buf, 16);              // NVME_LOG_PAGE_HEALTH_INFO
+            BitConverter.GetBytes(0).CopyTo(buf, 20);              // sub value
+            BitConverter.GetBytes(protocolSize).CopyTo(buf, 24);   // ProtocolDataOffset (from the protocol block)
+            BitConverter.GetBytes(logSize).CopyTo(buf, 28);        // ProtocolDataLength
+
+            Microsoft.Win32.SafeHandles.SafeFileHandle h = null;
+            foreach (uint access in new uint[] { 0xC0000000, 0x80000000, 0 })
+            {
+                h = CreateFile("\\\\.\\PhysicalDrive" + diskNumber, access, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+                if (!h.IsInvalid) break;
+            }
+            if (h == null || h.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Could not open disk " + diskNumber);
+            using (h)
+            {
+                int returned;
+                if (!DeviceIoControl(h, 0x002D1400 /* IOCTL_STORAGE_QUERY_PROPERTY */, buf, buf.Length, buf, buf.Length, out returned, IntPtr.Zero))
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "The drive did not return its NVMe health log");
+            }
+            // Output: STORAGE_PROTOCOL_DATA_DESCRIPTOR (Version, Size, protocol block); data at 8 + ProtocolDataOffset.
+            int at = 8 + BitConverter.ToInt32(buf, 8 + 16);
+            if (at < 8 || at + logSize > buf.Length) at = headerSize + protocolSize;
+            var n = new NvmeHealth();
+            n.Disk = diskNumber;
+            n.CriticalWarning = buf[at];
+            int kelvin = BitConverter.ToUInt16(buf, at + 1);
+            n.TemperatureC = kelvin > 0 ? kelvin - 273 : 0;
+            n.AvailableSpare = buf[at + 3];
+            n.SpareThreshold = buf[at + 4];
+            n.PercentUsed = buf[at + 5];
+            n.ReadTB = BitConverter.ToUInt64(buf, at + 32) * 512000.0 / 1e12;     // data units are 1000 x 512 bytes
+            n.WrittenTB = BitConverter.ToUInt64(buf, at + 48) * 512000.0 / 1e12;
+            n.PowerCycles = (long)BitConverter.ToUInt64(buf, at + 112);
+            n.PowerOnHours = (long)BitConverter.ToUInt64(buf, at + 128);
+            n.UnsafeShutdowns = (long)BitConverter.ToUInt64(buf, at + 144);
+            n.MediaErrors = (long)BitConverter.ToUInt64(buf, at + 160);
+            n.ErrorLogEntries = (long)BitConverter.ToUInt64(buf, at + 176);
+            n.WarningTempMinutes = BitConverter.ToUInt32(buf, at + 192);
+            n.CriticalTempMinutes = BitConverter.ToUInt32(buf, at + 196);
+            return n;
         }
     }
 
@@ -1225,7 +1316,8 @@ $script:LogFile   = Join-Path $script:DataDir 'AWiper.log'
 $script:StateFile = Join-Path $script:DataDir 'state.json'
 if (-not (Test-Path -LiteralPath $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
 
-$script:State = @{ TotalFreed = [long]0; Cleans = 0; LastClean = ''; RecentTargets = @(); AutoRestorePoint = $true; ResourcesPath = ''; ForceOffline = $false }
+$script:State = @{ TotalFreed = [long]0; Cleans = 0; LastClean = ''; RecentTargets = @(); AutoRestorePoint = $true; ResourcesPath = ''; ForceOffline = $false
+                   FleetHosts = ''; Backup = @{ Sources = @(); Dest = ''; DestVolumeId = ''; Keep = 10; Daily = $false; Time = '19:00'; LastRun = ''; LastResult = '' } }
 try {
     if (Test-Path -LiteralPath $script:StateFile) {
         $j = Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json
@@ -1236,11 +1328,18 @@ try {
         if ($null -ne $j.AutoRestorePoint) { $script:State.AutoRestorePoint = [bool]$j.AutoRestorePoint }
         if ($j.ResourcesPath) { $script:State.ResourcesPath = [string]$j.ResourcesPath }
         if ($null -ne $j.ForceOffline) { $script:State.ForceOffline = [bool]$j.ForceOffline }
+        if ($j.FleetHosts) { $script:State.FleetHosts = [string]$j.FleetHosts }
+        if ($j.Backup) {
+            foreach ($k in 'Dest', 'DestVolumeId', 'Time', 'LastRun', 'LastResult') { if ($j.Backup.$k) { $script:State.Backup[$k] = [string]$j.Backup.$k } }
+            if ($j.Backup.Sources) { $script:State.Backup.Sources = @($j.Backup.Sources | ForEach-Object { [string]$_ }) }
+            if ($j.Backup.Keep) { $script:State.Backup.Keep = [int]$j.Backup.Keep }
+            $script:State.Backup.Daily = [bool]$j.Backup.Daily
+        }
     }
 } catch { }
 
 function Save-AWState {
-    try { $script:State | ConvertTo-Json | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 } catch { }
+    try { $script:State | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 } catch { }
 }
 
 $Sync = [hashtable]::Synchronized(@{})
@@ -1307,7 +1406,7 @@ function Add-AWUndoEntry($Capture) {
         Target = $(if ($script:Target) { $script:Target.ComputerName } else { $env:COMPUTERNAME })
         TargetHost = $(if ($script:Target) { $script:Target.Host } else { '' })
         Snapshot = @($Capture.Snapshot | ForEach-Object { [pscustomobject]@{ Path = $_.Path; Name = $_.Name; Existed = $_.Existed; Prev = $_.Prev; Kind = $_.Kind } })
-        RemoveKeys = @($Capture.RemoveKeys); Undone = $false
+        RemoveKeys = @($Capture.RemoveKeys); Revert = [string]$Capture.Revert; Undone = $false
     }
     Save-AWUndoJournal (@(Get-AWUndoJournal) + $entry)
     $id
@@ -1674,6 +1773,8 @@ function Get-WDriverInventory {
         Manufacturer = [string]$cs.Manufacturer; Model = [string]$cs.Model; Family = [string]$csp.Version
         Serial = [string]$bios.SerialNumber; Bios = [string]$bios.SMBIOSBIOSVersion
         BiosDate = $(if ($bios.ReleaseDate) { [datetime]$bios.ReleaseDate } else { [datetime]::MinValue })
+        BoardMaker = [string](Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue).Manufacturer
+        BoardModel = [string](Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue).Product
         Tools = @($tools | Select-Object -Unique)
     }
     $ents = @{}
@@ -1768,8 +1869,18 @@ function Get-WFirmwareInfo {
     & $add 'Firmware' 'SMBIOS version' ('{0}.{1}' -f $bios.SMBIOSMajorVersion, $bios.SMBIOSMinorVersion)
     if ($bios.EmbeddedControllerMajorVersion -ne $null -and $bios.EmbeddedControllerMajorVersion -lt 255) { & $add 'Firmware' 'Embedded controller' ('{0}.{1}' -f $bios.EmbeddedControllerMajorVersion, $bios.EmbeddedControllerMinorVersion) }
     & $add 'Firmware' 'Serial number' $bios.SerialNumber
-    & $add 'System' 'Model' ("$($cs.Manufacturer) $($cs.Model)".Trim())
-    if ($bb) { & $add 'System' 'Motherboard' ("$($bb.Manufacturer) $($bb.Product) $($bb.Version)".Trim()) }
+    & $add 'System' 'Manufacturer' $cs.Manufacturer
+    & $add 'System' 'Model' $cs.Model
+    if ($bb) { & $add 'System' 'Board maker' $bb.Manufacturer; & $add 'System' 'Board model' ("$($bb.Product) $($bb.Version)".Trim()) }
+
+    # BitLocker must be suspended before a BIOS update, or the PC asks for the recovery key afterwards.
+    try {
+        $bl = Get-CimInstance -Namespace root/cimv2/Security/MicrosoftVolumeEncryption -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$($env:SystemDrive)'" -ErrorAction Stop
+        if ($bl) {
+            $ps = [int]$bl.ProtectionStatus
+            & $add 'Security' "BitLocker on $($env:SystemDrive)" $(switch ($ps) { 1 { 'On' } 0 { 'Off / suspended' } default { 'Unknown' } }) $(if ($ps -eq 1) { 'Suspend it for one restart before updating the BIOS, or the PC will ask for the recovery key' } else { '' }) $(if ($ps -eq 1) { 'Good' } else { '' })
+        }
+    } catch { & $add 'Security' "BitLocker on $($env:SystemDrive)" $(if ($isAdmin) { 'Not available' } else { $needAdmin }) '' }
 
     # Secure Boot (readable without admin via the registry)
     try {
@@ -1863,6 +1974,432 @@ function Get-WFirmwareInfo {
     $rows
 }
 
+# ---------------------------------------------------------------- Boot performance
+# Diagnostics-Performance events: 100 = boot duration, 101/102/103 = app / driver / service that slowed it.
+function Get-WBootHistory([int]$Days = 60) {
+    $since = (Get-Date).AddDays(-$Days)
+    $data = { param($ev) $h = @{}; foreach ($d in ([xml]$ev.ToXml()).Event.EventData.Data) { $h[[string]$d.Name] = [string]$d.'#text' }; $h }
+    $boots = foreach ($e in @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Diagnostics-Performance/Operational'; Id = 100; StartTime = $since } -MaxEvents 30 -ErrorAction SilentlyContinue)) {
+        $d = & $data $e
+        [pscustomobject]@{ Time = $e.TimeCreated; BootMs = [long]$d.BootTime; MainMs = [long]$d.MainPathBootTime; PostMs = [long]$d.BootPostBootTime }
+    }
+    $kinds = @{ 101 = 'App'; 102 = 'Driver'; 103 = 'Service' }
+    $raw = foreach ($e in @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Diagnostics-Performance/Operational'; Id = 101, 102, 103; StartTime = $since } -ErrorAction SilentlyContinue)) {
+        $d = & $data $e
+        $name = if ($d.FriendlyName) { $d.FriendlyName } elseif ($d.Name) { $d.Name } else { 'Unknown' }
+        [pscustomobject]@{ Kind = $kinds[$e.Id]; Name = $name; File = [string]$d.Name; DegradationMs = [long]$d.DegradationTime; Time = $e.TimeCreated }
+    }
+    $culprits = foreach ($g in @($raw | Group-Object Kind, Name)) {
+        $f = $g.Group[0]
+        [pscustomobject]@{ Kind = $f.Kind; Name = $f.Name; File = $f.File; Times = $g.Count
+            AvgSeconds = [Math]::Round((($g.Group | Measure-Object DegradationMs -Average).Average) / 1000, 1)
+            Last = ($g.Group | Sort-Object Time -Descending | Select-Object -First 1).Time }
+    }
+    [pscustomobject]@{ Boots = @($boots | Sort-Object Time); Culprits = @($culprits | Sort-Object AvgSeconds -Descending) }
+}
+
+# ---------------------------------------------------------------- Event triage
+# Curated events that usually explain "what's wrong with this PC", grouped with plain-language notes.
+function Get-WEventTriage([int]$Days = 7) {
+    $since = (Get-Date).AddDays(-$Days)
+    $defs = @(
+        @{ Sev = 'Problem'; Title = 'Blue screen (crash)';            Log = 'System'; Prov = 'Microsoft-Windows-WER-SystemErrorReporting'; Ids = 1001; Why = 'Windows stopped with an error. Repeated crashes usually point to a driver, memory or overheating - check Hardware errors and run a memory test.' }
+        @{ Sev = 'Warning'; Title = 'Unexpected restart';             Log = 'System'; Prov = 'Microsoft-Windows-Kernel-Power'; Ids = 41;            Why = 'The PC restarted without shutting down cleanly: power loss, a forced power-off, or a hang/crash.' }
+        @{ Sev = 'Warning'; Title = 'Unexpected shutdown';            Log = 'System'; Prov = 'EventLog'; Ids = 6008;                                 Why = 'The previous shutdown was not clean.' }
+        @{ Sev = 'Problem'; Title = 'Hardware error (WHEA)';          Log = 'System'; Prov = 'Microsoft-Windows-WHEA-Logger'; Ids = $null;          Why = 'The CPU, memory or PCIe bus reported an error. Corrected errors are a warning sign; uncorrected ones cause crashes.' }
+        @{ Sev = 'Problem'; Title = 'Disk bad block / paging error';  Log = 'System'; Prov = 'disk'; Ids = 7, 51;                                    Why = 'The drive could not read or write some data. Back up and check the disk health.' }
+        @{ Sev = 'Warning'; Title = 'Disk I/O retried';               Log = 'System'; Prov = 'disk'; Ids = 153;                                      Why = 'Storage requests timed out and were retried - often a failing drive, cable or storage driver.' }
+        @{ Sev = 'Warning'; Title = 'Storage controller reset';       Log = 'System'; Prov = @('stornvme', 'storahci', 'iaStorAC', 'iaStorAVC', 'iaStorA', 'nvme', 'secnvme'); Ids = 129;                                  Why = 'Storage requests timed out and were retried - often a failing drive, cable or storage driver.' }
+        @{ Sev = 'Problem'; Title = 'File system corruption (NTFS)';  Log = 'System'; Prov = 'Ntfs'; Ids = 55, 98;                                  Why = 'NTFS found damage on a volume. Run chkdsk /scan on that drive.' }
+        @{ Sev = 'Warning'; Title = 'Service crashed';                Log = 'System'; Prov = 'Service Control Manager'; Ids = 7031, 7034;           Why = 'A Windows service stopped unexpectedly.' }
+        @{ Sev = 'Info';    Title = 'Service failed to start';        Log = 'System'; Prov = 'Service Control Manager'; Ids = 7000, 7009;           Why = 'A service could not start (often a leftover from uninstalled software).' }
+        @{ Sev = 'Warning'; Title = 'Windows Update install failed';  Log = 'System'; Prov = 'Microsoft-Windows-WindowsUpdateClient'; Ids = 20;      Why = 'An update failed to install. Try Tools > Reset Windows Update, then install again.' }
+        @{ Sev = 'Info';    Title = 'Time sync problem';              Log = 'System'; Prov = 'Microsoft-Windows-Time-Service'; Ids = 36, 129, 134;  Why = 'The clock could not sync. Wrong time breaks sign-ins, certificates and Kerberos.' }
+        @{ Sev = 'Info';    Title = 'Group Policy failed';            Log = 'System'; Prov = 'Microsoft-Windows-GroupPolicy'; Ids = 1085, 1096, 1129; Why = 'Policy could not be applied - often no connection to a domain controller.' }
+        @{ Sev = 'Info';    Title = 'DNS name resolution timeout';    Log = 'System'; Prov = 'Microsoft-Windows-DNS-Client'; Ids = 1014;            Why = 'A DNS server did not answer in time.' }
+        @{ Sev = 'Warning'; Title = 'App crashed';                    Log = 'Application'; Prov = 'Application Error'; Ids = 1000;                 Why = 'A program crashed. If it is always the same one, repair or reinstall it.' }
+        @{ Sev = 'Info';    Title = 'App stopped responding';         Log = 'Application'; Prov = 'Application Hang'; Ids = 1002;                  Why = 'A program froze and was closed.' }
+        @{ Sev = 'Warning'; Title = '.NET app crashed';               Log = 'Application'; Prov = '.NET Runtime'; Ids = 1026;                       Why = 'A .NET program crashed with an unhandled error.' }
+        @{ Sev = 'Warning'; Title = 'Failed sign-ins';                Log = 'Security'; Prov = $null; Ids = 4625;                                    Why = 'Someone (or a saved password) tried to sign in with wrong credentials. Many in a row can mean a stale password or a guessing attack.' }
+        @{ Sev = 'Problem'; Title = 'Account locked out';             Log = 'Security'; Prov = $null; Ids = 4740;                                    Why = 'An account was locked after too many failed sign-ins.' }
+    )
+    foreach ($x in $defs) {
+        $f = @{ LogName = $x.Log; StartTime = $since }
+        if ($x.Prov) { $f.ProviderName = $x.Prov }
+        if ($x.Ids) { $f.Id = $x.Ids }
+        $ev = @(Get-WinEvent -FilterHashtable $f -MaxEvents 500 -ErrorAction SilentlyContinue)
+        if ($x.Title -eq 'Hardware error (WHEA)') { $ev = @($ev | Where-Object { $_.Level -le 3 }) }
+        if (-not $ev.Count) { continue }
+        # Most frequent source: the crashing app for app crashes, otherwise the provider / first words.
+        $src = switch -Regex ($x.Title) {
+            '^\.NET' { ($ev | Group-Object { if ([string]$_.Message -match 'Application:\s*(\S+)') { $Matches[1] } else { 'unknown' } } | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) ($($_.Count))" }) -join ', '; break }
+            'App crashed|stopped responding' { ($ev | Group-Object { [string]$_.Properties[0].Value } | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) ($($_.Count))" }) -join ', ' }
+            'Service' { ($ev | Group-Object { [string]$_.Properties[0].Value } | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) ($($_.Count))" }) -join ', ' }
+            default { (([string]$ev[0].Message) -split "`r?`n")[0] }
+        }
+        [pscustomobject]@{ Severity = $x.Sev; Title = $x.Title; Count = $ev.Count; Last = $ev[0].TimeCreated; Log = $x.Log; Ids = (@($x.Ids) -join ','); Source = $src; Why = $x.Why }
+    }
+}
+
+# ---------------------------------------------------------------- Security posture
+# Read-only checks. Fix = an ID from the short whitelist of safe, reversible fixes (Invoke-WSecurityFix).
+function Get-WSecurityPosture {
+    $rows = New-Object System.Collections.Generic.List[object]
+    # On domain PCs a value under HKLM\SOFTWARE\Policies is usually set by Group Policy, which overwrites local fixes.
+    $domain = [bool](Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).PartOfDomain
+    $add = { param($Id, $Name, $Status, $Detail, $Fix = '', $Path = '') $rows.Add([pscustomobject]@{ Id = $Id; Name = $Name; Status = $Status; Detail = $Detail; Fix = $Fix; Policy = [bool]($domain -and $Path -like 'HKLM:\SOFTWARE\Policies*' -and (Test-Path -LiteralPath $Path)) }) }
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $reg = { param($p, $n) try { (Get-Item -LiteralPath $p -ErrorAction Stop).GetValue($n, $null) } catch { $null } }
+
+    try {
+        $fw = @(Get-NetFirewallProfile -ErrorAction Stop)
+        $off = @($fw | Where-Object { -not $_.Enabled } | ForEach-Object Name)
+        if ($off.Count) { & $add 'Firewall' 'Windows Firewall' 'Problem' "Off for: $($off -join ', ')" 'Firewall' } else { & $add 'Firewall' 'Windows Firewall' 'Good' 'On for all network profiles' }
+    } catch { & $add 'Firewall' 'Windows Firewall' 'NA' $_.Exception.Message }
+
+    try {
+        $mp = Get-MpComputerStatus -ErrorAction Stop
+        if ($mp.RealTimeProtectionEnabled) { & $add 'Defender' 'Real-time protection' 'Good' ("On" + $(if ($mp.IsTamperProtected) { ', tamper protection on' } else { ', tamper protection off' })) }
+        else { & $add 'Defender' 'Real-time protection' 'Problem' 'Microsoft Defender real-time protection is off (or another antivirus is active)' }
+    } catch { & $add 'Defender' 'Real-time protection' 'NA' 'Defender status is not available' }
+
+    try {
+        $smb = Get-SmbServerConfiguration -ErrorAction Stop
+        if ($smb.EnableSMB1Protocol) { & $add 'SMB1' 'SMB version 1' 'Problem' 'SMB1 is on - an old, insecure file-sharing protocol (WannaCry spread through it)' 'SMB1' }
+        else { & $add 'SMB1' 'SMB version 1' 'Good' 'Off' }
+    } catch { & $add 'SMB1' 'SMB version 1' 'NA' $(if ($isAdmin) { $_.Exception.Message } else { 'Needs administrator rights' }) }
+
+    $p = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient'
+    if ((& $reg $p 'EnableMulticast') -eq 0) { & $add 'LLMNR' 'LLMNR name broadcasts' 'Good' 'Off' '' $p }
+    else { & $add 'LLMNR' 'LLMNR name broadcasts' 'Warning' 'On - attackers on the same network can answer these and capture password hashes' 'LLMNR' $p }
+
+    try {
+        $g = Get-LocalUser -Name 'Guest' -ErrorAction Stop
+        if ($g.Enabled) { & $add 'Guest' 'Guest account' 'Problem' 'Enabled' 'Guest' } else { & $add 'Guest' 'Guest account' 'Good' 'Disabled' }
+    } catch { & $add 'Guest' 'Guest account' 'NA' 'Not available (domain controller or renamed)' }
+
+    try {
+        $adm = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { [string]$_.Name })
+        & $add 'Admins' 'Local administrators' $(if ($adm.Count -gt 3) { 'Warning' } else { 'Info' }) ("$($adm.Count): " + ($adm -join ', '))
+    } catch { & $add 'Admins' 'Local administrators' 'NA' 'Could not list members' }
+
+    $ts = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+    $rdpOn = (& $reg $ts 'fDenyTSConnections') -eq 0
+    $nla = (& $reg "$ts\WinStations\RDP-Tcp" 'UserAuthentication') -eq 1
+    if (-not $rdpOn) { & $add 'RDP' 'Remote Desktop' 'Good' 'Off' }
+    elseif ($nla) { & $add 'RDP' 'Remote Desktop' 'Info' 'On, with Network Level Authentication' }
+    else { & $add 'RDP' 'Remote Desktop' 'Problem' 'On WITHOUT Network Level Authentication - anyone can reach the sign-in screen' 'NLA' }
+
+    $sbl = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
+    if ((& $reg $sbl 'EnableScriptBlockLogging') -eq 1) { & $add 'PSLog' 'PowerShell script logging' 'Good' 'On - scripts are recorded in the PowerShell event log' '' $sbl }
+    else { & $add 'PSLog' 'PowerShell script logging' 'Info' 'Off - turning it on helps investigate malicious scripts' 'PSLog' $sbl }
+
+    $ar = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+    if ((& $reg $ar 'NoDriveTypeAutoRun') -eq 255) { & $add 'AutoRun' 'AutoRun for drives' 'Good' 'Off for all drive types' }
+    else { & $add 'AutoRun' 'AutoRun for drives' 'Info' 'Not fully off - USB sticks and discs can try to start programs' 'AutoRun' }
+
+    $uac = & $reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'EnableLUA'
+    & $add 'UAC' 'User Account Control' $(if ($uac -eq 0) { 'Problem' } else { 'Good' }) $(if ($uac -eq 0) { 'Off - every program runs with full rights' } else { 'On' })
+
+    $ppl = & $reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RunAsPPL'
+    & $add 'LSA' 'LSA protection' $(if ($ppl -in 1, 2) { 'Good' } else { 'Info' }) $(if ($ppl -in 1, 2) { 'On' } else { 'Off - report only: turning it on can block old smart-card or password-filter drivers' })
+
+    try {
+        $dg = Get-CimInstance -Namespace root/Microsoft/Windows/DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction Stop
+        & $add 'CredGuard' 'Credential Guard' $(if (@($dg.SecurityServicesRunning) -contains 1) { 'Good' } else { 'Info' }) $(if (@($dg.SecurityServicesRunning) -contains 1) { 'Running' } else { 'Not running (report only - needs compatible hardware and policy)' })
+    } catch { }
+
+    try {
+        $bl = Get-CimInstance -Namespace root/cimv2/Security/MicrosoftVolumeEncryption -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$($env:SystemDrive)'" -ErrorAction Stop
+        & $add 'BitLocker' "BitLocker ($($env:SystemDrive))" $(if ($bl.ProtectionStatus -eq 1) { 'Good' } else { 'Warning' }) $(if ($bl.ProtectionStatus -eq 1) { 'On' } else { 'Off - a lost or stolen PC exposes its files' })
+    } catch { & $add 'BitLocker' "BitLocker ($($env:SystemDrive))" 'NA' $(if ($isAdmin) { 'Not available on this edition' } else { 'Needs administrator rights' }) }
+
+    $laps = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Policies\LAPS') -or (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft Services\AdmPwd')
+    & $add 'LAPS' 'LAPS (local admin passwords)' 'Info' $(if ($laps) { 'Configured' } else { 'Not configured - fine for home PCs; workplaces should rotate local admin passwords' })
+
+    try {
+        $sh = @(Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -notmatch '^(ADMIN|IPC|print)\$$|^[A-Z]\$$' })
+        & $add 'Shares' 'Shared folders' $(if ($sh.Count) { 'Info' } else { 'Good' }) $(if ($sh.Count) { ($sh | ForEach-Object { "$($_.Name) ($($_.Path))" }) -join ', ' } else { 'None besides the built-in admin shares' })
+    } catch { }
+
+    try {
+        $ls = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_.LocalAddress -notin '127.0.0.1', '::1' })
+        $procs = @($ls | ForEach-Object { try { (Get-Process -Id $_.OwningProcess -ErrorAction Stop).ProcessName } catch { 'unknown' } } | Sort-Object -Unique)
+        & $add 'Ports' 'Open network ports' 'Info' ("$(@($ls | Select-Object -ExpandProperty LocalPort -Unique).Count) port(s) listening, by: " + ($procs -join ', '))
+    } catch { }
+
+    try {
+        $soon = @(Get-ChildItem Cert:\LocalMachine\My -ErrorAction Stop | Where-Object { $_.NotAfter -lt (Get-Date).AddDays(30) })
+        if ($soon.Count) { & $add 'Certs' 'Computer certificates' 'Warning' ("$($soon.Count) expire within 30 days or already expired: " + (($soon | Select-Object -First 3 | ForEach-Object { "$($_.Subject) ($($_.NotAfter.ToString('yyyy-MM-dd')))" }) -join '; ')) }
+        else { & $add 'Certs' 'Computer certificates' 'Good' 'None expire in the next 30 days' }
+    } catch { }
+
+    $usb = & $reg 'HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR' 'Start'
+    & $add 'USB' 'USB storage' 'Info' $(if ($usb -eq 4) { 'Blocked by policy' } else { 'Allowed' })
+    $rows
+}
+
+# Whitelisted, reversible fixes. Returns an undo capture (registry snapshot or a revert script).
+function Invoke-WSecurityFix([string]$Id) {
+    switch ($Id) {
+        'Firewall' {
+            $prev = @(Get-NetFirewallProfile | ForEach-Object { "Set-NetFirewallProfile -Name '$($_.Name)' -Enabled $(if ($_.Enabled) { 'True' } else { 'False' })" }) -join '; '
+            Set-NetFirewallProfile -All -Enabled True -ErrorAction Stop
+            Write-WLog 'Windows Firewall turned on for all profiles'
+            [pscustomobject]@{ UndoKind = 'Script'; Label = 'Turned on Windows Firewall'; Revert = $prev }
+        }
+        'SMB1' {
+            Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop
+            Write-WLog 'SMB1 server protocol turned off'
+            [pscustomobject]@{ UndoKind = 'Script'; Label = 'Turned off SMB1'; Revert = 'Set-SmbServerConfiguration -EnableSMB1Protocol $true -Force' }
+        }
+        'Guest' {
+            Disable-LocalUser -Name 'Guest' -ErrorAction Stop
+            Write-WLog 'Guest account disabled'
+            [pscustomobject]@{ UndoKind = 'Script'; Label = 'Disabled the Guest account'; Revert = "Enable-LocalUser -Name 'Guest'" }
+        }
+        default {
+            $vals = switch ($Id) {
+                'LLMNR'   { @(@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient'; Name = 'EnableMulticast'; Type = 'DWord'; Value = 0 }) }
+                'NLA'     { @(@{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'; Name = 'UserAuthentication'; Type = 'DWord'; Value = 1 }) }
+                'PSLog'   { @(@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'; Name = 'EnableScriptBlockLogging'; Type = 'DWord'; Value = 1 }) }
+                'AutoRun' { @(@{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name = 'NoDriveTypeAutoRun'; Type = 'DWord'; Value = 255 }) }
+                default   { throw "Unknown fix '$Id'" }
+            }
+            $snap = @(Get-WRegSnapshot $vals)
+            foreach ($v in $vals) {
+                if (-not (Test-Path -LiteralPath $v.Path)) { New-Item -Path $v.Path -Force | Out-Null }
+                New-ItemProperty -LiteralPath $v.Path -Name $v.Name -PropertyType $v.Type -Value $v.Value -Force | Out-Null
+            }
+            Write-WLog "Security fix applied: $Id"
+            [pscustomobject]@{ UndoKind = 'Registry'; Label = "Security fix: $Id"; Snapshot = $snap; RemoveKeys = @() }
+        }
+    }
+}
+
+# ---------------------------------------------------------------- Privacy: camera / microphone / location use
+# Windows records the last time each app used these (only the most recent session per app).
+function Get-WPrivacyUsage {
+    $caps = [ordered]@{ webcam = 'Camera'; microphone = 'Microphone'; location = 'Location' }
+    $ft = { param($v) if ($v -and [long]$v -gt 0) { try { [DateTime]::FromFileTime([long]$v) } catch { $null } } else { $null } }
+    foreach ($root in 'HKCU:', 'HKLM:') {
+        foreach ($cap in $caps.Keys) {
+            $base = "$root\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$cap"
+            if (-not (Test-Path -LiteralPath $base)) { continue }
+            $keys = @(Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -ne 'NonPackaged' })
+            $keys += @(Get-ChildItem -LiteralPath "$base\NonPackaged" -ErrorAction SilentlyContinue)
+            foreach ($k in $keys) {
+                $start = & $ft $k.GetValue('LastUsedTimeStart'); $stop = & $ft $k.GetValue('LastUsedTimeStop')
+                if (-not $start) { continue }
+                $app = $k.PSChildName
+                if ($k.PSParentPath -like '*NonPackaged') { $app = $app -replace '#', '\' } else { $app = $app -replace '_[a-z0-9]{13}$', '' }
+                [pscustomobject]@{ Capability = $caps[$cap]; App = $app; LastUsed = $start; Stopped = $stop; InUse = ($null -eq $stop -or $stop -lt $start); Scope = $(if ($root -eq 'HKCU:') { 'You' } else { 'System' }) }
+            }
+        }
+    }
+}
+
+# Report-only sweep for adware / PUP persistence: forced browser extensions and search / homepage
+# policies, startup entries and scheduled tasks that run unsigned programs from user-writable folders,
+# a forced proxy, and hosts-file redirects.
+function Get-WPupSweep {
+    $out = New-Object System.Collections.Generic.List[object]
+    $add = { param($Kind, $Item, $Detail, $Sev, $Path) $out.Add([pscustomobject]@{ Kind = $Kind; Item = [string]$Item; Detail = [string]$Detail; Severity = $Sev; Path = [string]$Path }) }
+    foreach ($hive in 'HKLM:', 'HKCU:') {
+        foreach ($b in @(@{ N = 'Chrome'; K = 'SOFTWARE\Policies\Google\Chrome' }, @{ N = 'Edge'; K = 'SOFTWARE\Policies\Microsoft\Edge' }, @{ N = 'Brave'; K = 'SOFTWARE\Policies\BraveSoftware\Brave' })) {
+            $p = "$hive\$($b.K)"
+            $fl = "$p\ExtensionInstallForcelist"
+            if (Test-Path -LiteralPath $fl) {
+                $k = Get-Item -LiteralPath $fl
+                foreach ($n in $k.GetValueNames()) { & $add 'Forced extension' "$($b.N): $(([string]$k.GetValue($n)).Split(';')[0])" 'Installed by policy - users cannot remove it. Fine if your workplace set it, suspicious on a home PC.' 'Warning' $fl }
+            }
+            if (Test-Path -LiteralPath $p) {
+                $k = Get-Item -LiteralPath $p
+                foreach ($n in 'DefaultSearchProviderSearchURL', 'HomepageLocation', 'NewTabPageLocation') {
+                    $v = $k.GetValue($n, $null)
+                    if ($v) { & $add 'Browser policy' "$($b.N) $n" "$v" 'Warning' $p }
+                }
+            }
+        }
+    }
+    $isRisky = { param($path)
+        $x = [Environment]::ExpandEnvironmentVariables(([string]$path).Trim('"'))
+        if ($x -notmatch '\\AppData\\|\\Temp\\|\\Users\\Public\\|\\ProgramData\\') { return $null }
+        $exe = if ($x -match '^"?([^"]+?\.(exe|dll|vbs|js|cmd|bat|ps1|scr))') { $Matches[1] } else { $x }
+        if (-not (Test-Path -LiteralPath $exe)) { return $null }
+        $sig = Get-AuthenticodeSignature -LiteralPath $exe -ErrorAction SilentlyContinue
+        if ($sig -and $sig.Status -eq 'Valid') { return $null }
+        $exe
+    }
+    foreach ($rk in 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run') {
+        if (-not (Test-Path -LiteralPath $rk)) { continue }
+        $k = Get-Item -LiteralPath $rk
+        foreach ($n in $k.GetValueNames()) {
+            $exe = & $isRisky $k.GetValue($n)
+            if ($exe) { & $add 'Startup entry' $n "Runs an unsigned program from a user-writable folder: $exe" 'Warning' $exe }
+        }
+    }
+    try {
+        foreach ($t in @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.State -ne 'Disabled' })) {
+            foreach ($a in @($t.Actions)) {
+                if (-not $a.Execute) { continue }
+                $exe = & $isRisky $a.Execute
+                if ($exe) { & $add 'Scheduled task' "$($t.TaskPath)$($t.TaskName)" "Runs an unsigned program from a user-writable folder: $exe" 'Warning' $exe }
+            }
+        }
+    } catch { }
+    $is = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+    $k = Get-Item -LiteralPath $is -ErrorAction SilentlyContinue
+    if ($k) {
+        if ($k.GetValue('ProxyEnable', 0) -eq 1) { & $add 'Proxy' 'Manual proxy' "All web traffic goes through $($k.GetValue('ProxyServer', ''))" 'Info' $is }
+        if ($k.GetValue('AutoConfigURL', $null)) { & $add 'Proxy' 'Proxy script' "$($k.GetValue('AutoConfigURL'))" 'Info' $is }
+    }
+    $hosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+    $lines = @(Get-Content -LiteralPath $hosts -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*\d' -and $_ -notmatch '^\s*(127\.0\.0\.1|::1)\s+localhost\s*$' })
+    if ($lines.Count) { & $add 'Hosts file' "$($lines.Count) redirect(s)" (($lines | Select-Object -First 3) -join '; ') $(if ($lines.Count -gt 20) { 'Info' } else { 'Info' }) $hosts }
+    $out
+}
+
+# ---------------------------------------------------------------- Inventory (one PC; fleet runs call it on each)
+function Get-WInventory {
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+    $cpu = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue)[0]
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $sys = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue
+    $disks = @(Get-PhysicalDisk -ErrorAction SilentlyContinue | ForEach-Object { '{0} ({1:N0} GB, {2})' -f $_.FriendlyName, ($_.Size / 1GB), $_.HealthStatus })
+    $sig = $null; try { $sig = (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureAge } catch { }
+    $sb = $null; try { $sb = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -ErrorAction Stop).UEFISecureBootEnabled -eq 1 } catch { }
+    $tpm = $null; try { $t = Get-CimInstance -Namespace root/cimv2/Security/MicrosoftTpm -ClassName Win32_Tpm -ErrorAction Stop; if ($t) { $tpm = ([string]$t.SpecVersion).Split(',')[0] } } catch { }
+    $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object IPAddress)
+    $reboot = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+    $apps = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -and $_.SystemComponent -ne 1 -and -not $_.ParentKeyName } | ForEach-Object { '{0} {1}' -f $_.DisplayName, $_.DisplayVersion } | Sort-Object -Unique)
+    [pscustomobject]@{
+        Computer = $env:COMPUTERNAME; Domain = [string]$cs.Domain; User = [string]$cs.UserName
+        Manufacturer = [string]$cs.Manufacturer; Model = [string]$cs.Model; Serial = [string]$bios.SerialNumber
+        Bios = '{0} ({1})' -f $bios.SMBIOSBIOSVersion, $(if ($bios.ReleaseDate) { ([datetime]$bios.ReleaseDate).ToString('yyyy-MM-dd') } else { '?' })
+        OS = ([string]$os.Caption -replace '^Microsoft\s+', ''); Build = '{0}.{1}' -f $cv.CurrentBuild, $cv.UBR; DisplayVersion = [string]$cv.DisplayVersion
+        Installed = $(if ($os.InstallDate) { ([datetime]$os.InstallDate).ToString('yyyy-MM-dd') } else { '' })
+        LastBoot = $(if ($os.LastBootUpTime) { ([datetime]$os.LastBootUpTime).ToString('yyyy-MM-dd HH:mm') } else { '' })
+        CPU = ([string]$cpu.Name).Trim(); RamGB = [Math]::Round($cs.TotalPhysicalMemory / 1GB)
+        SystemFreeGB = $(if ($sys) { [Math]::Round($sys.FreeSpace / 1GB, 1) } else { $null }); Disks = $disks
+        SecureBoot = $sb; Tpm = $tpm; DefenderSigDays = $sig; RebootPending = $reboot; IPs = $ips; Programs = $apps
+        Collected = (Get-Date).ToString('o')
+    }
+}
+
+# Collects Get-WInventory from each host over WinRM (saved Credential Manager credentials are used
+# when present), writes inventory.json / .csv / report.html into a dated folder, and lists what
+# changed since the previous run (programs added / removed, BIOS, Windows build, RAM...).
+function Invoke-WFleetInventory([string[]]$Hosts, [string]$OutRoot) {
+    $stamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+    $dir = Join-Path $OutRoot $stamp
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $prev = @{}
+    $prevDir = Get-ChildItem -LiteralPath $OutRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne $stamp -and (Test-Path (Join-Path $_.FullName 'inventory.json')) } | Sort-Object Name -Descending | Select-Object -First 1
+    if ($prevDir) { foreach ($x in @(Get-Content -LiteralPath (Join-Path $prevDir.FullName 'inventory.json') -Raw | ConvertFrom-Json)) { $prev[[string]$x.Computer] = $x } }
+    $wrapper = { param($Lib) $Sync = @{ Remote = $true }; . ([scriptblock]::Create($Lib)); Get-WInventory }
+    $results = New-Object System.Collections.Generic.List[object]; $fails = New-Object System.Collections.Generic.List[object]
+    $i = 0
+    foreach ($h in $Hosts) {
+        $i++; $Sync.Status = "Inventory: $h ($i of $($Hosts.Count))..."; $Sync.Progress = [int]($i * 100 / $Hosts.Count)
+        try {
+            if ($h -in 'localhost', '.', $env:COMPUTERNAME) { $results.Add((Get-WInventory)); continue }
+            $p = @{ ComputerName = $h; ScriptBlock = $wrapper; ArgumentList = @($Sync.WorkerLib); ErrorAction = 'Stop' }
+            $saved = try { [AWiper.CredMan]::Read('AWiper:' + $h.ToLowerInvariant()) } catch { $null }
+            if ($saved) { $p.Credential = New-Object System.Management.Automation.PSCredential($saved[0], (ConvertTo-SecureString $saved[1] -AsPlainText -Force)) }
+            $r = Invoke-Command @p 6>$null | Select-Object -Property * -ExcludeProperty PSComputerName, RunspaceId, PSShowComputerName
+            $results.Add($r)
+            Write-WLog "Inventory: $h done"
+        } catch { $fails.Add([pscustomobject]@{ Computer = $h; Error = $_.Exception.Message }); Write-WLog "Inventory of $h failed: $($_.Exception.Message)" 'WARN' }
+    }
+    $changes = foreach ($r in $results) {
+        $o = $prev[[string]$r.Computer]
+        if (-not $o) { continue }
+        $c = @(foreach ($f in 'Model', 'Serial', 'Bios', 'OS', 'Build', 'RamGB', 'Tpm', 'SecureBoot') { if ("$($r.$f)" -ne "$($o.$f)") { "$($f): $($o.$f) -> $($r.$f)" } })
+        $added = @($r.Programs | Where-Object { $_ -notin @($o.Programs) }); $removed = @($o.Programs | Where-Object { $_ -notin @($r.Programs) })
+        if ($c.Count -or $added.Count -or $removed.Count) { [pscustomobject]@{ Computer = $r.Computer; Changes = $c; Added = $added; Removed = $removed } }
+    }
+    ConvertTo-Json -InputObject $results.ToArray() -Depth 4 | Set-Content -LiteralPath (Join-Path $dir 'inventory.json') -Encoding UTF8   # (@(List) throws in PS 5.1)
+    $results | Select-Object Computer, Domain, User, Manufacturer, Model, Serial, Bios, OS, DisplayVersion, Build, Installed, LastBoot, CPU, RamGB, SystemFreeGB, SecureBoot, Tpm, DefenderSigDays, RebootPending,
+        @{ n = 'Disks'; e = { $_.Disks -join '; ' } }, @{ n = 'IPs'; e = { $_.IPs -join ', ' } }, @{ n = 'Programs'; e = { @($_.Programs).Count } } |
+        Export-Csv -LiteralPath (Join-Path $dir 'inventory.csv') -NoTypeInformation -Encoding UTF8
+    if ($fails.Count) { $fails | Export-Csv -LiteralPath (Join-Path $dir 'failed.csv') -NoTypeInformation -Encoding UTF8 }
+    $e = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
+    $rows = foreach ($r in $results) {
+        $flag = if ($r.RebootPending) { ' (restart pending)' } else { '' }
+        "<tr><td><b>$(& $e $r.Computer)</b><br><small>$(& $e $r.User)</small></td><td>$(& $e "$($r.Manufacturer) $($r.Model)")<br><small>S/N $(& $e $r.Serial)</small></td><td>$(& $e $r.OS)<br><small>$(& $e $r.DisplayVersion) build $(& $e $r.Build)$flag</small></td><td>$(& $e $r.Bios)</td><td>$(& $e $r.CPU)<br><small>$($r.RamGB) GB RAM</small></td><td>$($r.SystemFreeGB) GB</td><td>SB $(& $e $r.SecureBoot), TPM $(& $e $r.Tpm), Defender defs $(& $e $r.DefenderSigDays) d</td><td>$(@($r.Programs).Count)</td></tr>"
+    }
+    $chg = foreach ($c in @($changes)) {
+        "<h3>$(& $e $c.Computer)</h3><ul>" + (($c.Changes | ForEach-Object { "<li>$(& $e $_)</li>" }) -join '') + (($c.Added | ForEach-Object { "<li style='color:#1f9e8f'>+ $(& $e $_)</li>" }) -join '') + (($c.Removed | ForEach-Object { "<li style='color:#c8344f'>- $(& $e $_)</li>" }) -join '') + '</ul>'
+    }
+    $fl = if ($fails.Count) { '<h2>Not reached</h2><ul>' + (($fails | ForEach-Object { "<li><b>$(& $e $_.Computer)</b>: $(& $e $_.Error)</li>" }) -join '') + '</ul>' } else { '' }
+    $html = @"
+<!doctype html><html><head><meta charset="utf-8"><title>Fleet inventory $stamp</title>
+<style>body{font-family:Segoe UI,sans-serif;margin:28px;color:#1c2140}table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:7px 9px;border-bottom:1px solid #dde;text-align:left;vertical-align:top}th{color:#667}small{color:#778}</style></head>
+<body><h1>Fleet inventory</h1><p>$($results.Count) PC(s) collected $((Get-Date).ToString('f')) by AWiper. $(if ($prevDir) { "Compared with $($prevDir.Name)." } else { 'First run - nothing to compare with yet.' })</p>
+<table><tr><th>Computer</th><th>Model</th><th>Windows</th><th>BIOS</th><th>CPU / RAM</th><th>Free on C:</th><th>Security</th><th>Programs</th></tr>
+$($rows -join "`n")</table>
+<h2>Changes since last run</h2>$(if (@($changes).Count) { $chg -join "`n" } else { '<p>None.</p>' })
+$fl</body></html>
+"@
+    $html | Set-Content -LiteralPath (Join-Path $dir 'report.html') -Encoding UTF8
+    [pscustomobject]@{ Dir = $dir; Html = (Join-Path $dir 'report.html'); Count = $results.Count; Failed = $fails.Count; Changed = @($changes).Count }
+}
+
+# ---------------------------------------------------------------- Folder backup (robocopy mirror + versions)
+# Mirrors each source into <Dest>\AWiper-Backup\<COMPUTER>\current\<name>. Before mirroring, files the
+# mirror would overwrite or delete are moved to versions\<timestamp>\ so older copies are kept.
+# Refuses to run if the destination isn't the exact volume chosen when the job was set up.
+function Invoke-WBackup($Job) {
+    $res = [ordered]@{ Ok = $false; New = 0; Versioned = 0; Errors = 0; Message = '' }
+    if (-not $Job.Dest -or -not (Test-Path -LiteralPath $Job.Dest)) { $res.Message = "The backup drive isn't connected ($($Job.Dest))."; return [pscustomobject]$res }
+    if ($Job.DestVolumeId -and [AWiper.Native]::VolumeId($Job.Dest) -ne $Job.DestVolumeId) {
+        $res.Message = "A different drive is using $($Job.Dest) now - backup skipped to protect it. Reconnect the backup drive or choose it again."; return [pscustomobject]$res
+    }
+    $root = Join-Path $Job.Dest "AWiper-Backup\$env:COMPUTERNAME"
+    $stamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+    $verRoot = Join-Path $root "versions\$stamp"
+    foreach ($src in @($Job.Sources)) {
+        if (-not (Test-Path -LiteralPath $src)) { Write-WLog "Backup: $src not found - skipped" 'WARN'; $res.Errors++; continue }
+        $name = ($src.TrimEnd('\') -replace ':', '' -replace '\\', '_')
+        $cur = Join-Path $root "current\$name"
+        $Sync.Status = "Backing up $src..."
+        # 1) What would the mirror overwrite or delete? Keep those as versions first.
+        $plan = & robocopy.exe $src $cur /MIR /L /XJ /R:0 /W:0 /NJH /NJS /FP /NS /NP 2>&1
+        $moves = New-Object System.Collections.Generic.List[string]
+        foreach ($l in $plan) {
+            if ("$l" -match '^\s*\*EXTRA (File|Dir)\s+(.+?)\s*$') { $moves.Add($Matches[2]) }
+            elseif ("$l" -match '^\s*(Newer|Older|Changed|Tweaked)\s+(.+?)\s*$') { $res.New++; $p = $Matches[2]; if ($p.StartsWith($src, [StringComparison]::OrdinalIgnoreCase)) { $moves.Add((Join-Path $cur $p.Substring($src.TrimEnd('\').Length).TrimStart('\'))) } }
+            elseif ("$l" -match '^\s*New File\s') { $res.New++ }
+        }
+        foreach ($m in ($moves | Sort-Object Length)) {
+            if (-not (Test-Path -LiteralPath $m)) { continue }        # already moved with its folder
+            $rel = $m.Substring((Join-Path $root 'current').Length).TrimStart('\')
+            $to = Join-Path $verRoot $rel
+            try { New-Item -ItemType Directory -Path (Split-Path $to) -Force | Out-Null; Move-Item -LiteralPath $m -Destination $to -Force -ErrorAction Stop; $res.Versioned++ }
+            catch { Write-WLog "Backup: could not keep old version of $($m): $($_.Exception.Message)" 'WARN'; $res.Errors++ }
+        }
+        # 2) Mirror.
+        & robocopy.exe $src $cur /MIR /XJ /R:1 /W:1 /MT:8 /DCOPY:T /COPY:DAT /NP /NFL /NDL /NJH /NJS 2>&1 | Out-Null
+        if ($LASTEXITCODE -ge 8) { Write-WLog "Backup: robocopy reported errors for $src (exit $LASTEXITCODE)" 'ERROR'; $res.Errors++ }
+    }
+    # 3) Keep only the newest N version folders.
+    $vdir = Join-Path $root 'versions'
+    if (Test-Path -LiteralPath $vdir) {
+        $keep = [Math]::Max(1, [int]$Job.Keep)
+        foreach ($old in @(Get-ChildItem -LiteralPath $vdir -Directory | Sort-Object Name -Descending | Select-Object -Skip $keep)) {
+            Remove-Item -LiteralPath $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $res.Ok = $res.Errors -eq 0
+    $res.Message = '{0} new or changed file(s) copied, {1} older version(s) kept{2}' -f $res.New, $res.Versioned, $(if ($res.Errors) { ", $($res.Errors) problem(s) - see the log" } else { '' })
+    Write-WLog "Backup finished: $($res.Message)"
+    [pscustomobject]$res
+}
+
 # ---------------------------------------------------------------- Health check
 # Every row: Id, Name, Status (Good / Warning / Problem / Info / NA), Detail, Action.
 # NA means the data source isn't available here - it must never be counted as healthy.
@@ -1888,6 +2425,26 @@ function Get-WHealth {
                 }
                 if ($rc.PowerOnHours -gt 0) { $facts.Add(('{0:N0} hours powered on' -f $rc.PowerOnHours)) }
                 if ($rc.ReadErrorsUncorrected -gt 0 -or $rc.WriteErrorsUncorrected -gt 0) { $status = 'Problem'; $why += 'uncorrected read/write errors' }
+            }
+            # NVMe drives: the drive's own SMART / health log (CrystalDiskInfo-level detail, no extra driver).
+            if ("$($d.BusType)" -eq 'NVMe' -and ('AWiper.StorageHealth' -as [type])) {
+                try {
+                    $nv = [AWiper.StorageHealth]::ReadNvme([int]$d.DeviceId)
+                    $facts.Clear()
+                    $facts.Add("$($nv.PercentUsed)% of rated life used"); $facts.Add("$($nv.TemperatureC) C"); $facts.Add("$($nv.AvailableSpare)% spare")
+                    $facts.Add(('{0:N1} TB written' -f $nv.WrittenTB)); $facts.Add(('{0:N0} power-on hours' -f $nv.PowerOnHours))
+                    if ($nv.UnsafeShutdowns) { $facts.Add("$($nv.UnsafeShutdowns) unsafe shutdowns") }
+                    if ($nv.CriticalWarning -ne 0) {
+                        $bits = @(); $cw = $nv.CriticalWarning
+                        if ($cw -band 1) { $bits += 'spare space is low' }; if ($cw -band 2) { $bits += 'temperature limit reached' }
+                        if ($cw -band 4) { $bits += 'reliability is degraded' }; if ($cw -band 8) { $bits += 'the drive is now read-only' }
+                        $status = 'Problem'; $why += "the drive reports a critical warning: $($bits -join ', ') - back up now"
+                    }
+                    if ($nv.PercentUsed -ge 90 -or ($nv.SpareThreshold -gt 0 -and $nv.AvailableSpare -le $nv.SpareThreshold)) { $status = 'Problem'; $why += 'nearly worn out - plan a replacement' }
+                    elseif ($nv.PercentUsed -ge 70 -and $status -eq 'Good') { $status = 'Warning'; $why += 'heavily worn' }
+                    if ($nv.MediaErrors -gt 0) { if ($status -eq 'Good') { $status = 'Warning' }; $why += "$($nv.MediaErrors) media error(s) recorded" }
+                    if ($nv.CriticalTempMinutes -gt 0 -and $status -eq 'Good') { $status = 'Warning'; $why += "ran critically hot for $($nv.CriticalTempMinutes) min" }
+                } catch { }
             }
             if ($status -eq 'Good' -and $facts.Count -eq 0 -and (-not $hs -or $hs -eq 'Unknown')) {
                 $status = 'NA'; $why += $(if ("$($d.BusType)" -eq 'USB') { 'health data is not passed through this USB enclosure' } else { 'the drive does not report health data' })
@@ -2458,8 +3015,12 @@ function Resolve-AWDriverVendor([string]$Provider, $HardwareIds) {
 }
 
 # The PC maker's driver page for this exact model (laptops often need the maker's customized drivers).
+# Custom-built PCs report a placeholder maker, so the motherboard maker / model is used instead.
+function Test-AWGenericMaker([string]$Maker) { -not $Maker -or $Maker -match 'System manufacturer|To Be Filled|Default string|O\.E\.M|^Not Applicable' }
+
 function Get-AWOemSupport($System) {
     $maker = [string]$System.Manufacturer; $model = [string]$System.Model
+    if ((Test-AWGenericMaker $maker) -and $System.BoardMaker) { $maker = [string]$System.BoardMaker; $model = [string]$System.BoardModel }
     $q = [uri]::EscapeDataString($model)
     $url = switch -Regex ($maker) {
         'Dell'                  { "https://www.dell.com/support/home/en-us/product-support/servicetag/$([uri]::EscapeDataString($System.Serial))/drivers" }
@@ -2469,6 +3030,7 @@ function Get-AWOemSupport($System) {
         'ASUS'                  { 'https://www.asus.com/support/download-center/' }
         'Acer'                  { 'https://www.acer.com/us-en/support/drivers-and-manuals' }
         'Gigabyte'              { 'https://www.gigabyte.com/Support' }
+        'ASRock'                { 'https://www.asrock.com/support/index.asp' }
         '^Microsoft'            { 'https://support.microsoft.com/surface/download-drivers-and-firmware-for-surface-09bb2e09-2a4b-cb69-0951-078a7739e120' }
         'Framework'             { 'https://knowledgebase.frame.work/' }
         default                 { 'https://www.bing.com/search?q=' + [uri]::EscapeDataString("$maker $model drivers") }
@@ -2550,7 +3112,7 @@ function Invoke-AWCli {
     }
     $remote = [bool]$Target
     $canAdmin = $script:IsAdmin -or $remote
-    $wantsChanges = ($want.Clean.Count -and -not $want.Analyze) -or $want.ApplyTweaks.Count -or $want.RevertTweaks.Count -or $want.RemoveApps.Count -or $want.RestorePoint
+    $wantsChanges = [bool]$Backup -or ($want.Clean.Count -and -not $want.Analyze) -or $want.ApplyTweaks.Count -or $want.RevertTweaks.Count -or $want.RemoveApps.Count -or $want.RestorePoint
     Write-AWCli ("AWiper {0} - {1}{2}{3}" -f $script:AppVersion, $result.Target, $(if ($remote) { ' (remote)' } else { '' }), $(if ($wantsChanges -and -not $Yes) { ' - preview only, add -Yes to make changes' } else { '' })) Cyan
     if ($script:ElevationNote -and -not $remote) { Write-AWCli $script:ElevationNote Yellow }
 
@@ -2617,6 +3179,33 @@ function Invoke-AWCli {
         if ($old.Count) { Write-AWCli "  $($old.Count) third-party driver(s) are over 3 years old - check the vendor sites" Yellow }
         Write-AWCli "  Maker's driver page: $($oem.Url)"
         $result.Steps += [ordered]@{ Step = 'CheckDrivers'; System = $inv.System; Problems = @($probs | ForEach-Object Name); Updates = @($updates); OldDrivers = @($old | ForEach-Object Name); MakerPage = $oem.Url }
+    }
+
+    # ---- fleet inventory (read-only)
+    if ($Inventory) {
+        $hosts = @($Inventory | ForEach-Object { "$_" -split '[,;\s]+' } | Where-Object { $_ } | Select-Object -Unique)
+        Write-AWCli "`nFleet inventory of $($hosts.Count) PC(s)" Cyan
+        $inv = Invoke-WFleetInventory $hosts (Join-Path $script:DataDir 'Inventory')
+        Write-AWCli ("  {0} collected, {1} not reached, {2} changed since last run" -f $inv.Count, $inv.Failed, $inv.Changed) $(if ($inv.Failed) { 'Yellow' } else { 'Green' })
+        Write-AWCli "  Report: $($inv.Html)"
+        if ($inv.Failed) { $failed = $true }
+        $result.Steps += [ordered]@{ Step = 'Inventory'; Hosts = $hosts; Folder = $inv.Dir; Report = $inv.Html; Collected = $inv.Count; Failed = $inv.Failed; Changed = $inv.Changed }
+    }
+
+    # ---- folder backup (the job saved in the window)
+    if ($Backup) {
+        $job = $script:State.Backup
+        Write-AWCli "`nBackup" Cyan
+        if (-not @($job.Sources).Count -or -not $job.Dest) { Write-AWCli '  No backup is set up yet - choose folders and a drive in Recovery > Backup.' Yellow; $failed = $true }
+        elseif (-not $Yes) { Write-AWCli "  Would back up $(@($job.Sources).Count) folder(s) to $($job.Dest)" }
+        else {
+            $r = Invoke-WBackup ([pscustomobject]$job)
+            $script:State.Backup.LastRun = (Get-Date).ToString('o'); $script:State.Backup.LastResult = $r.Message; Save-AWState
+            Write-AWCli "  $($r.Message)" $(if ($r.Ok) { 'Green' } else { 'Yellow' })
+            Write-AWAction 'Backup' @($job.Sources) @{ Dest = $job.Dest } $(if ($r.Ok) { 'Done' } else { 'Problems' })
+            if (-not $r.Ok) { $failed = $true }
+            $result.Steps += [ordered]@{ Step = 'Backup'; Ok = $r.Ok; Message = $r.Message }
+        }
     }
 
     # ---- restore point (explicit, or automatic before tweaks / app removal)
@@ -3396,30 +3985,234 @@ if ($script:CliMode) {
           <!-- ===== Health Check ===== -->
           <Grid x:Name="ViewHealth" Visibility="Collapsed">
             <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-            <Border Style="{StaticResource Card}" Padding="24,20">
-              <Grid>
-                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                <StackPanel>
-                  <TextBlock x:Name="HealthTitle" Text="Health check" Style="{StaticResource H1}"/>
-                  <TextBlock x:Name="HealthSummary" Text="Checks disks, crashes, hardware errors, devices, battery, antivirus and more. Read-only and works offline."
-                             Style="{StaticResource Muted}" Margin="0,6,0,12" MaxWidth="640" HorizontalAlignment="Left"/>
-                  <WrapPanel x:Name="HealthCounts"/>
-                </StackPanel>
-                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                  <Button x:Name="HealthSave" Content="Save report..." Style="{StaticResource BtnChip}" IsEnabled="False"/>
-                  <Button x:Name="HealthRun" Style="{StaticResource BtnAccent}" Padding="20,10">
-                    <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE95E;" Style="{StaticResource Icon}" Margin="0,0,8,0"/><TextBlock Text="Run health check"/></StackPanel>
-                  </Button>
-                </StackPanel>
-              </Grid>
+            <Border Background="{StaticResource FieldBrush}" CornerRadius="10" Padding="3" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" HorizontalAlignment="Left">
+              <StackPanel Orientation="Horizontal">
+                <RadioButton x:Name="HTabChecks"  Style="{StaticResource SegBtn}" GroupName="HTab" IsChecked="True" Content="Checks" MinWidth="96"/>
+                <RadioButton x:Name="HTabEvents"  Style="{StaticResource SegBtn}" GroupName="HTab" Content="Events" MinWidth="96"/>
+                <RadioButton x:Name="HTabBoot"    Style="{StaticResource SegBtn}" GroupName="HTab" Content="Startup time" MinWidth="96"/>
+                <RadioButton x:Name="HTabSec"     Style="{StaticResource SegBtn}" GroupName="HTab" Content="Security" MinWidth="96"/>
+                <RadioButton x:Name="HTabPriv"    Style="{StaticResource SegBtn}" GroupName="HTab" Content="Privacy" MinWidth="96"/>
+              </StackPanel>
             </Border>
-            <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="10,8">
-              <ScrollViewer VerticalScrollBarVisibility="Auto">
-                <StackPanel x:Name="HealthRows" Margin="4,0,8,0"/>
-              </ScrollViewer>
-            </Border>
-          </Grid>
+            <Grid Grid.Row="1" Margin="0,14,0,16">
 
+              <!-- Checks -->
+              <Grid x:Name="HPanelChecks">
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                <Border Style="{StaticResource Card}" Padding="24,20">
+                  <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <StackPanel>
+                      <TextBlock x:Name="HealthTitle" Text="Health check" Style="{StaticResource H1}"/>
+                      <TextBlock x:Name="HealthSummary" Text="Checks disks, crashes, hardware errors, devices, battery, antivirus and more. Read-only and works offline."
+                                 Style="{StaticResource Muted}" Margin="0,6,0,12" MaxWidth="640" HorizontalAlignment="Left"/>
+                      <WrapPanel x:Name="HealthCounts"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                      <Button x:Name="HealthSave" Content="Save report..." Style="{StaticResource BtnChip}" IsEnabled="False"/>
+                      <Button x:Name="HealthRun" Style="{StaticResource BtnAccent}" Padding="20,10">
+                        <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE95E;" Style="{StaticResource Icon}" Margin="0,0,8,0"/><TextBlock Text="Run health check"/></StackPanel>
+                      </Button>
+                    </StackPanel>
+                  </Grid>
+                </Border>
+                <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,0" Padding="10,8">
+                  <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="HealthRows" Margin="4,0,8,0"/>
+                  </ScrollViewer>
+                </Border>
+              </Grid>
+
+              <!-- Events -->
+              <Border x:Name="HPanelEvents" Style="{StaticResource Card}" Padding="14,12" Visibility="Collapsed">
+                <DockPanel>
+                  <Grid DockPanel.Dock="Top" Margin="0,0,0,10">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <TextBlock Text="What went wrong recently" Style="{StaticResource H2}" VerticalAlignment="Center"/>
+                    <Border Grid.Column="1" Background="{StaticResource FieldBrush}" CornerRadius="10" Padding="3" Margin="14,0,0,0" BorderBrush="{StaticResource LineBrush}" BorderThickness="1">
+                      <StackPanel Orientation="Horizontal">
+                        <RadioButton x:Name="EvtDays7"  Style="{StaticResource SegBtn}" GroupName="EvtDays" IsChecked="True" Content="7 days"/>
+                        <RadioButton x:Name="EvtDays30" Style="{StaticResource SegBtn}" GroupName="EvtDays" Content="30 days"/>
+                      </StackPanel>
+                    </Border>
+                    <TextBlock x:Name="EvtInfo" Grid.Column="2" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0" TextTrimming="CharacterEllipsis"/>
+                    <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+                      <Button x:Name="EvtViewer" Content="Event Viewer" Style="{StaticResource BtnChip}"/>
+                      <Button x:Name="EvtBundle" Content="Create support bundle..." Style="{StaticResource BtnPurple}" Padding="14,6" FontSize="12"
+                              ToolTip="Zips the last 7 days of System / Application logs, health and event reports, system info and the driver list - handy for a technician"/>
+                    </StackPanel>
+                  </Grid>
+                  <TextBlock DockPanel.Dock="Bottom" Text="Hover a row for what it means and what to do. Security-log items (failed sign-ins) need administrator rights."
+                             Style="{StaticResource Muted}" FontSize="11.5" Margin="6,8,6,0"/>
+                  <ListView x:Name="EvtList">
+                    <ListView.View>
+                      <GridView>
+                        <GridViewColumn Header="Severity" Width="90">
+                          <GridViewColumn.CellTemplate><DataTemplate>
+                            <TextBlock x:Name="S" Text="{Binding Severity}" FontWeight="SemiBold" Foreground="#8C95BD"/>
+                            <DataTemplate.Triggers>
+                              <DataTrigger Binding="{Binding Severity}" Value="Problem"><Setter TargetName="S" Property="Foreground" Value="#F2617A"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Severity}" Value="Warning"><Setter TargetName="S" Property="Foreground" Value="#F5B94B"/></DataTrigger>
+                            </DataTemplate.Triggers>
+                          </DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="What happened" Width="230">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Title}" FontWeight="SemiBold" ToolTip="{Binding Why}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Times" Width="64">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Count}" TextAlignment="Right"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Last seen" Width="130" DisplayMemberBinding="{Binding LastText}"/>
+                        <GridViewColumn Header="Details" Width="520">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Source}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Why}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                      </GridView>
+                    </ListView.View>
+                  </ListView>
+                </DockPanel>
+              </Border>
+
+              <!-- Startup time -->
+              <Grid x:Name="HPanelBoot" Visibility="Collapsed">
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                <Border Style="{StaticResource Card}" Padding="20,16">
+                  <DockPanel>
+                    <Grid DockPanel.Dock="Top">
+                      <StackPanel>
+                        <TextBlock Text="How long Windows takes to start" Style="{StaticResource H2}"/>
+                        <TextBlock x:Name="BootSummary" Text="" Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                      </StackPanel>
+                      <Button x:Name="BootStartup" Content="Open Startup manager" Style="{StaticResource BtnChip}" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0"/>
+                    </Grid>
+                    <Canvas x:Name="BootChart" Height="150" Margin="0,14,0,0" ClipToBounds="True"/>
+                  </DockPanel>
+                </Border>
+                <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,0" Padding="14,12">
+                  <DockPanel>
+                    <TextBlock DockPanel.Dock="Top" Text="What slowed startup (last 60 days)" Style="{StaticResource H2}" Margin="2,0,0,8"/>
+                    <ListView x:Name="BootList">
+                      <ListView.View>
+                        <GridView>
+                          <GridViewColumn Header="Type" Width="80" DisplayMemberBinding="{Binding Kind}"/>
+                          <GridViewColumn Header="Name" Width="320">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding File}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                          <GridViewColumn Header="Times" Width="64" DisplayMemberBinding="{Binding Times}"/>
+                          <GridViewColumn Header="Average delay" Width="120">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding DelayText}" Foreground="#F5B94B" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                          <GridViewColumn Header="Last seen" Width="140" DisplayMemberBinding="{Binding LastText}"/>
+                        </GridView>
+                      </ListView.View>
+                    </ListView>
+                  </DockPanel>
+                </Border>
+              </Grid>
+
+              <!-- Security -->
+              <Border x:Name="HPanelSec" Style="{StaticResource Card}" Padding="14,12" Visibility="Collapsed">
+                <DockPanel>
+                  <Grid DockPanel.Dock="Top" Margin="0,0,0,10">
+                    <StackPanel>
+                      <TextBlock Text="Security checks" Style="{StaticResource H2}"/>
+                      <TextBlock x:Name="SecInfo" Text="" Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                      <Button x:Name="SecRefresh" Content="Refresh" Style="{StaticResource BtnChip}"/>
+                      <Button x:Name="SecFix" Content="Fix checked" Style="{StaticResource BtnAccent}" Padding="14,6" FontSize="12"/>
+                    </StackPanel>
+                  </Grid>
+                  <TextBlock DockPanel.Dock="Bottom" Style="{StaticResource Muted}" FontSize="11.5" Margin="6,8,6,0" TextWrapping="Wrap"
+                             Text="Only safe, reversible fixes can be checked - each one goes into the undo history (Rebloat). Items marked policy are set by your organization's Group Policy, which overwrites local changes."/>
+                  <ListView x:Name="SecList">
+                    <ListView.View>
+                      <GridView>
+                        <GridViewColumn Header="" Width="44">
+                          <GridViewColumn.CellTemplate><DataTemplate><CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}" IsEnabled="{Binding CanFix}" Margin="4,0,0,0"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Status" Width="90">
+                          <GridViewColumn.CellTemplate><DataTemplate>
+                            <TextBlock x:Name="S" Text="{Binding StatusText}" FontWeight="SemiBold" Foreground="#8C95BD"/>
+                            <DataTemplate.Triggers>
+                              <DataTrigger Binding="{Binding Status}" Value="Good"><Setter TargetName="S" Property="Foreground" Value="#19C3B1"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Status}" Value="Warning"><Setter TargetName="S" Property="Foreground" Value="#F5B94B"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Status}" Value="Problem"><Setter TargetName="S" Property="Foreground" Value="#F2617A"/></DataTrigger>
+                            </DataTemplate.Triggers>
+                          </DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Check" Width="220">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Details" Width="560">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Detail}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Detail}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="" Width="70">
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding PolicyText}" Foreground="#F5B94B" FontSize="11"/></DataTemplate></GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                      </GridView>
+                    </ListView.View>
+                  </ListView>
+                </DockPanel>
+              </Border>
+
+              <!-- Privacy -->
+              <Grid x:Name="HPanelPriv" Visibility="Collapsed">
+                <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                <Border Style="{StaticResource Card}" Padding="14,12">
+                  <DockPanel>
+                    <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                      <StackPanel>
+                        <TextBlock Text="Which apps used your camera, microphone or location" Style="{StaticResource H2}"/>
+                        <TextBlock x:Name="PrivInfo" Text="" Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                      </StackPanel>
+                      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                        <Button x:Name="PrivRefresh" Content="Refresh" Style="{StaticResource BtnChip}"/>
+                        <Button x:Name="PrivSettings" Content="Privacy settings" Style="{StaticResource BtnChip}" Margin="0"/>
+                      </StackPanel>
+                    </Grid>
+                    <ListView x:Name="PrivList">
+                      <ListView.View>
+                        <GridView>
+                          <GridViewColumn Header="Used" Width="100" DisplayMemberBinding="{Binding Capability}"/>
+                          <GridViewColumn Header="App" Width="460">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding App}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding App}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                          <GridViewColumn Header="Last used" Width="150" DisplayMemberBinding="{Binding LastText}"/>
+                          <GridViewColumn Header="" Width="90">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding NowText}" Foreground="#F2617A" FontWeight="Bold"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                        </GridView>
+                      </ListView.View>
+                    </ListView>
+                  </DockPanel>
+                </Border>
+                <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,0" Padding="14,12">
+                  <DockPanel>
+                    <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                      <StackPanel>
+                        <TextBlock Text="Adware and hijack sweep" Style="{StaticResource H2}"/>
+                        <TextBlock x:Name="PupInfo" Text="" Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                      </StackPanel>
+                      <Button x:Name="PupOpen" Content="Open location" Style="{StaticResource BtnChip}" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0"/>
+                    </Grid>
+                    <ListView x:Name="PupList">
+                      <ListView.View>
+                        <GridView>
+                          <GridViewColumn Header="Found" Width="130" DisplayMemberBinding="{Binding Kind}"/>
+                          <GridViewColumn Header="Item" Width="280">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Item}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Item}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                          <GridViewColumn Header="Details" Width="560">
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Detail}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Detail}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          </GridViewColumn>
+                        </GridView>
+                      </ListView.View>
+                    </ListView>
+                  </DockPanel>
+                </Border>
+              </Grid>
+            </Grid>
+          </Grid>
           <!-- ===== Cleaner ===== -->
           <Grid x:Name="ViewCleaner" Visibility="Collapsed">
             <Grid.ColumnDefinitions><ColumnDefinition Width="330"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
@@ -3664,6 +4457,7 @@ if ($script:CliMode) {
                     <RadioButton x:Name="RecTabShadow" Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Previous versions"/>
                     <RadioButton x:Name="RecTabUndel"  Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Undelete"/>
                     <RadioButton x:Name="RecTabRP"     Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Restore points"/>
+                    <RadioButton x:Name="RecTabBackup" Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Backup"/>
                     <RadioButton x:Name="RecTabDeep"   Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Deep scan"/>
                   </StackPanel>
                 </Border>
@@ -3916,6 +4710,62 @@ if ($script:CliMode) {
                 </Border>
               </Grid>
 
+              <!-- Folder backup -->
+              <Grid x:Name="RecPanelBackup" Visibility="Collapsed">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="360"/></Grid.ColumnDefinitions>
+                <Border Style="{StaticResource Card}" Padding="14,12">
+                  <DockPanel>
+                    <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                      <StackPanel>
+                        <TextBlock Text="Folders to back up" Style="{StaticResource H2}"/>
+                        <TextBlock Text="Copied to the backup drive and kept in sync. Files you change or delete keep their older versions there." Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                      </StackPanel>
+                    </Grid>
+                    <WrapPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                      <Button x:Name="BkAddMine" Content="Add my folders" Style="{StaticResource BtnChip}" ToolTip="Documents, Pictures, Desktop, Videos and Music"/>
+                      <Button x:Name="BkAdd" Content="Add folder..." Style="{StaticResource BtnChip}"/>
+                      <Button x:Name="BkRemove" Content="Remove" Style="{StaticResource BtnChip}"/>
+                    </WrapPanel>
+                    <ListBox x:Name="BkSources"/>
+                  </DockPanel>
+                </Border>
+                <Border Grid.Column="1" Style="{StaticResource Card}" Margin="16,0,0,0" Padding="18,14">
+                  <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="0,0,6,0">
+                      <TextBlock Text="BACKUP DRIVE" Style="{StaticResource Caps}" Margin="0,0,0,6"/>
+                      <Grid>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <TextBox x:Name="BkDest" IsReadOnly="True" Tag="Choose a folder on an external drive"/>
+                        <Button x:Name="BkBrowse" Grid.Column="1" Style="{StaticResource BtnIcon}" Content="&#xE838;" ToolTip="Choose" Margin="8,0,0,0"/>
+                      </Grid>
+                      <TextBlock x:Name="BkDestInfo" Text="" TextWrapping="Wrap" FontSize="12" Margin="2,6,0,0"/>
+
+                      <TextBlock Text="OLDER VERSIONS" Style="{StaticResource Caps}"/>
+                      <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="Keep the last" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBox x:Name="BkKeep" Width="56" Text="10"/>
+                        <TextBlock Text="backup runs' changes" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                      </StackPanel>
+
+                      <TextBlock Text="SCHEDULE" Style="{StaticResource Caps}"/>
+                      <StackPanel Orientation="Horizontal">
+                        <CheckBox x:Name="BkDaily" Content="Back up every day at" VerticalAlignment="Center"/>
+                        <TextBox x:Name="BkTime" Width="70" Text="19:00" Margin="8,0,0,0"/>
+                      </StackPanel>
+                      <TextBlock Text="Runs while you're signed in; a missed run catches up when the PC is next on. The drive just needs to be connected."
+                                 Style="{StaticResource Muted}" FontSize="11.5" Margin="0,6,0,0"/>
+
+                      <TextBlock x:Name="BkLast" Text="" Style="{StaticResource Muted}" FontSize="12" Margin="0,16,0,0" TextWrapping="Wrap"/>
+                      <WrapPanel Margin="0,12,0,0">
+                        <Button x:Name="BkSave" Content="Save settings" Style="{StaticResource BtnChip}"/>
+                        <Button x:Name="BkRun" Content="Back up now" Style="{StaticResource BtnAccent}" Padding="16,7" FontSize="12" Margin="0,0,8,0"/>
+                        <Button x:Name="BkOpen" Content="Open backup" Style="{StaticResource BtnChip}" Margin="0"/>
+                      </WrapPanel>
+                    </StackPanel>
+                  </ScrollViewer>
+                </Border>
+              </Grid>
+
               <!-- Deep scan (Windows File Recovery) -->
               <Grid x:Name="RecPanelDeep" Visibility="Collapsed">
                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="330"/></Grid.ColumnDefinitions>
@@ -4147,7 +4997,26 @@ if ($script:CliMode) {
 
           <!-- ===== BIOS ===== -->
           <Grid x:Name="ViewBios" Visibility="Collapsed">
-            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,0" Padding="20,14">
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <Border Width="36" Height="36" CornerRadius="10" Background="{StaticResource TealGrad}" VerticalAlignment="Top">
+                  <TextBlock Text="&#xE895;" Style="{StaticResource Icon}" FontSize="16" Foreground="White" HorizontalAlignment="Center"/>
+                </Border>
+                <StackPanel Grid.Column="1" Margin="14,0,14,0">
+                  <TextBlock Text="BIOS updates" Style="{StaticResource H2}" FontSize="15"/>
+                  <TextBlock x:Name="BiosUpdText" Text="" TextWrapping="Wrap" Margin="0,4,0,0" FontSize="12.5"/>
+                  <TextBlock x:Name="BiosUpdTips" Text="Before updating: plug a laptop into power, close your apps, use the maker's instructions and update tool, and never turn the PC off during the update."
+                             Style="{StaticResource Muted}" FontSize="11.5" Margin="0,6,0,0"/>
+                </StackPanel>
+                <WrapPanel Grid.Column="2" VerticalAlignment="Center" MaxWidth="330" HorizontalAlignment="Right">
+                  <Button x:Name="BiosFind" Content="Find BIOS update" Style="{StaticResource BtnAccent}" Padding="14,7" FontSize="12" Margin="0,0,8,6"/>
+                  <Button x:Name="BiosWu" Content="Check Windows Update" Style="{StaticResource BtnChip}" Margin="0,0,8,6"/>
+                  <Button x:Name="BiosBitlocker" Content="Suspend BitLocker for 1 restart" Style="{StaticResource BtnChip}" Margin="0,0,0,6" Visibility="Collapsed"/>
+                </WrapPanel>
+              </Grid>
+            </Border>
             <Border Style="{StaticResource Card}" Padding="20,16">
               <Grid>
                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
@@ -4164,7 +5033,7 @@ if ($script:CliMode) {
                 </StackPanel>
               </Grid>
             </Border>
-            <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="14,12">
+            <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="14,12">
               <DockPanel>
                 <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="300"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
@@ -6081,6 +6950,7 @@ function Set-AWTarget($NewTarget) {
     $ui.CleanSubtext.Text = if (Test-AWRemote) { "Machine-wide rules run on $($NewTarget.ComputerName). Per-user rules are only available on this PC." } else { 'Pick the rules on the left, then Analyze to see what can be removed.' }
     $ui.CleanProgress.Value = 0
     $script:AllApps = @(); $ui.AppList.ItemsSource = $null; $script:Programs = @(); $ui.ProgList.ItemsSource = $null
+    $script:HTabLoaded = @{}
     [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat'); [void]$script:Loaded.Remove('Recovery'); [void]$script:Loaded.Remove('Rebloat'); [void]$script:Loaded.Remove('Health'); [void]$script:Loaded.Remove('Drivers'); [void]$script:Loaded.Remove('Bios')
     $cur = Get-AWCurrentView
     Update-AWViewTitle $cur
@@ -6088,7 +6958,7 @@ function Set-AWTarget($NewTarget) {
     if ($cur -eq 'Debloat')  { $script:Loaded['Debloat'] = $true; Update-AWAppList; Update-AWTweakStatus }
     if ($cur -eq 'Recovery') { $script:Loaded['Recovery'] = $true; Initialize-AWRecovery }
     if ($cur -eq 'Rebloat')  { $script:Loaded['Rebloat'] = $true; Initialize-AWRebloat }
-    if ($cur -eq 'Health')   { $script:Loaded['Health'] = $true; Start-AWHealthCheck }
+    if ($cur -eq 'Health')   { $script:Loaded['Health'] = $true; Start-AWHealthCheck; foreach ($k in 'Events', 'Boot', 'Sec', 'Priv') { if ($ui["HTab$k"].IsChecked) { Show-AWHealthTab $k } } }
     if ($cur -eq 'Drivers')  { $script:Loaded['Drivers'] = $true; Start-AWDriverInventory }
     if ($cur -eq 'Bios')     { $script:Loaded['Bios'] = $true; Start-AWBiosRead }
     if (Test-AWRemote) {
@@ -6262,6 +7132,25 @@ function New-AWToolCard {
 
 function Get-AWWhere { if (Test-AWRemote) { " on $($script:Target.ComputerName)" } else { '' } }
 
+function Start-AWFleetInventory {
+    $def = if ($script:State.FleetHosts) { $script:State.FleetHosts } else { (@($env:COMPUTERNAME) + @($script:State.RecentTargets)) -join ', ' }
+    $in = [Microsoft.VisualBasic.Interaction]::InputBox("Computers to inventory (names or addresses, separated by commas). Credentials saved in Credential Manager are used where present; otherwise your current sign-in.", 'AWiper - Fleet inventory', $def)
+    $hosts = @($in -split '[,;\s]+' | Where-Object { $_ } | Select-Object -Unique)
+    if (-not $hosts.Count) { return }
+    $script:State.FleetHosts = $hosts -join ', '; Save-AWState
+    Write-AWAction 'FleetInventory' $hosts @{} 'Started'
+    $saved = $script:Target; $script:Target = $null
+    try {
+        Start-AWTask -Name 'Fleet inventory' -Arguments @{ Hosts = $hosts; Root = (Join-Path $script:DataDir 'Inventory') } -Work { Invoke-WFleetInventory $Hosts $Root } -OnComplete {
+            param($r)
+            $res = @($r | Where-Object { $_ -and $_.Html }) | Select-Object -Last 1
+            if (-not $res) { Show-AWMessage 'The inventory did not complete - see the Activity log.' 'Warning'; return }
+            $script:IdleStatus = "Fleet inventory: $($res.Count) collected, $($res.Failed) not reached, $($res.Changed) changed"
+            Start-Process $res.Html
+        }
+    } finally { $script:Target = $saved }
+}
+
 function Initialize-AWTools {
     $ui.ToolCards.Children.Clear()
     $script:ResourcesRoot = Find-AWResources
@@ -6306,6 +7195,27 @@ function Initialize-AWTools {
             param($r) $script:IdleStatus = "Manifest written ($(@($r)[-1]) files)"; Write-AWAction 'BuildManifest' @($script:ResourcesRoot) @{} 'Done'
         }
     } -Accent 'Purple' -Unavailable $(if ($script:ResourcesRoot) { '' } else { 'No Resources folder yet' })
+
+    $defs = if ($script:ResourcesRoot) { Join-Path $script:ResourcesRoot 'defs\x64\mpam-fe.exe' } else { $null }
+    $haveDefs = $defs -and (Test-Path -LiteralPath $defs)
+    $defsDesc = if ($haveDefs) { "Installs the definitions in Resources\defs ($(((Get-Item -LiteralPath $defs).LastWriteTime).ToString('yyyy-MM-dd'))) - no internet needed." }
+                else { "Keeps Microsoft Defender current on offline PCs. Download mpam-fe.exe on a connected PC into Resources\defs\x64." }
+    New-AWToolCard ([string][char]0xE83D) 'Defender offline update' $defsDesc $(if ($haveDefs) { 'Update now' } else { 'Get the file' }) $haveDefs {
+        $f = if ($script:ResourcesRoot) { Join-Path $script:ResourcesRoot 'defs\x64\mpam-fe.exe' } else { $null }
+        if ($f -and (Test-Path -LiteralPath $f)) {
+            if (-not (Confirm-AW "Update Microsoft Defender from`n$f ?")) { return }
+            Write-AWAction 'DefenderOfflineUpdate' @($f) @{} 'Started'
+            $saved = $script:Target; $script:Target = $null
+            try { Start-AWCommandTask 'Defender offline update' ([scriptblock]::Create("& '$($f -replace "'", "''")' 2>&1; ""AWEXIT `$LASTEXITCODE""")) } finally { $script:Target = $saved }
+        } elseif (Test-AWOffline) { Show-AWMessage "On a PC with internet, download the 64-bit definition file (mpam-fe.exe) from Microsoft's Defender updates page and save it as Resources\defs\x64\mpam-fe.exe on your USB stick." }
+        else { Start-Process 'https://www.microsoft.com/en-us/wdsi/defenderupdates' }
+    } -Unavailable $(if (Test-AWRemote) { '' } else { '' })
+
+    # ---------------- Fleet
+    Add-AWToolSection 'Fleet'
+    New-AWToolCard ([string][char]0xE7F4) 'Fleet inventory' 'Collects hardware, Windows, BIOS, security and installed programs from several PCs over WinRM into one report, and shows what changed since last time.' 'Run...' $false {
+        Start-AWFleetInventory
+    } -Accent 'Purple'
 
     # ---------------- Quick fixes
     Add-AWToolSection 'Quick fixes'
@@ -6704,8 +7614,66 @@ function Start-AWBiosRead {
         $ui.BiosExport.IsEnabled = $true
         if ((& $get 'Boot mode') -ne 'UEFI') { $ui.BiosRestart.IsEnabled = $false; $ui.BiosRestart.ToolTip = 'Only UEFI firmware supports restarting straight into setup' }
         Update-AWBiosView
+        Update-AWBiosUpdateCard
     }
 }
+
+# Where this PC's BIOS updates come from, and whether Windows Update already offers one.
+function Update-AWBiosUpdateCard {
+    $get = { param($n) [string](@($script:BiosRows | Where-Object { $_.Name -eq $n }) | Select-Object -First 1).Value }
+    $sys = [pscustomobject]@{ Manufacturer = (& $get 'Manufacturer'); Model = (& $get 'Model'); Serial = (& $get 'Serial number')
+                              BoardMaker = (& $get 'Board maker'); BoardModel = (& $get 'Board model'); Family = '' }
+    $script:BiosOem = Get-AWOemSupport $sys
+    $custom = Test-AWGenericMaker $sys.Manufacturer
+    $who = if ($custom) { "This looks like a custom-built PC, so BIOS updates come from the motherboard maker: $($script:BiosOem.Maker) $($script:BiosOem.Model)." }
+           else { "BIOS updates for the $($script:BiosOem.Maker) $($script:BiosOem.Model) come from $($script:BiosOem.Maker)'s support page, listed under BIOS or Firmware." }
+    $rel = & $get 'Release date'
+    $ui.BiosUpdText.Text = "$who Installed: $(& $get 'Version') from $rel."
+    $ui.BiosFind.ToolTip = "Opens $($script:BiosOem.Url)" + $(if ($script:BiosOem.SendsSerial) { "`nThe link includes this PC's service tag so Dell shows the exact model." } else { '' })
+    $ui.BiosFind.IsEnabled = -not (Test-AWOffline)
+    $ui.BiosWu.IsEnabled = -not (Test-AWOffline)
+    $blOn = (& $get "BitLocker on $($env:SystemDrive)") -eq 'On'
+    $ui.BiosBitlocker.Visibility = if ($blOn -and $script:IsAdmin -and -not (Test-AWRemote)) { 'Visible' } else { 'Collapsed' }
+    if ($blOn) { $ui.BiosUpdTips.Text = "Before updating: suspend BitLocker (button), plug a laptop into power, close your apps, follow the maker's instructions, and never turn the PC off during the update." }
+}
+
+function Start-AWBiosWuCheck {
+    $ui.BiosWu.IsEnabled = $false
+    $ui.BiosUpdText.Text = 'Asking Windows Update whether it offers a BIOS / firmware update for this PC (10-60 seconds)...'
+    Start-AWTask -Name 'Check Windows Update for BIOS' -Work { Invoke-WTarget { Get-WDriverUpdates } } -OnComplete {
+        param($Result)
+        $ui.BiosWu.IsEnabled = $true
+        $all = @($Result | Where-Object { $_ -and $_.UpdateId })
+        $script:DrvUpdates = $all                     # share with the Drivers view
+        if ($script:DrvInv) { Build-AWDriverEntries; Update-AWDrvView }
+        $fw = @($all | Where-Object { $_.Class -match 'Firmware' })
+        Update-AWBiosUpdateCard
+        $suffix = if ($fw.Count) {
+            'Windows Update offers: ' + (($fw | ForEach-Object { '{0} ({1:yyyy-MM-dd})' -f $(if ($_.Model) { $_.Model } else { $_.Title }), $_.VerDate }) -join '; ') + " - install it from Drivers > Install checked updates, or get it from the maker's page."
+        } else { "Windows Update doesn't offer a BIOS update for this PC - check the maker's page." }
+        $ui.BiosUpdText.Text = $ui.BiosUpdText.Text + ' ' + $suffix
+        Write-AWLog "BIOS update check: Windows Update offers $($fw.Count) firmware update(s)"
+    }
+}
+
+$ui.BiosFind.Add_Click({
+    if (-not $script:BiosOem) { return }
+    Write-AWAction 'OpenBiosSupportPage' @($script:BiosOem.Url) @{} 'Done'
+    Start-Process $script:BiosOem.Url
+})
+$ui.BiosWu.Add_Click({ Start-AWBiosWuCheck })
+$ui.BiosBitlocker.Add_Click({
+    if (-not (Confirm-AW "Suspend BitLocker on $($env:SystemDrive) until the next restart?`n`nDo this right before installing a BIOS update. Protection turns back on automatically after one restart; the drive stays encrypted the whole time.")) { return }
+    try {
+        $vol = Get-CimInstance -Namespace root/cimv2/Security/MicrosoftVolumeEncryption -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$($env:SystemDrive)'" -ErrorAction Stop
+        $r = Invoke-CimMethod -InputObject $vol -MethodName DisableKeyProtectors -Arguments @{ DisableCount = [uint32]1 } -ErrorAction Stop
+        if ($r.ReturnValue -ne 0) { throw "BitLocker returned code $($r.ReturnValue)" }
+        Write-AWLog "BitLocker suspended on $($env:SystemDrive) for one restart"
+        Write-AWAction 'SuspendBitLocker' @($env:SystemDrive) @{ RebootCount = 1 } 'Done'
+        Show-AWMessage 'BitLocker is suspended until the next restart. You can install the BIOS update now.'
+        Start-AWBiosRead
+    } catch { Show-AWMessage "Could not suspend BitLocker: $($_.Exception.Message)" 'Error' }
+})
 
 function Export-AWBios {
     $dlg = New-Object Microsoft.Win32.SaveFileDialog
@@ -6859,6 +7827,191 @@ $($rows -join "`n")
 
 $ui.HealthRun.Add_Click({ Start-AWHealthCheck })
 $ui.HealthSave.Add_Click({ Save-AWHealthReport })
+
+# ---------------- Health tabs: events, startup time, security, privacy
+$script:HTabLoaded = @{}
+
+function Show-AWHealthTab([string]$Tab) {
+    foreach ($k in 'Checks', 'Events', 'Boot', 'Sec', 'Priv') { $ui["HPanel$k"].Visibility = if ($k -eq $Tab) { 'Visible' } else { 'Collapsed' } }
+    if (-not $script:HTabLoaded[$Tab]) {
+        $script:HTabLoaded[$Tab] = $true
+        switch ($Tab) { 'Events' { Start-AWEventTriage } 'Boot' { Start-AWBootHistory } 'Sec' { Start-AWSecurityCheck } 'Priv' { Start-AWPrivacyCheck } }
+    }
+}
+
+function Start-AWEventTriage {
+    $days = if ($ui.EvtDays30.IsChecked) { 30 } else { 7 }
+    $ui.EvtInfo.Text = "Reading the last $days days of event logs..."
+    Start-AWTask -Name 'Event triage' -Arguments @{ Days = $days } -Work { Invoke-WTarget { param($d) Get-WEventTriage $d } -ArgumentList @($Days) } -OnComplete {
+        param($Result)
+        $order = @{ Problem = 0; Warning = 1; Info = 2 }
+        $rows = @($Result | Where-Object { $_ -and $_.Title } | ForEach-Object {
+            [pscustomobject]@{ Severity = $_.Severity; Title = $_.Title; Count = $_.Count; Last = $_.Last; LastText = ([datetime]$_.Last).ToString('MMM d, h:mm tt'); Source = $_.Source; Why = $_.Why; Log = $_.Log; Ids = $_.Ids }
+        } | Sort-Object { $order[$_.Severity] }, { - $_.Count })
+        $ui.EvtList.ItemsSource = $rows
+        $ui.EvtInfo.Text = if ($rows.Count) { "$($rows.Count) kind(s) of problem found" } else { 'Nothing notable in this period' }
+        $script:EvtRows = $rows
+    }
+}
+
+function Start-AWBootHistory {
+    $ui.BootSummary.Text = 'Reading startup history...'
+    $ui.BootChart.Children.Clear()
+    Start-AWTask -Name 'Startup time history' -Work { Invoke-WTarget { Get-WBootHistory 60 } } -OnComplete {
+        param($Result)
+        $h = @($Result | Where-Object { $_ -and $null -ne $_.Boots }) | Select-Object -Last 1
+        $boots = @($h.Boots)
+        if (-not $boots.Count) {
+            $ui.BootSummary.Text = if (-not $script:IsAdmin -and -not (Test-AWRemote)) { 'Windows only lets administrators read the startup-performance log. Use "Restart as admin" to see this.' } else { 'Windows has not recorded any startups in the last 60 days.' }
+            $ui.BootList.ItemsSource = $null; return
+        }
+        $last = $boots[-1]
+        $avg = ($boots | Measure-Object BootMs -Average).Average
+        $ui.BootSummary.Text = ('Last startup took {0:N1} s ({1:N1} s until the desktop, {2:N1} s more until it settled). Average of the last {3}: {4:N1} s.' -f ($last.BootMs / 1000), ($last.MainMs / 1000), ($last.PostMs / 1000), $boots.Count, ($avg / 1000))
+        # Bar chart: teal = until desktop, purple = settling after sign-in.
+        $c = $ui.BootChart; $c.Children.Clear()
+        $w = [Math]::Max(300, $c.ActualWidth); $hgt = 150
+        $max = [Math]::Max(1, ($boots | Measure-Object BootMs -Maximum).Maximum)
+        $bw = [Math]::Min(40, ($w - 20) / $boots.Count - 6)
+        for ($i = 0; $i -lt $boots.Count; $i++) {
+            $b = $boots[$i]; $x = 10 + $i * ($bw + 6)
+            $mainH = ($hgt - 24) * $b.MainMs / $max; $postH = ($hgt - 24) * $b.PostMs / $max
+            foreach ($seg in @(@{ H = $mainH; Y = $hgt - 18 - $mainH; Brush = $script:Res.TealGrad }, @{ H = $postH; Y = $hgt - 18 - $mainH - $postH; Brush = $script:Res.PurpleGrad })) {
+                $r = New-Object System.Windows.Shapes.Rectangle
+                $r.Width = $bw; $r.Height = [Math]::Max(1, $seg.H); $r.Fill = $seg.Brush; $r.RadiusX = 3; $r.RadiusY = 3
+                $r.ToolTip = '{0:ddd MMM d, h:mm tt}: {1:N1} s total ({2:N1} s to desktop)' -f $b.Time, ($b.BootMs / 1000), ($b.MainMs / 1000)
+                [System.Windows.Controls.Canvas]::SetLeft($r, $x); [System.Windows.Controls.Canvas]::SetTop($r, $seg.Y)
+                [void]$c.Children.Add($r)
+            }
+            if ($i -eq 0 -or $i -eq $boots.Count - 1) {
+                $lbl = New-AWText ($b.Time.ToString('MMM d')) 10 $script:Res.Dim
+                [System.Windows.Controls.Canvas]::SetLeft($lbl, $x); [System.Windows.Controls.Canvas]::SetTop($lbl, $hgt - 14)
+                [void]$c.Children.Add($lbl)
+            }
+        }
+        $ui.BootList.ItemsSource = @($h.Culprits | ForEach-Object {
+            [pscustomobject]@{ Kind = $_.Kind; Name = $_.Name; File = $_.File; Times = $_.Times; DelayText = ('{0:N1} s' -f $_.AvgSeconds); LastText = ([datetime]$_.Last).ToString('MMM d, h:mm tt') }
+        })
+    }
+}
+
+function Start-AWSecurityCheck {
+    $ui.SecInfo.Text = 'Checking...'
+    Start-AWTask -Name 'Security checks' -Work { Invoke-WTarget { Get-WSecurityPosture } } -OnComplete {
+        param($Result)
+        $order = @{ Problem = 0; Warning = 1; Info = 2; NA = 3; Good = 4 }
+        $items = @($Result | Where-Object { $_ -and $_.Name } | Sort-Object { $order[[string]$_.Status] } | ForEach-Object {
+            $s = New-Object AWiper.SecItem
+            $s.Id = $_.Id; $s.Name = $_.Name; $s.Status = $_.Status; $s.Detail = $_.Detail; $s.Fix = $_.Fix; $s.Policy = [bool]$_.Policy
+            $s.IsChecked = $s.CanFix -and $s.Status -eq 'Problem'
+            $s
+        })
+        $ui.SecList.ItemsSource = $items
+        $p = @($items | Where-Object { $_.Status -eq 'Problem' }).Count; $w = @($items | Where-Object { $_.Status -eq 'Warning' }).Count
+        $ui.SecInfo.Text = "$p problem(s), $w warning(s), $(@($items | Where-Object { $_.CanFix }).Count) item(s) AWiper can fix."
+        $ui.SecFix.IsEnabled = (Test-AWCanAdmin)
+    }
+}
+
+function Start-AWSecurityFix {
+    $sel = @(@($ui.SecList.ItemsSource) | Where-Object { $_ -and $_.IsChecked -and $_.CanFix })
+    if (-not $sel.Count) { Show-AWMessage 'Check the items to fix first (only items with a checkbox can be fixed).'; return }
+    $pol = @($sel | Where-Object { $_.Policy })
+    $extra = if ($pol.Count) { "`n`n$($pol.Count) of these are set by Group Policy, which may undo the fix at the next policy refresh." } else { '' }
+    if (-not (Confirm-AW "Apply these fixes$(Get-AWWhere)?`n`n$(($sel | ForEach-Object { "  - $($_.Name)" }) -join "`n")$extra`n`nEach one can be undone from Rebloat > Undo history.")) { return }
+    Write-AWAction 'SecurityFix' ($sel | ForEach-Object Fix) @{} 'Started'
+    Start-AWTask -Name 'Security fixes' -Arguments @{ Ids = @($sel | ForEach-Object Fix) } -Work {
+        foreach ($id in $Ids) {
+            try { Invoke-WTarget { param($x) Invoke-WSecurityFix $x } -ArgumentList @($id) } catch { Write-WLog "$($id): $($_.Exception.Message)" 'ERROR' }
+        }
+    } -OnComplete {
+        param($r)
+        foreach ($cap in @($r | Where-Object { $_ -and $_.UndoKind })) { $uid = Add-AWUndoEntry $cap; Write-AWAction 'SecurityFix' @($cap.Label) @{} 'Done' $uid }
+        if ($script:Loaded['Rebloat']) { Update-AWUndoList }
+        Start-AWSecurityCheck
+    }
+}
+
+function Start-AWPrivacyCheck {
+    $ui.PrivInfo.Text = 'Reading...'; $ui.PupInfo.Text = 'Sweeping...'
+    Start-AWTask -Name 'Privacy and adware sweep' -Work {
+        [pscustomobject]@{ Usage = @(Invoke-WTarget { Get-WPrivacyUsage }); Pup = @(Invoke-WTarget { Get-WPupSweep }) }
+    } -OnComplete {
+        param($Result)
+        $r = @($Result | Where-Object { $_ -and $null -ne $_.Usage }) | Select-Object -Last 1
+        $use = @($r.Usage | Where-Object { $_ } | Sort-Object LastUsed -Descending | ForEach-Object {
+            [pscustomobject]@{ Capability = $_.Capability; App = $_.App; LastText = ([datetime]$_.LastUsed).ToString('MMM d yyyy, h:mm tt'); NowText = $(if ($_.InUse) { 'IN USE' } else { '' }) }
+        })
+        $ui.PrivList.ItemsSource = $use
+        $now = @($use | Where-Object { $_.NowText }).Count
+        $ui.PrivInfo.Text = "$($use.Count) app(s) on record" + $(if ($now) { " - $now in use right now" } else { '' }) + '. Windows keeps only the most recent use per app.' + $(if (Test-AWRemote) { ' On a remote PC this shows the connecting account and system apps only.' } else { '' })
+        $pup = @($r.Pup | Where-Object { $_ })
+        $ui.PupList.ItemsSource = $pup
+        $warn = @($pup | Where-Object { $_.Severity -eq 'Warning' }).Count
+        $ui.PupInfo.Text = if (-not $pup.Count) { 'Nothing suspicious found: no forced extensions, hijacked browser settings or unsigned startup programs in user folders.' } else { "$($pup.Count) item(s), $warn worth a look. Report only - nothing is changed." }
+    }
+}
+
+function New-AWSupportBundle {
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.FileName = 'AWiper-support-{0}-{1:yyyyMMdd-HHmm}.zip' -f $env:COMPUTERNAME, (Get-Date)
+    $dlg.Filter = 'Zip file (*.zip)|*.zip'
+    $dlg.InitialDirectory = [Environment]::GetFolderPath('Desktop')
+    if (-not $dlg.ShowDialog($window)) { return }
+    $zip = $dlg.FileName
+    Write-AWAction 'SupportBundle' @($zip) @{} 'Started'
+    $saved = $script:Target; $script:Target = $null
+    try {
+        Start-AWTask -Name 'Create support bundle' -Arguments @{ Zip = $zip; Health = @($script:HealthResults); Version = $script:AppVersion; LogFile = $script:LogFile } -Work {
+            $dir = Join-Path ([IO.Path]::GetTempPath()) ('AWiper-support-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $dir | Out-Null
+            $q = '*[System[TimeCreated[timediff(@SystemTime) <= 604800000]]]'
+            foreach ($log in 'System', 'Application') {
+                $Sync.Status = "Exporting the $log log..."
+                & wevtutil.exe epl $log (Join-Path $dir "$log.evtx") "/q:$q" 2>&1 | Out-Null
+            }
+            $Sync.Status = 'Collecting system information...'
+            & systeminfo.exe /fo list 2>&1 | Out-File (Join-Path $dir 'systeminfo.txt') -Encoding UTF8
+            & ipconfig.exe /all 2>&1 | Out-File (Join-Path $dir 'ipconfig.txt') -Encoding UTF8
+            & driverquery.exe /v /fo csv 2>&1 | Out-File (Join-Path $dir 'drivers.csv') -Encoding UTF8
+            $rows = if ($Health.Count) { $Health } else { @(Get-WHealth) }
+            ConvertTo-Json -InputObject @($rows) -Depth 4 | Out-File (Join-Path $dir 'health.json') -Encoding UTF8
+            ConvertTo-Json -InputObject @(Get-WEventTriage 30) -Depth 4 | Out-File (Join-Path $dir 'events-triage.json') -Encoding UTF8
+            Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                Where-Object DisplayName | Select-Object DisplayName, DisplayVersion, Publisher, InstallDate | Export-Csv (Join-Path $dir 'programs.csv') -NoTypeInformation -Encoding UTF8
+            if (Test-Path -LiteralPath $LogFile) { Get-Content -LiteralPath $LogFile -Tail 2000 | Out-File (Join-Path $dir 'AWiper.log') -Encoding UTF8 }
+            "Created by AWiper $Version on $(Get-Date -Format o) for $env:COMPUTERNAME. Contains the last 7 days of System/Application events, system and network info, drivers, installed programs and AWiper's health and event reports. Review before sharing - it includes your computer and user names." |
+                Out-File (Join-Path $dir 'README.txt') -Encoding UTF8
+            if (Test-Path -LiteralPath $Zip) { Remove-Item -LiteralPath $Zip -Force }
+            Compress-Archive -Path (Join-Path $dir '*') -DestinationPath $Zip
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-WLog "Support bundle saved: $Zip"
+            $Zip
+        } -OnComplete { param($r) $z = @($r | Where-Object { $_ -is [string] }) | Select-Object -Last 1; if ($z -and (Test-Path -LiteralPath $z)) { Open-AWExplorer $z; $script:IdleStatus = 'Support bundle created' } }
+    } finally { $script:Target = $saved }
+}
+
+$ui.HTabChecks.Add_Checked({ Show-AWHealthTab 'Checks' })
+$ui.HTabEvents.Add_Checked({ Show-AWHealthTab 'Events' })
+$ui.HTabBoot.Add_Checked({ Show-AWHealthTab 'Boot' })
+$ui.HTabSec.Add_Checked({ Show-AWHealthTab 'Sec' })
+$ui.HTabPriv.Add_Checked({ Show-AWHealthTab 'Priv' })
+$ui.EvtDays7.Add_Checked({ if ($script:HTabLoaded['Events']) { Start-AWEventTriage } })
+$ui.EvtDays30.Add_Checked({ if ($script:HTabLoaded['Events']) { Start-AWEventTriage } })
+$ui.EvtViewer.Add_Click({ Start-Process eventvwr.msc })
+$ui.EvtBundle.Add_Click({ New-AWSupportBundle })
+$ui.BootStartup.Add_Click({ Select-AWView 'Startup' })
+$ui.SecRefresh.Add_Click({ Start-AWSecurityCheck })
+$ui.SecFix.Add_Click({ Start-AWSecurityFix })
+$ui.PrivRefresh.Add_Click({ Start-AWPrivacyCheck })
+$ui.PrivSettings.Add_Click({ Start-Process 'ms-settings:privacy-webcam' })
+$ui.PupOpen.Add_Click({
+    $i = $ui.PupList.SelectedItem
+    if (-not $i) { Show-AWMessage 'Select an item first.'; return }
+    if ($i.Path -like 'HK*') { Show-AWMessage "This is in the registry:`n$($i.Path)`n`nOpen Registry Editor (regedit) to review it." }
+    elseif (Test-Path -LiteralPath $i.Path) { Open-AWExplorer $i.Path }
+    else { Show-AWMessage "$($i.Path) no longer exists." }
+})
 #endregion
 
 #region ---------------------------------------------------------------- Online / offline status
@@ -6917,8 +8070,9 @@ function Start-AWUndo {
     if ($e.Target -ne $here) { Show-AWMessage "This change was made on $($e.Target). Connect to that computer first (title bar), then undo it."; return }
     if (-not (Confirm-AW "Undo: $($e.Label)?`n`nThe settings go back exactly as they were before that change.")) { return }
     $script:PendingUndo = $e
-    Start-AWTask -Name 'Undo change' -Arguments @{ Snap = @($e.Snapshot); Keys = @($e.RemoveKeys) } -Work {
-        Invoke-WTarget { param($s, $k) Restore-WRegSnapshot $s $k } -ArgumentList @($Snap, $Keys)
+    Start-AWTask -Name 'Undo change' -Arguments @{ Snap = @($e.Snapshot); Keys = @($e.RemoveKeys); Kind = [string]$e.Kind; Revert = [string]$e.Revert } -Work {
+        if ($Kind -eq 'Script') { Invoke-WTarget ([scriptblock]::Create($Revert)) }
+        else { Invoke-WTarget { param($s, $k) Restore-WRegSnapshot $s $k } -ArgumentList @($Snap, $Keys) }
         Write-WLog 'Previous values restored'
     } -OnComplete {
         param($r)
@@ -7623,6 +8777,125 @@ foreach ($b in @($ui.RPSize5, $ui.RPSize10, $ui.RPSize15)) { $b.Add_Click({ para
 $ui.RPAuto.Add_Checked({ $script:State.AutoRestorePoint = $true; Save-AWState })
 $ui.RPAuto.Add_Unchecked({ $script:State.AutoRestorePoint = $false; Save-AWState })
 
+# ---------------- Folder backup
+function Update-AWBackupUI {
+    $b = $script:State.Backup
+    $ui.BkSources.ItemsSource = @($b.Sources)
+    $ui.BkDest.Text = [string]$b.Dest
+    $ui.BkKeep.Text = [string]$b.Keep
+    $ui.BkDaily.IsChecked = [bool]$b.Daily
+    $ui.BkTime.Text = [string]$b.Time
+    Update-AWBackupDestInfo
+    $ui.BkLast.Text = if ($b.LastRun) { "Last backup: $(try { ([datetime]$b.LastRun).ToString('ddd MMM d, h:mm tt') } catch { $b.LastRun }) - $($b.LastResult)" } else { 'No backup has run yet.' }
+}
+
+function Update-AWBackupDestInfo {
+    $b = $script:State.Backup
+    $msg = ''; $color = $script:Res.Muted
+    if ($b.Dest) {
+        if (-not (Test-Path -LiteralPath $b.Dest)) { $msg = 'The backup drive is not connected right now.'; $color = $script:Res.Amber }
+        else {
+            $vid = [AWiper.Native]::VolumeId($b.Dest)
+            $drv = try { New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($b.Dest)) } catch { $null }
+            $free = if ($drv -and $drv.IsReady) { "$(Format-AWSize $drv.AvailableFreeSpace) free" + $(if ($drv.VolumeLabel) { " on $($drv.VolumeLabel)" } else { '' }) } else { '' }
+            if ($b.DestVolumeId -and $vid -ne $b.DestVolumeId) { $msg = 'A different drive is using this letter now - choose the backup drive again.'; $color = $script:Res.Danger }
+            elseif (@($b.Sources | Where-Object { [AWiper.Native]::VolumeId($_) -eq $vid }).Count) { $msg = "$free. Warning: some folders are on this same drive - a backup there won't survive the drive failing."; $color = $script:Res.Amber }
+            else { $msg = "$free. Backups go to AWiper-Backup\$env:COMPUTERNAME there."; $color = $script:Res.Teal }
+        }
+    }
+    $ui.BkDestInfo.Text = $msg; $ui.BkDestInfo.Foreground = $color
+}
+
+# Reads the form into the saved job, and creates / removes the daily scheduled task.
+function Save-AWBackupJob([switch]$Quiet) {
+    $b = $script:State.Backup
+    $keep = 0; if (-not [int]::TryParse($ui.BkKeep.Text.Trim(), [ref]$keep) -or $keep -lt 1) { Show-AWMessage 'Enter how many older versions to keep (1 or more).'; return $false }
+    $time = $ui.BkTime.Text.Trim()
+    if ($ui.BkDaily.IsChecked -and $time -notmatch '^([01]?\d|2[0-3]):[0-5]\d$') { Show-AWMessage 'Enter the time as HH:mm, e.g. 19:00.'; return $false }
+    $b.Keep = $keep; $b.Time = $time; $b.Daily = [bool]$ui.BkDaily.IsChecked
+    Save-AWState
+    $task = Get-ScheduledTask -TaskName 'AWiper Backup' -ErrorAction SilentlyContinue
+    try {
+        if ($b.Daily -and @($b.Sources).Count -and $b.Dest) {
+            $exe = (Get-Process -Id $PID).Path
+            $action = New-ScheduledTaskAction -Execute $exe -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Backup -Yes"
+            $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]::ParseExact($time, 'H:mm', $null))
+            $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+            Register-ScheduledTask -TaskName 'AWiper Backup' -Action $action -Trigger $trigger -Settings $settings -Description 'Folder backup set up in AWiper (Recovery > Backup).' -Force | Out-Null
+            Write-AWLog "Daily backup scheduled at $time"
+            Write-AWAction 'BackupSchedule' @("daily $time") @{} 'Done'
+        } elseif ($task) {
+            Unregister-ScheduledTask -TaskName 'AWiper Backup' -Confirm:$false
+            Write-AWLog 'Daily backup schedule removed'
+            Write-AWAction 'BackupSchedule' @('removed') @{} 'Done'
+        }
+    } catch { Show-AWMessage "Could not update the schedule: $($_.Exception.Message)" 'Error'; return $false }
+    if (-not $Quiet) { Set-AWStatus 'Backup settings saved' }
+    $true
+}
+
+function Start-AWBackupNow {
+    $b = $script:State.Backup
+    if (-not @($b.Sources).Count) { Show-AWMessage 'Add at least one folder to back up.'; return }
+    if (-not $b.Dest) { Show-AWMessage 'Choose the backup drive first.'; return }
+    if (-not (Save-AWBackupJob -Quiet)) { return }
+    Write-AWAction 'Backup' @($b.Sources) @{ Dest = $b.Dest } 'Started'
+    $ui.BkRun.IsEnabled = $false
+    $saved = $script:Target; $script:Target = $null
+    try {
+        Start-AWTask -Name 'Folder backup' -Arguments @{ Job = [pscustomobject]$b } -Work { Invoke-WBackup $Job } -OnComplete {
+            param($r)
+            $ui.BkRun.IsEnabled = $true
+            $res = @($r | Where-Object { $_ -and $null -ne $_.Ok }) | Select-Object -Last 1
+            if ($res) {
+                $script:State.Backup.LastRun = (Get-Date).ToString('o'); $script:State.Backup.LastResult = $res.Message; Save-AWState
+                Write-AWAction 'Backup' @($script:State.Backup.Dest) @{} $(if ($res.Ok) { 'Done' } else { 'Problems' })
+                $script:IdleStatus = "Backup: $($res.Message)"
+                if (-not $res.Ok) { Show-AWMessage $res.Message 'Warning' }
+            }
+            Update-AWBackupUI
+        }
+    } finally { $script:Target = $saved }
+}
+
+$ui.BkAddMine.Add_Click({
+    $b = $script:State.Backup
+    foreach ($f in 'MyDocuments', 'MyPictures', 'Desktop', 'MyVideos', 'MyMusic') {
+        $p = [Environment]::GetFolderPath($f)
+        if ($p -and (Test-Path -LiteralPath $p) -and $b.Sources -notcontains $p) { $b.Sources = @($b.Sources) + $p }
+    }
+    Save-AWState; Update-AWBackupUI
+})
+$ui.BkAdd.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Add a folder to back up'
+    if ($dlg.ShowDialog() -ne 'OK') { return }
+    $b = $script:State.Backup
+    if ($b.Sources -notcontains $dlg.SelectedPath) { $b.Sources = @($b.Sources) + $dlg.SelectedPath }
+    Save-AWState; Update-AWBackupUI
+})
+$ui.BkRemove.Add_Click({
+    $sel = $ui.BkSources.SelectedItem
+    if (-not $sel) { Show-AWMessage 'Select a folder to remove from the list (nothing is deleted).'; return }
+    $script:State.Backup.Sources = @($script:State.Backup.Sources | Where-Object { $_ -ne $sel })
+    Save-AWState; Update-AWBackupUI
+})
+$ui.BkBrowse.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Choose where backups go (an external drive is best)'
+    $dlg.ShowNewFolderButton = $true
+    if ($dlg.ShowDialog() -ne 'OK') { return }
+    $script:State.Backup.Dest = $dlg.SelectedPath
+    $script:State.Backup.DestVolumeId = [AWiper.Native]::VolumeId($dlg.SelectedPath)
+    Save-AWState; Update-AWBackupUI
+})
+$ui.BkSave.Add_Click({ [void](Save-AWBackupJob) })
+$ui.BkRun.Add_Click({ Start-AWBackupNow })
+$ui.BkOpen.Add_Click({
+    $d = Join-Path ([string]$script:State.Backup.Dest) "AWiper-Backup\$env:COMPUTERNAME"
+    if ($script:State.Backup.Dest -and (Test-Path -LiteralPath $d)) { Open-AWExplorer $d } else { Show-AWMessage 'There is no backup on that drive yet.' }
+})
+
 # ---------------- Tabs, remote handling, wiring
 function Update-AWRecoveryButtons {
     $remote = Test-AWRemote
@@ -7633,8 +8906,9 @@ function Update-AWRecoveryButtons {
     $ui.RecTabDeep.IsEnabled = -not $remote
     $ui.RecTabUndel.IsEnabled = -not $remote
     $ui.RecTabRP.IsEnabled = -not $remote
+    $ui.RecTabBackup.IsEnabled = -not $remote
     $tip = if ($remote) { 'Only available on this PC' } else { $null }
-    foreach ($c in @($ui.RecTabShadow, $ui.RecTabDeep, $ui.RecTabUndel, $ui.RecTabRP, $ui.BinRestoreTo, $ui.BinOpen)) {
+    foreach ($c in @($ui.RecTabShadow, $ui.RecTabDeep, $ui.RecTabUndel, $ui.RecTabRP, $ui.RecTabBackup, $ui.BinRestoreTo, $ui.BinOpen)) {
         $c.ToolTip = $tip; [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($c, $true)
     }
     if ($remote -and -not $ui.RecTabBin.IsChecked) { $ui.RecTabBin.IsChecked = $true }
@@ -7646,11 +8920,13 @@ function Show-AWRecoveryTab([string]$Tab) {
     $ui.RecPanelDeep.Visibility   = if ($Tab -eq 'Deep')   { 'Visible' } else { 'Collapsed' }
     $ui.RecPanelUndel.Visibility  = if ($Tab -eq 'Undel')  { 'Visible' } else { 'Collapsed' }
     $ui.RecPanelRP.Visibility     = if ($Tab -eq 'RP')     { 'Visible' } else { 'Collapsed' }
+    $ui.RecPanelBackup.Visibility = if ($Tab -eq 'Backup') { 'Visible' } else { 'Collapsed' }
     if (-not $script:RecLoadedTabs[$Tab]) {
         $script:RecLoadedTabs[$Tab] = $true
         if ($Tab -eq 'Shadow') { Update-AWShadowList }
         if ($Tab -eq 'Deep')   { Update-AWWinfrStatus }
         if ($Tab -eq 'RP')     { Update-AWRestorePoints }
+        if ($Tab -eq 'Backup') { Update-AWBackupUI }
     }
 }
 
@@ -7661,7 +8937,7 @@ function Initialize-AWRecovery {
     Update-AWRecoveryButtons
     Update-AWRecoveryDrives
     Update-AWBinList
-    if ($ui.RecTabShadow.IsChecked) { Show-AWRecoveryTab 'Shadow' } elseif ($ui.RecTabDeep.IsChecked) { Show-AWRecoveryTab 'Deep' } elseif ($ui.RecTabUndel.IsChecked) { Show-AWRecoveryTab 'Undel' } elseif ($ui.RecTabRP.IsChecked) { Show-AWRecoveryTab 'RP' }
+    if ($ui.RecTabShadow.IsChecked) { Show-AWRecoveryTab 'Shadow' } elseif ($ui.RecTabDeep.IsChecked) { Show-AWRecoveryTab 'Deep' } elseif ($ui.RecTabUndel.IsChecked) { Show-AWRecoveryTab 'Undel' } elseif ($ui.RecTabRP.IsChecked) { Show-AWRecoveryTab 'RP' } elseif ($ui.RecTabBackup.IsChecked) { Show-AWRecoveryTab 'Backup' }
 }
 
 $ui.RecTabBin.Add_Checked({ Show-AWRecoveryTab 'Bin' })
@@ -7669,6 +8945,7 @@ $ui.RecTabShadow.Add_Checked({ Show-AWRecoveryTab 'Shadow' })
 $ui.RecTabDeep.Add_Checked({ Show-AWRecoveryTab 'Deep' })
 $ui.RecTabUndel.Add_Checked({ Show-AWRecoveryTab 'Undel' })
 $ui.RecTabRP.Add_Checked({ Show-AWRecoveryTab 'RP' })
+$ui.RecTabBackup.Add_Checked({ Show-AWRecoveryTab 'Backup' })
 
 $ui.BinSearch.Add_TextChanged({ Update-AWBinView })
 $ui.BinRefresh.Add_Click({ Update-AWBinList })
