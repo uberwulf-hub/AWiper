@@ -16,6 +16,10 @@
                        Windows File Recovery, per-drive recoverability (SSD/TRIM) check
       * Startup      - enable / disable startup entries (same StartupApproved switches Task Manager uses)
       * Programs     - installed software list with size, search and uninstall
+      * Drivers      - installed drivers with their vendor, age and problems; updates from Windows Update;
+                       vendor / PC maker download pages, Update Catalog lookup, driver backup and restore
+      * BIOS         - firmware version, boot mode, Secure Boot, TPM, virtualization, boot order and (Dell, HP,
+                       Lenovo business PCs) every BIOS setup option - view only; restart into BIOS setup
       * Debloat      - remove preinstalled Store apps, turn off ads, suggestions, Copilot and other extras
       * Rebloat      - reinstall removed apps (from the copy on disk or the Microsoft Store), restore default settings
       * Tools        - quick fixes (DNS, Group Policy, Explorer), repair (SFC, DISM, Windows Update reset,
@@ -76,6 +80,9 @@
 .PARAMETER RestorePoint
     Headless: create a restore point with this description before the other changes.
 
+.PARAMETER CheckDrivers
+    Headless: list devices with driver problems, driver updates Windows Update offers, and old third-party drivers.
+
 .PARAMETER ComputerName
     Headless: run against another PC over WinRM. Use with -Credential or -UseSavedCredential.
 
@@ -112,7 +119,7 @@
 
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.5.0
+    Version : 1.6.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -135,6 +142,7 @@ param(
     [switch]$ListRules,
     [switch]$ListTweaks,
     [switch]$ListApps,
+    [switch]$CheckDrivers,           # list driver problems and updates Windows Update offers
     [string]$ComputerName,           # run against a remote PC over WinRM
     [pscredential]$Credential,
     [switch]$UseSavedCredential,     # use credentials saved for -ComputerName in Credential Manager
@@ -146,9 +154,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.5.0'
+$script:AppVersion = '1.6.0'
 $script:CliMode = [bool]($Config -or $Analyze -or $Clean -or $HealthCheck -or $ApplyTweak -or $RevertTweak -or $RemoveApp -or
-                         $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps)
+                         $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps -or $CheckDrivers)
 
 # Under App Control / AppLocker, unsigned scripts run in ConstrainedLanguage mode, which blocks WPF,
 # embedded C# and most .NET/COM use. Explain instead of failing with a wall of red text.
@@ -277,6 +285,30 @@ namespace AWiper
         public string Status { get; set; }
         public string SizeText { get { return Fmt.Size(Size); } }
         public string ModifiedText { get { return Modified == DateTime.MinValue ? "" : Modified.ToString("yyyy-MM-dd HH:mm"); } }
+    }
+
+    public class DriverEntry
+    {
+        public bool IsChecked { get; set; }
+        public string Name { get; set; }
+        public string Class { get; set; }
+        public string Provider { get; set; }
+        public string Version { get; set; }
+        public DateTime Date { get; set; }
+        public string Inf { get; set; }
+        public string DeviceId { get; set; }
+        public string HardwareId { get; set; }
+        public string Vendor { get; set; }
+        public string VendorUrl { get; set; }
+        public string Status { get; set; }
+        public string UpdateText { get; set; }
+        public string UpdateId { get; set; }
+        public string Note { get; set; }
+        public int ErrorCode { get; set; }
+        public bool IsMicrosoft { get; set; }
+        public bool HasUpdate { get; set; }
+        public string DateText { get { return Date == DateTime.MinValue ? "" : Date.ToString("yyyy-MM-dd"); } }
+        public int SortRank { get { return ErrorCode != 0 ? 0 : (HasUpdate ? 1 : 2); } }
     }
 
     public class RecycleEntry
@@ -1625,6 +1657,212 @@ function Test-WResourceManifest([string]$Root) {
     [pscustomobject]@{ Ok = $ok; Bad = $bad; Created = [string]$doc.Created }
 }
 
+# ---------------------------------------------------------------- Drivers
+# Installed drivers joined with each device's hardware / compatible IDs, plus the PC's make, model,
+# BIOS and any maker update tools that are installed.
+function Get-WDriverInventory {
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+    $csp = Get-CimInstance Win32_ComputerSystemProduct -ErrorAction SilentlyContinue
+    $toolPattern = 'Dell Command \| Update|SupportAssist|HP Support Assistant|HP Image Assistant|Lenovo (System Update|Vantage|Commercial Vantage)|Driver (&|and) Support Assistant|NVIDIA App|GeForce Experience|AMD Software|MSI Center|Dragon Center|MyASUS|Armoury Crate|Acer Care Center'
+    $tools = @()
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*') {
+        $tools += @(Get-ItemProperty -Path $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match $toolPattern } | ForEach-Object { [string]$_.DisplayName })
+    }
+    try { $tools += @(Get-AppxPackage -ErrorAction Stop | Where-Object { $_.Name -match 'MSICenter|MSI\.Center|MyASUS|ArmouryCrate|LenovoVantage|LenovoCompanion|DellCommandUpdate|SupportAssist|HPSupportAssistant|NVIDIAControlPanel' } | ForEach-Object { [string]$_.Name }) } catch { }
+    $system = [pscustomobject]@{
+        Manufacturer = [string]$cs.Manufacturer; Model = [string]$cs.Model; Family = [string]$csp.Version
+        Serial = [string]$bios.SerialNumber; Bios = [string]$bios.SMBIOSBIOSVersion
+        BiosDate = $(if ($bios.ReleaseDate) { [datetime]$bios.ReleaseDate } else { [datetime]::MinValue })
+        Tools = @($tools | Select-Object -Unique)
+    }
+    $ents = @{}
+    foreach ($e in @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue)) { $ents[[string]$e.PNPDeviceID] = $e }
+    $drivers = foreach ($d in @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { $_.DeviceName -and $_.DeviceID })) {
+        $e = $ents[[string]$d.DeviceID]
+        [pscustomobject]@{
+            DeviceId = [string]$d.DeviceID; Name = [string]$d.DeviceName; Class = [string]$d.DeviceClass
+            Provider = [string]$d.DriverProviderName; Manufacturer = [string]$d.Manufacturer; Version = [string]$d.DriverVersion
+            Date = $(if ($d.DriverDate) { [datetime]$d.DriverDate } else { [datetime]::MinValue }); Inf = [string]$d.InfName
+            HardwareIds = @(@($e.HardwareID) + @($e.CompatibleID) + @($d.HardWareID) | Where-Object { $_ } | ForEach-Object { [string]$_ } | Select-Object -Unique)
+            ErrorCode = $(if ($e) { [int]$e.ConfigManagerErrorCode } else { 0 })
+        }
+    }
+    [pscustomobject]@{ System = $system; Drivers = @($drivers) }
+}
+
+# Driver updates Windows Update offers this PC (needs internet; ~10-60 s). Tries Windows Update
+# directly first, then whatever update service the PC is configured for (e.g. WSUS).
+function Open-WDriverSearch {
+    $s = New-Object -ComObject Microsoft.Update.Session
+    $s.ClientApplicationID = 'AWiper'
+    $q = $s.CreateUpdateSearcher(); $q.Online = $true
+    $err = ''
+    foreach ($sel in 2, 0) {
+        try {
+            $q.ServerSelection = $sel
+            $res = $q.Search("IsInstalled=0 and Type='Driver' and IsHidden=0")
+            return [pscustomobject]@{ Session = $s; Result = $res; Source = $(if ($sel -eq 2) { 'Windows Update' } else { 'your update service' }) }
+        } catch { $err = $_.Exception.Message }
+    }
+    throw "Windows Update could not be searched: $err"
+}
+
+function Get-WDriverUpdates {
+    $o = Open-WDriverSearch
+    foreach ($u in $o.Result.Updates) {
+        [pscustomobject]@{
+            UpdateId = [string]$u.Identity.UpdateID; Title = [string]$u.Title; Provider = [string]$u.DriverProvider
+            Manufacturer = [string]$u.DriverManufacturer; Model = [string]$u.DriverModel; Class = [string]$u.DriverClass
+            HardwareId = [string]$u.DriverHardwareID; VerDate = $(try { [datetime]$u.DriverVerDate } catch { [datetime]::MinValue })
+            Size = [long]$u.MaxDownloadSize; Source = $o.Source
+        }
+    }
+}
+
+# Downloads and installs the chosen driver updates through Windows Update (local, admin).
+function Install-WDriverUpdates([string[]]$UpdateIds) {
+    $o = Open-WDriverSearch
+    $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+    foreach ($u in $o.Result.Updates) {
+        if ($UpdateIds -contains [string]$u.Identity.UpdateID) {
+            if (-not $u.EulaAccepted) { $u.AcceptEula() }
+            [void]$coll.Add($u)
+        }
+    }
+    if ($coll.Count -eq 0) { Write-WLog 'None of the selected updates are offered any more' 'WARN'; return [pscustomobject]@{ Installed = 0; Failed = 0; Reboot = $false } }
+    $Sync.Status = "Downloading $($coll.Count) driver update(s)..."
+    $dl = $o.Session.CreateUpdateDownloader(); $dl.Updates = $coll; [void]$dl.Download()
+    $Sync.Status = "Installing $($coll.Count) driver update(s)..."
+    $in = $o.Session.CreateUpdateInstaller(); $in.Updates = $coll
+    $r = $in.Install()
+    $ok = 0; $bad = 0
+    for ($i = 0; $i -lt $coll.Count; $i++) {
+        $code = $r.GetUpdateResult($i).ResultCode
+        if ($code -eq 2 -or $code -eq 3) { $ok++; Write-WLog "Installed: $($coll.Item($i).Title)" }
+        else { $bad++; Write-WLog "Failed (result $code): $($coll.Item($i).Title)" 'ERROR' }
+    }
+    if ($r.RebootRequired) { Write-WLog 'Restart the PC to finish installing the driver updates' 'WARN' }
+    [pscustomobject]@{ Installed = $ok; Failed = $bad; Reboot = [bool]$r.RebootRequired }
+}
+
+# ---------------------------------------------------------------- BIOS / firmware (read-only)
+# Firmware facts every PC exposes, plus the full BIOS setup options where the maker publishes them
+# to Windows (Dell, HP and Lenovo business PCs). Nothing is ever written to the firmware.
+function Get-WFirmwareInfo {
+    $rows = New-Object System.Collections.Generic.List[object]
+    $add = { param($Section, $Name, $Value, $Note = '', $Flag = '') $rows.Add([pscustomobject]@{ Section = $Section; Name = $Name; Value = [string]$Value; Note = [string]$Note; Flag = $Flag }) }
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $needAdmin = 'Needs administrator rights to read'
+
+    $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $bb = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue
+    $date = if ($bios.ReleaseDate) { [datetime]$bios.ReleaseDate } else { $null }
+    $mode = if ($env:firmware_type) { $env:firmware_type } else { try { [string](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control' -ErrorAction Stop).PEFirmwareType -replace '^2$', 'UEFI' -replace '^1$', 'Legacy' } catch { 'Unknown' } }
+    & $add 'Firmware' 'Maker' $bios.Manufacturer
+    & $add 'Firmware' 'Version' $bios.SMBIOSBIOSVersion
+    $age = if ($date) { [int](((Get-Date) - $date).TotalDays / 365.25 * 10) / 10 } else { 0 }
+    & $add 'Firmware' 'Release date' $(if ($date) { $date.ToString('yyyy-MM-dd') } else { 'Unknown' }) $(if ($age -ge 2) { "$age years old - check the PC maker's support page for a BIOS update" } else { '' }) $(if ($age -ge 2) { 'Warn' } else { '' })
+    & $add 'Firmware' 'Boot mode' $mode $(if ($mode -eq 'Legacy') { 'Legacy (CSM) boot - Windows 11 needs UEFI' } else { '' }) $(if ($mode -eq 'Legacy') { 'Warn' } else { '' })
+    & $add 'Firmware' 'SMBIOS version' ('{0}.{1}' -f $bios.SMBIOSMajorVersion, $bios.SMBIOSMinorVersion)
+    if ($bios.EmbeddedControllerMajorVersion -ne $null -and $bios.EmbeddedControllerMajorVersion -lt 255) { & $add 'Firmware' 'Embedded controller' ('{0}.{1}' -f $bios.EmbeddedControllerMajorVersion, $bios.EmbeddedControllerMinorVersion) }
+    & $add 'Firmware' 'Serial number' $bios.SerialNumber
+    & $add 'System' 'Model' ("$($cs.Manufacturer) $($cs.Model)".Trim())
+    if ($bb) { & $add 'System' 'Motherboard' ("$($bb.Manufacturer) $($bb.Product) $($bb.Version)".Trim()) }
+
+    # Secure Boot (readable without admin via the registry)
+    try {
+        $sb = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -ErrorAction Stop).UEFISecureBootEnabled
+        & $add 'Security' 'Secure Boot' $(if ($sb -eq 1) { 'On' } else { 'Off' }) $(if ($sb -ne 1) { 'Recommended: On. Windows 11 requires Secure Boot support.' } else { '' }) $(if ($sb -ne 1) { 'Warn' } else { 'Good' })
+    } catch { & $add 'Security' 'Secure Boot' 'Not supported' 'This firmware has no Secure Boot (legacy BIOS)' 'Warn' }
+
+    # TPM
+    try {
+        $tpm = Get-CimInstance -Namespace root/cimv2/Security/MicrosoftTpm -ClassName Win32_Tpm -ErrorAction Stop
+        if ($tpm) {
+            $ver = ([string]$tpm.SpecVersion).Split(',')[0].Trim()
+            $on = $tpm.IsEnabled_InitialValue -and $tpm.IsActivated_InitialValue
+            & $add 'Security' 'TPM' ("$ver - " + $(if ($on) { 'enabled' } else { 'disabled' })) $(if ($ver -notlike '2*') { 'Windows 11 requires TPM 2.0' } elseif (-not $on) { 'Turn the TPM on in the BIOS (often called PTT, fTPM or Security Chip)' } else { '' }) $(if ($ver -like '2*' -and $on) { 'Good' } else { 'Warn' })
+            & $add 'Security' 'TPM maker' ("$($tpm.ManufacturerIdTxt) $($tpm.ManufacturerVersion)".Trim())
+        } else { & $add 'Security' 'TPM' 'Not found' 'No TPM, or it is turned off in the BIOS' 'Warn' }
+    } catch { & $add 'Security' 'TPM' $(if ($isAdmin) { 'Not available' } else { $needAdmin }) '' }
+
+    # Virtualization-based security / Credential Guard / memory integrity
+    try {
+        $dg = Get-CimInstance -Namespace root/Microsoft/Windows/DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction Stop
+        $vbs = switch ([int]$dg.VirtualizationBasedSecurityStatus) { 2 { 'Running' } 1 { 'Enabled, not running' } default { 'Off' } }
+        & $add 'Security' 'Virtualization-based security' $vbs
+        $svc = @($dg.SecurityServicesRunning)
+        & $add 'Security' 'Credential Guard' $(if ($svc -contains 1) { 'Running' } else { 'Off' })
+        & $add 'Security' 'Memory integrity (HVCI)' $(if ($svc -contains 2) { 'Running' } else { 'Off' })
+    } catch { }
+
+    # CPU virtualization (VT-x / AMD-V). When a hypervisor already runs, Windows reports it that way instead.
+    try {
+        $cpu = @(Get-CimInstance Win32_Processor -ErrorAction Stop)[0]
+        & $add 'Processor' 'CPU' ([string]$cpu.Name).Trim()
+        if ($cs.HypervisorPresent) { & $add 'Processor' 'Virtualization (VT-x / AMD-V)' 'In use by a hypervisor (Hyper-V, WSL 2 or VBS)' '' 'Good' }
+        else {
+            $vt = [bool]$cpu.VirtualizationFirmwareEnabled
+            & $add 'Processor' 'Virtualization (VT-x / AMD-V)' $(if ($vt) { 'Enabled in firmware' } else { 'Disabled in firmware' }) $(if (-not $vt) { 'Turn it on in the BIOS to use WSL 2, Hyper-V, Windows Sandbox or Android apps' } else { '' }) $(if ($vt) { 'Good' } else { 'Warn' })
+        }
+    } catch { }
+
+    # Firmware boot order (UEFI boot manager entries)
+    if ($mode -eq 'UEFI') {
+        if ($isAdmin) {
+            try {
+                $out = & bcdedit.exe /enum firmware 2>&1
+                $order = @(); $desc = @{}; $cur = $null
+                foreach ($l in $out) {
+                    if ($l -match '^identifier\s+(\{.+\})') { $cur = $Matches[1] }
+                    elseif ($l -match '^description\s+(.+)$' -and $cur) { $desc[$cur] = $Matches[1].Trim() }
+                    elseif ($l -match '^displayorder\s+(\{.+\})') { $order += $Matches[1] }
+                    elseif ($l -match '^\s+(\{.+\})\s*$' -and $order.Count) { $order += $Matches[1] }
+                }
+                $i = 0
+                foreach ($id in $order) { $i++; if ($desc[$id]) { & $add 'Boot order' "#$i" $desc[$id] } }
+                if (-not $i) { & $add 'Boot order' 'Boot entries' 'None reported' }
+            } catch { & $add 'Boot order' 'Boot entries' $_.Exception.Message }
+        } else { & $add 'Boot order' 'Boot entries' $needAdmin }
+    }
+
+    # Full BIOS setup options from maker WMI interfaces (business PCs).
+    $found = $false
+    try {
+        $dell = @(Get-CimInstance -Namespace root/dcim/sysman/biosattributes -ClassName EnumerationAttribute -ErrorAction Stop)
+        $dell += @(Get-CimInstance -Namespace root/dcim/sysman/biosattributes -ClassName IntegerAttribute -ErrorAction SilentlyContinue)
+        $dell += @(Get-CimInstance -Namespace root/dcim/sysman/biosattributes -ClassName StringAttribute -ErrorAction SilentlyContinue)
+        foreach ($a in $dell) { & $add 'BIOS setup (Dell)' $a.AttributeName $a.CurrentValue $(if ($a.PossibleValue) { 'Options: ' + (@($a.PossibleValue) -join ', ') } else { '' }) }
+        $found = $dell.Count -gt 0
+    } catch { }
+    if (-not $found) {
+        try {
+            $hp = @(Get-CimInstance -Namespace root/HP/InstrumentedBIOS -ClassName HP_BIOSEnumeration -ErrorAction Stop)
+            foreach ($a in $hp) { & $add 'BIOS setup (HP)' $a.Name $a.CurrentValue $(if ($a.PossibleValues) { 'Options: ' + (@($a.PossibleValues) -join ', ') } else { '' }) }
+            foreach ($a in @(Get-CimInstance -Namespace root/HP/InstrumentedBIOS -ClassName HP_BIOSString -ErrorAction SilentlyContinue)) { & $add 'BIOS setup (HP)' $a.Name $a.Value }
+            $found = $hp.Count -gt 0
+        } catch { }
+    }
+    if (-not $found) {
+        try {
+            $lv = @(Get-CimInstance -Namespace root/wmi -ClassName Lenovo_BiosSetting -ErrorAction Stop | Where-Object { $_.CurrentSetting })
+            foreach ($a in $lv) {
+                $parts = ([string]$a.CurrentSetting) -split ';', 2
+                $nv = $parts[0] -split ',', 2
+                $opt = if ($parts.Count -gt 1) { $parts[1] -replace '^\[|\]$', '' -replace '^Optional:', 'Options: ' } else { '' }
+                & $add 'BIOS setup (Lenovo)' $nv[0] $(if ($nv.Count -gt 1) { $nv[1] } else { '' }) $opt
+            }
+            $found = $lv.Count -gt 0
+        } catch { }
+    }
+    if (-not $found) {
+        & $add 'BIOS setup' 'Setup options' 'Not available from Windows' "$($cs.Manufacturer) doesn't publish BIOS setup options to Windows on this model (Dell, HP and Lenovo business PCs do). Use 'Restart into BIOS setup' to see them." 'Info'
+    }
+    $rows
+}
+
 # ---------------------------------------------------------------- Health check
 # Every row: Id, Name, Status (Good / Warning / Problem / Info / NA), Detail, Action.
 # NA means the data source isn't available here - it must never be counted as healthy.
@@ -2198,6 +2436,49 @@ missing or tampered files (SHA-256).
 }
 #endregion
 
+#region ---------------------------------------------------------------- Driver sources
+# Where a driver should come from. Matched on the driver provider first, then on the PCI / USB
+# vendor ID in the device's hardware IDs. Links were checked in Oct 2026.
+$script:DriverVendors = @(
+    @{ Name = 'Intel';    Provider = '^Intel';                         Hw = 'VEN_8086|VID_8086|VID_8087|\\VEN_INTC';   Url = 'https://www.intel.com/content/www/us/en/support/detect.html' }
+    @{ Name = 'NVIDIA';   Provider = 'NVIDIA';                         Hw = 'VEN_10DE|VID_0955';                     Url = 'https://www.nvidia.com/en-us/drivers/' }
+    @{ Name = 'AMD';      Provider = '^AMD|Advanced Micro Devices';    Hw = 'VEN_1002|VEN_1022';                     Url = 'https://www.amd.com/en/support/download/drivers.html' }
+    @{ Name = 'Realtek';  Provider = 'Realtek';                        Hw = 'VEN_10EC|VID_0BDA';                     Url = 'https://www.realtek.com/Download/Index' }
+    @{ Name = 'Qualcomm'; Provider = 'Qualcomm';                       Hw = 'VEN_17CB|VEN_168C|VEN_QCOM';            Url = 'https://www.qualcomm.com/support' }
+    @{ Name = 'Samsung';  Provider = '^Samsung';                       Hw = 'VEN_144D|VID_04E8';                     Url = 'https://semiconductor.samsung.com/consumer-storage/support/tools/' }
+    @{ Name = 'Logitech'; Provider = 'Logitech';                       Hw = 'VID_046D';                              Url = 'https://support.logi.com/' }
+)
+
+function Resolve-AWDriverVendor([string]$Provider, $HardwareIds) {
+    if ($Provider -match '^Microsoft') { return @{ Name = 'Microsoft (built into Windows)'; Url = '' } }
+    foreach ($v in $script:DriverVendors) { if ($Provider -match $v.Provider) { return @{ Name = $v.Name; Url = $v.Url } } }
+    $ids = (@($HardwareIds) -join ' ')
+    foreach ($v in $script:DriverVendors) { if ($ids -match $v.Hw) { return @{ Name = $v.Name; Url = $v.Url } } }
+    @{ Name = $Provider; Url = '' }
+}
+
+# The PC maker's driver page for this exact model (laptops often need the maker's customized drivers).
+function Get-AWOemSupport($System) {
+    $maker = [string]$System.Manufacturer; $model = [string]$System.Model
+    $q = [uri]::EscapeDataString($model)
+    $url = switch -Regex ($maker) {
+        'Dell'                  { "https://www.dell.com/support/home/en-us/product-support/servicetag/$([uri]::EscapeDataString($System.Serial))/drivers" }
+        'HP|Hewlett'            { 'https://support.hp.com/us-en/drivers' }
+        'Lenovo'                { 'https://pcsupport.lenovo.com/us/en/' }
+        'Micro-Star|^MSI'       { "https://www.msi.com/search/$q" }
+        'ASUS'                  { 'https://www.asus.com/support/download-center/' }
+        'Acer'                  { 'https://www.acer.com/us-en/support/drivers-and-manuals' }
+        'Gigabyte'              { 'https://www.gigabyte.com/Support' }
+        '^Microsoft'            { 'https://support.microsoft.com/surface/download-drivers-and-firmware-for-surface-09bb2e09-2a4b-cb69-0951-078a7739e120' }
+        'Framework'             { 'https://knowledgebase.frame.work/' }
+        default                 { 'https://www.bing.com/search?q=' + [uri]::EscapeDataString("$maker $model drivers") }
+    }
+    $short = ($maker -replace '(?i)\b(Co\.?,? ?Ltd\.?|Inc\.?|Corporation|International|Computer)\b', '' -replace '[,.]', '' -replace '\s+', ' ').Trim()
+    $friendly = if ($maker -match 'Lenovo' -and $System.Family) { $System.Family } else { $model }
+    [pscustomobject]@{ Maker = $short; Model = $friendly; Url = $url; SendsSerial = ($maker -match 'Dell') }
+}
+#endregion
+
 #region ---------------------------------------------------------------- Headless (command-line) mode
 function Write-AWCli([string]$Text, [string]$Color = '') {
     if ($Format -ne 'Text') { return }
@@ -2315,6 +2596,27 @@ function Invoke-AWCli {
         Write-AWCli ("  {0} good, {1} warning(s), {2} problem(s), {3} not available here" -f $cnt.Good, $cnt.Warning, $cnt.Problem, $cnt.NA)
         $healthCode = if ($cnt.Problem) { 4 } elseif ($cnt.Warning) { 3 } else { 0 }
         $result.Steps += [ordered]@{ Step = 'HealthCheck'; Items = @($rows); Summary = $cnt }
+    }
+
+    # ---- drivers (read-only)
+    if ($CheckDrivers) {
+        Write-AWCli "`nDrivers" Cyan
+        $inv = @(Invoke-WTarget { Get-WDriverInventory }) | Where-Object { $_.System } | Select-Object -Last 1
+        $oem = Get-AWOemSupport $inv.System
+        Write-AWCli "  $($oem.Maker) $($oem.Model) - BIOS $($inv.System.Bios) - $(@($inv.Drivers).Count) drivers"
+        $updates = @()
+        if (Test-AWOffline) { Write-AWCli '  Offline - skipping the Windows Update check.' Gray }
+        else {
+            try { $updates = @(Invoke-WTarget { Get-WDriverUpdates } | Where-Object { $_.UpdateId }) }
+            catch { Write-AWCli "  Windows Update check failed: $($_.Exception.Message)" Red; $failed = $true }
+        }
+        $probs = @($inv.Drivers | Where-Object { $_.ErrorCode -ne 0 })
+        foreach ($d in $probs) { Write-AWCli ("  PROBLEM  {0} (code {1})" -f $d.Name, $d.ErrorCode) Red }
+        foreach ($u in $updates) { Write-AWCli ("  UPDATE   {0} - {1:yyyy-MM-dd} driver from {2}" -f $(if ($u.Model) { $u.Model } else { $u.Title }), $u.VerDate, $u.Source) Green }
+        $old = @($inv.Drivers | Where-Object { $_.Provider -notmatch '^Microsoft' -and $_.Date -ne [datetime]::MinValue -and $_.Date -lt (Get-Date).AddYears(-3) })
+        if ($old.Count) { Write-AWCli "  $($old.Count) third-party driver(s) are over 3 years old - check the vendor sites" Yellow }
+        Write-AWCli "  Maker's driver page: $($oem.Url)"
+        $result.Steps += [ordered]@{ Step = 'CheckDrivers'; System = $inv.System; Problems = @($probs | ForEach-Object Name); Updates = @($updates); OldDrivers = @($old | ForEach-Object Name); MakerPage = $oem.Url }
     }
 
     # ---- restore point (explicit, or automatic before tweaks / app removal)
@@ -2571,13 +2873,13 @@ if ($script:CliMode) {
     <Style x:Key="NavBtn" TargetType="RadioButton">
       <Setter Property="Foreground" Value="{StaticResource MutedBrush}"/>
       <Setter Property="FontSize" Value="13.5"/>
-      <Setter Property="Margin" Value="0,3"/>
+      <Setter Property="Margin" Value="0,2"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="GroupName" Value="Nav"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="RadioButton">
-            <Border x:Name="Bd" CornerRadius="10" Padding="14,10" Background="Transparent">
+            <Border x:Name="Bd" CornerRadius="10" Padding="14,8" Background="Transparent">
               <StackPanel Orientation="Horizontal">
                 <TextBlock Text="{Binding Tag, RelativeSource={RelativeSource TemplatedParent}}" FontFamily="{StaticResource IconFont}"
                            FontSize="16" Width="22" VerticalAlignment="Center"/>
@@ -3011,6 +3313,7 @@ if ($script:CliMode) {
               <ProgressBar x:Name="SideDriveBar" Maximum="100" Value="0" Height="6"/>
               <TextBlock x:Name="SideDriveText" Text="" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,7,0,0"/>
             </StackPanel>
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel>
               <TextBlock Text="MENU" Style="{StaticResource Caps}" Margin="8,4,0,6"/>
               <RadioButton x:Name="NavHome"     Style="{StaticResource NavBtn}" Tag="&#xE80F;" Content="Dashboard" IsChecked="True"/>
@@ -3022,10 +3325,13 @@ if ($script:CliMode) {
               <TextBlock Text="SYSTEM" Style="{StaticResource Caps}" Margin="8,16,0,6"/>
               <RadioButton x:Name="NavStartup"  Style="{StaticResource NavBtn}" Tag="&#xE7E8;" Content="Startup"/>
               <RadioButton x:Name="NavPrograms" Style="{StaticResource NavBtn}" Tag="&#xE71D;" Content="Programs"/>
+              <RadioButton x:Name="NavDrivers"  Style="{StaticResource NavBtn}" Tag="&#xE772;" Content="Drivers"/>
+              <RadioButton x:Name="NavBios"     Style="{StaticResource NavBtn}" Tag="&#xE950;" Content="BIOS"/>
               <RadioButton x:Name="NavDebloat"  Style="{StaticResource NavBtn}" Tag="&#xE71C;" Content="Debloat"/>
               <RadioButton x:Name="NavRebloat"  Style="{StaticResource NavBtn}" Tag="&#xE896;" Content="Rebloat"/>
               <RadioButton x:Name="NavTools"    Style="{StaticResource NavBtn}" Tag="&#xE90F;" Content="Tools and Log"/>
             </StackPanel>
+            </ScrollViewer>
           </DockPanel>
         </Border>
 
@@ -3766,6 +4072,133 @@ if ($script:CliMode) {
             </Border>
           </Grid>
 
+          <!-- ===== Drivers ===== -->
+          <Grid x:Name="ViewDrivers" Visibility="Collapsed">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Border Style="{StaticResource Card}" Padding="20,16">
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel>
+                  <TextBlock Text="Drivers" Style="{StaticResource H2}"/>
+                  <TextBlock x:Name="DrvSystem" Text="Reading this PC's drivers..." Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                  <TextBlock x:Name="DrvTools" Text="" Style="{StaticResource Muted}" FontSize="12" Margin="0,4,0,0" Visibility="Collapsed"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                  <Button x:Name="DrvOem" Content="PC maker's driver page" Style="{StaticResource BtnChip}" IsEnabled="False"/>
+                  <Button x:Name="DrvCheck" Style="{StaticResource BtnAccent}" Padding="18,9">
+                    <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE895;" Style="{StaticResource Icon}" Margin="0,0,8,0"/><TextBlock Text="Check for updates"/></StackPanel>
+                  </Button>
+                </StackPanel>
+              </Grid>
+            </Border>
+            <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="14,12">
+              <DockPanel>
+                <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="260"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                  <TextBox x:Name="DrvSearch" Tag="Filter devices, vendors, classes..."/>
+                  <CheckBox x:Name="DrvHideMs" Grid.Column="1" Content="Hide drivers built into Windows" IsChecked="True" Margin="14,0,0,0"/>
+                  <CheckBox x:Name="DrvOnlyIssues" Grid.Column="2" Content="Only updates and problems" Margin="14,0,0,0"/>
+                  <TextBlock x:Name="DrvInfo" Grid.Column="3" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0,0,0" TextTrimming="CharacterEllipsis"/>
+                </Grid>
+                <Grid DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                  <WrapPanel VerticalAlignment="Center">
+                    <Button x:Name="DrvVendor" Content="Vendor's site" Style="{StaticResource BtnChip}" ToolTip="Open the download page of the company that makes the selected device"/>
+                    <Button x:Name="DrvCatalog" Content="Search Update Catalog" Style="{StaticResource BtnChip}" ToolTip="Look up the selected device's hardware ID in the Microsoft Update Catalog"/>
+                    <Button x:Name="DrvCopyId" Content="Copy hardware ID" Style="{StaticResource BtnChip}"/>
+                    <Button x:Name="DrvBackup" Content="Back up drivers..." Style="{StaticResource BtnChip}" ToolTip="Export every third-party driver (pnputil) - keep it with your Resources for reinstalling offline"/>
+                    <Button x:Name="DrvRestore" Content="Install from folder..." Style="{StaticResource BtnChip}" ToolTip="Install drivers from a backup or a downloaded driver folder (.inf files)"/>
+                  </WrapPanel>
+                  <Button x:Name="DrvInstall" Grid.Column="1" Content="Install checked updates" Style="{StaticResource BtnPurple}" Padding="14,6" FontSize="12" IsEnabled="False"/>
+                </Grid>
+                <TextBlock DockPanel.Dock="Bottom" Style="{StaticResource Muted}" FontSize="11.5" Margin="6,8,6,0" TextWrapping="Wrap"
+                           Text="Updates are installed only through Windows Update (Microsoft-signed). On laptops, the PC maker's page usually has the right audio, touchpad and power drivers - they're often customized for that model."/>
+                <ListView x:Name="DrvList">
+                  <ListView.View>
+                    <GridView>
+                      <GridViewColumn Header="" Width="44">
+                        <GridViewColumn.CellTemplate><DataTemplate><CheckBox IsChecked="{Binding IsChecked, Mode=TwoWay}" IsEnabled="{Binding HasUpdate}" Margin="4,0,0,0"/></DataTemplate></GridViewColumn.CellTemplate>
+                      </GridViewColumn>
+                      <GridViewColumn Header="Device" Width="270">
+                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding HardwareId}"/></DataTemplate></GridViewColumn.CellTemplate>
+                      </GridViewColumn>
+                      <GridViewColumn Header="Status" Width="130">
+                        <GridViewColumn.CellTemplate><DataTemplate>
+                          <TextBlock x:Name="St" Text="{Binding Status}" FontWeight="SemiBold" Foreground="#8C95BD"/>
+                          <DataTemplate.Triggers>
+                            <DataTrigger Binding="{Binding Status}" Value="Update available"><Setter TargetName="St" Property="Foreground" Value="#19C3B1"/></DataTrigger>
+                            <DataTrigger Binding="{Binding Status}" Value="Problem"><Setter TargetName="St" Property="Foreground" Value="#F2617A"/></DataTrigger>
+                          </DataTemplate.Triggers>
+                        </DataTemplate></GridViewColumn.CellTemplate>
+                      </GridViewColumn>
+                      <GridViewColumn Header="Vendor" Width="120" DisplayMemberBinding="{Binding Vendor}"/>
+                      <GridViewColumn Header="Version" Width="130" DisplayMemberBinding="{Binding Version}"/>
+                      <GridViewColumn Header="Date" Width="90" DisplayMemberBinding="{Binding DateText}"/>
+                      <GridViewColumn Header="Update / notes" Width="260">
+                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding UpdateText}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
+                      </GridViewColumn>
+                      <GridViewColumn Header="Class" Width="110" DisplayMemberBinding="{Binding Class}"/>
+                    </GridView>
+                  </ListView.View>
+                </ListView>
+              </DockPanel>
+            </Border>
+          </Grid>
+
+          <!-- ===== BIOS ===== -->
+          <Grid x:Name="ViewBios" Visibility="Collapsed">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Border Style="{StaticResource Card}" Padding="20,16">
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel>
+                  <TextBlock Text="BIOS and firmware" Style="{StaticResource H2}"/>
+                  <TextBlock x:Name="BiosSummary" Text="Reading firmware settings..." Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                  <TextBlock Text="View only - AWiper never changes BIOS settings." Style="{StaticResource Muted}" FontSize="11.5" Margin="0,4,0,0"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                  <Button x:Name="BiosRefresh" Content="Refresh" Style="{StaticResource BtnChip}"/>
+                  <Button x:Name="BiosExport" Content="Export..." Style="{StaticResource BtnChip}" IsEnabled="False"/>
+                  <Button x:Name="BiosRestart" Content="Restart into BIOS setup" Style="{StaticResource BtnPurple}" Padding="14,7" FontSize="12"
+                          ToolTip="Restarts this PC straight into its UEFI firmware setup screen"/>
+                </StackPanel>
+              </Grid>
+            </Border>
+            <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="14,12">
+              <DockPanel>
+                <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="300"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                  <TextBox x:Name="BiosSearch" Tag="Filter settings..."/>
+                  <TextBlock x:Name="BiosInfo" Grid.Column="1" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0,0,0"/>
+                </Grid>
+                <ListView x:Name="BiosList">
+                  <ListView.View>
+                    <GridView>
+                      <GridViewColumn Header="Section" Width="150">
+                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Section}" Foreground="#8C95BD"/></DataTemplate></GridViewColumn.CellTemplate>
+                      </GridViewColumn>
+                      <GridViewColumn Header="Setting" Width="240">
+                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}"/></DataTemplate></GridViewColumn.CellTemplate>
+                      </GridViewColumn>
+                      <GridViewColumn Header="Value" Width="300">
+                        <GridViewColumn.CellTemplate><DataTemplate>
+                          <TextBlock x:Name="V" Text="{Binding Value}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Value}"/>
+                          <DataTemplate.Triggers>
+                            <DataTrigger Binding="{Binding Flag}" Value="Good"><Setter TargetName="V" Property="Foreground" Value="#19C3B1"/></DataTrigger>
+                            <DataTrigger Binding="{Binding Flag}" Value="Warn"><Setter TargetName="V" Property="Foreground" Value="#F5B94B"/></DataTrigger>
+                          </DataTemplate.Triggers>
+                        </DataTemplate></GridViewColumn.CellTemplate>
+                      </GridViewColumn>
+                      <GridViewColumn Header="Notes" Width="420">
+                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
+                      </GridViewColumn>
+                    </GridView>
+                  </ListView.View>
+                </ListView>
+              </DockPanel>
+            </Border>
+          </Grid>
+
           <!-- ===== Debloat ===== -->
           <Grid x:Name="ViewDebloat" Visibility="Collapsed">
             <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
@@ -4186,7 +4619,7 @@ $script:IdleStatus = 'Ready'
 #region ---------------------------------------------------------------- Navigation + title bar
 $script:ViewTitles = @{
     Home = 'Dashboard'; Health = 'Health Check'; Cleaner = 'Cleaner'; Map = 'Space Map'; Large = 'Large Files'; Recovery = 'Recovery'
-    Startup = 'Startup'; Programs = 'Programs'; Debloat = 'Debloat'; Rebloat = 'Rebloat'; Tools = 'Tools and Activity Log'
+    Startup = 'Startup'; Programs = 'Programs'; Drivers = 'Drivers'; Bios = 'BIOS and Firmware'; Debloat = 'Debloat'; Rebloat = 'Rebloat'; Tools = 'Tools and Activity Log'
 }
 $script:Loaded = @{}
 
@@ -4205,6 +4638,8 @@ foreach ($v in $script:ViewTitles.Keys) {
                 'Recovery' { Initialize-AWRecovery }
                 'Rebloat'  { Initialize-AWRebloat }
                 'Health'   { Start-AWHealthCheck }
+                'Drivers'  { Start-AWDriverInventory }
+                'Bios'     { Start-AWBiosRead }
             }
         }
         if ($name -eq 'Map') { Request-AWMapRedraw }
@@ -5646,7 +6081,7 @@ function Set-AWTarget($NewTarget) {
     $ui.CleanSubtext.Text = if (Test-AWRemote) { "Machine-wide rules run on $($NewTarget.ComputerName). Per-user rules are only available on this PC." } else { 'Pick the rules on the left, then Analyze to see what can be removed.' }
     $ui.CleanProgress.Value = 0
     $script:AllApps = @(); $ui.AppList.ItemsSource = $null; $script:Programs = @(); $ui.ProgList.ItemsSource = $null
-    [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat'); [void]$script:Loaded.Remove('Recovery'); [void]$script:Loaded.Remove('Rebloat'); [void]$script:Loaded.Remove('Health')
+    [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat'); [void]$script:Loaded.Remove('Recovery'); [void]$script:Loaded.Remove('Rebloat'); [void]$script:Loaded.Remove('Health'); [void]$script:Loaded.Remove('Drivers'); [void]$script:Loaded.Remove('Bios')
     $cur = Get-AWCurrentView
     Update-AWViewTitle $cur
     if ($cur -eq 'Programs') { $script:Loaded['Programs'] = $true; Update-AWProgramList }
@@ -5654,6 +6089,8 @@ function Set-AWTarget($NewTarget) {
     if ($cur -eq 'Recovery') { $script:Loaded['Recovery'] = $true; Initialize-AWRecovery }
     if ($cur -eq 'Rebloat')  { $script:Loaded['Rebloat'] = $true; Initialize-AWRebloat }
     if ($cur -eq 'Health')   { $script:Loaded['Health'] = $true; Start-AWHealthCheck }
+    if ($cur -eq 'Drivers')  { $script:Loaded['Drivers'] = $true; Start-AWDriverInventory }
+    if ($cur -eq 'Bios')     { $script:Loaded['Bios'] = $true; Start-AWBiosRead }
     if (Test-AWRemote) {
         Write-AWLog "Target is now $($NewTarget.ComputerName) ($($NewTarget.Host)) - $($NewTarget.OS), signed in as $($NewTarget.User)"
         $script:IdleStatus = "Connected to $($NewTarget.ComputerName)"
@@ -6013,6 +6450,285 @@ function Initialize-AWTools {
 
 $ui.LogClear.Add_Click({ $ui.LogBox.Clear() })
 $ui.LogOpen.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$script:DataDir`"" })
+#endregion
+
+#region ---------------------------------------------------------------- Drivers
+$script:DrvInv = $null          # Get-WDriverInventory result
+$script:DrvUpdates = $null      # Get-WDriverUpdates result ($null = not checked yet)
+$script:DrvEntries = @()
+$script:DrvOemInfo = $null
+
+# Joins the installed drivers with Windows Update's offers (matched on hardware / compatible IDs).
+function Build-AWDriverEntries {
+    if (-not $script:DrvInv) { return }
+    $byHw = @{}
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($d in $script:DrvInv.Drivers) {
+        $e = New-Object AWiper.DriverEntry
+        $e.Name = $d.Name; $e.Class = $d.Class; $e.Provider = $d.Provider; $e.Version = $d.Version; $e.Date = $d.Date
+        $e.Inf = $d.Inf; $e.DeviceId = $d.DeviceId; $e.ErrorCode = $d.ErrorCode
+        $e.HardwareId = (@($d.HardwareIds) | Select-Object -First 1)
+        $v = Resolve-AWDriverVendor $d.Provider $d.HardwareIds
+        $e.Vendor = $v.Name; $e.VendorUrl = $v.Url
+        $e.IsMicrosoft = $d.Provider -match '^Microsoft' -or -not $d.Provider     # no provider = generic / no driver package
+        $e.Note = "Provider: $($d.Provider)`nINF: $($d.Inf)`n" + ((@($d.HardwareIds) | Select-Object -First 4) -join "`n")
+        if ($d.ErrorCode -ne 0) { $e.Status = 'Problem'; $e.UpdateText = "Device Manager reports code $($d.ErrorCode)" }
+        else {
+            $e.Status = 'OK'
+            if (-not $e.IsMicrosoft -and $d.Date -ne [datetime]::MinValue -and $d.Date -lt (Get-Date).AddYears(-3)) {
+                $e.UpdateText = "Over 3 years old - worth checking the vendor's site"
+            }
+        }
+        foreach ($h in @($d.HardwareIds)) { $k = $h.ToLowerInvariant(); if (-not $byHw.ContainsKey($k)) { $byHw[$k] = New-Object System.Collections.Generic.List[object] }; $byHw[$k].Add($e) }
+        $list.Add($e)
+    }
+    foreach ($u in @($script:DrvUpdates)) {
+        if (-not $u) { continue }
+        $hits = if ($u.HardwareId) { $byHw[$u.HardwareId.ToLowerInvariant()] } else { $null }
+        $when = if ($u.VerDate -ne [datetime]::MinValue) { $u.VerDate.ToString('yyyy-MM-dd') } else { 'new' }
+        if ($hits) {
+            foreach ($e in $hits) {
+                if ($u.VerDate -gt $e.Date -or $e.Date -eq [datetime]::MinValue) {
+                    $e.HasUpdate = $true; $e.Status = 'Update available'; $e.UpdateId = $u.UpdateId; $e.IsChecked = $true
+                    $label = if ($u.Model -and $u.Model -ne $e.Name) { "$($u.Model), " } else { '' }
+                    $e.UpdateText = "$label$when - from $($u.Source)"; $e.Note = "$($u.Title)`n$($e.Note)"
+                    if ($u.Provider -and $u.Provider -notmatch '^Microsoft') { $e.Vendor = (Resolve-AWDriverVendor $u.Provider @($u.HardwareId)).Name }
+                } elseif (-not $e.UpdateText) { $e.UpdateText = "Windows Update offers a $when driver (not newer)" }
+            }
+        } else {
+            $e = New-Object AWiper.DriverEntry
+            $e.Name = $(if ($u.Model) { $u.Model } else { $u.Title }); $e.Class = $u.Class; $e.Provider = $u.Provider
+            $v = Resolve-AWDriverVendor $u.Provider @($u.HardwareId)
+            $e.Vendor = $v.Name; $e.VendorUrl = $v.Url; $e.HardwareId = $u.HardwareId
+            $e.HasUpdate = $true; $e.IsChecked = $true; $e.Status = 'Update available'; $e.UpdateId = $u.UpdateId
+            $e.UpdateText = "$when - from $($u.Source)"; $e.Note = $u.Title
+            $list.Add($e)
+        }
+    }
+    $script:DrvEntries = $list.ToArray()     # (@($list) throws "Argument types do not match" in PS 5.1 here)
+}
+
+function Update-AWDrvView {
+    $q = $ui.DrvSearch.Text.Trim()
+    $hide = [bool]$ui.DrvHideMs.IsChecked; $only = [bool]$ui.DrvOnlyIssues.IsChecked
+    $items = @($script:DrvEntries | Where-Object {
+        (-not $hide -or -not $_.IsMicrosoft -or $_.HasUpdate -or $_.ErrorCode) -and
+        (-not $only -or $_.HasUpdate -or $_.ErrorCode) -and
+        (-not $q -or $_.Name -like "*$q*" -or $_.Vendor -like "*$q*" -or $_.Class -like "*$q*" -or $_.Provider -like "*$q*")
+    } | Sort-Object SortRank, Vendor, Name)
+    $ui.DrvList.ItemsSource = $items
+    $upd = @($script:DrvEntries | Where-Object { $_.HasUpdate }).Count
+    $prob = @($script:DrvEntries | Where-Object { $_.ErrorCode }).Count
+    $state = if ($null -eq $script:DrvUpdates) { 'not checked for updates yet' } else { "$upd update(s) available" }
+    $ui.DrvInfo.Text = "$($items.Count) shown - $state - $prob problem(s)"
+    $local = -not (Test-AWRemote)
+    $ui.DrvInstall.IsEnabled = $upd -gt 0 -and $script:IsAdmin -and $local
+    $ui.DrvInstall.ToolTip = if (-not $local) { 'Installing driver updates is only available on this PC' } elseif (-not $script:IsAdmin) { 'Needs administrator rights' } else { $null }
+    [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($ui.DrvInstall, $true)
+    foreach ($c in @($ui.DrvBackup, $ui.DrvRestore)) {
+        $c.IsEnabled = $local -and $script:IsAdmin
+        $c.ToolTip = if (-not $local) { 'Only available on this PC' } elseif (-not $script:IsAdmin) { 'Needs administrator rights' } else { $c.ToolTip }
+        [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($c, $true)
+    }
+}
+
+function Start-AWDriverInventory {
+    $ui.DrvSystem.Text = 'Reading drivers...'
+    $script:DrvUpdates = $null
+    Start-AWTask -Name 'Read drivers' -Work { Invoke-WTarget { Get-WDriverInventory } } -OnComplete {
+        param($Result)
+        $inv = @($Result | Where-Object { $_ -and $_.System }) | Select-Object -Last 1
+        if (-not $inv) { $ui.DrvSystem.Text = 'Could not read drivers - see Activity log.'; return }
+        $script:DrvInv = $inv
+        $s = $inv.System
+        $script:DrvOemInfo = Get-AWOemSupport $s
+        $biosDate = if ($s.BiosDate -ne [datetime]::MinValue) { ' (' + $s.BiosDate.ToString('yyyy-MM-dd') + ')' } else { '' }
+        $ui.DrvSystem.Text = "$($script:DrvOemInfo.Maker) $($script:DrvOemInfo.Model) - BIOS $($s.Bios)$biosDate - $(@($inv.Drivers).Count) drivers"
+        $ui.DrvOem.Content = "$($script:DrvOemInfo.Maker) driver page"
+        $ui.DrvOem.IsEnabled = -not (Test-AWOffline)
+        $ui.DrvOem.ToolTip = "Opens $($script:DrvOemInfo.Url)" + $(if ($script:DrvOemInfo.SendsSerial) { "`nThe link includes this PC's service tag so Dell shows the exact model." } else { '' })
+        if (@($s.Tools).Count) {
+            $ui.DrvTools.Text = "Maker update tools installed: $(@($s.Tools) -join ', ') - they can update drivers customized for this model."
+            $ui.DrvTools.Visibility = 'Visible'
+        } else { $ui.DrvTools.Visibility = 'Collapsed' }
+        Build-AWDriverEntries
+        Update-AWDrvView
+    }
+}
+
+function Start-AWDriverCheck {
+    if (Test-AWOffline) {
+        Show-AWMessage "Checking for driver updates needs internet, and this PC is offline.`n`nOffline, install drivers you've downloaded elsewhere with 'Install from folder...' - for example a backup in your Resources\drivers folder."
+        return
+    }
+    if (-not $script:DrvInv) { Start-AWDriverInventory }
+    $ui.DrvCheck.IsEnabled = $false
+    $ui.DrvInfo.Text = 'Asking Windows Update which driver updates this PC is offered (10-60 seconds)...'
+    Start-AWTask -Name 'Check for driver updates' -Work { Invoke-WTarget { Get-WDriverUpdates } } -OnComplete {
+        param($Result)
+        $ui.DrvCheck.IsEnabled = $true
+        $script:DrvUpdates = @($Result | Where-Object { $_ -and $_.UpdateId })
+        Write-AWLog "Windows Update offers $($script:DrvUpdates.Count) driver update(s)"
+        Build-AWDriverEntries
+        Update-AWDrvView
+        if (-not $script:DrvUpdates.Count) { $script:IdleStatus = "Windows Update has no driver updates for this PC - the vendor and $($script:DrvOemInfo.Maker) pages may still have newer ones" }
+    }
+}
+
+function Start-AWDriverInstall {
+    $sel = @($script:DrvEntries | Where-Object { $_.HasUpdate -and $_.IsChecked })
+    $ids = @($sel | ForEach-Object UpdateId | Select-Object -Unique)
+    if (-not $ids.Count) { Show-AWMessage 'Check the updates you want to install first.'; return }
+    $names = ($sel | Select-Object -First 15 | ForEach-Object { "  - $($_.Name)  ($($_.UpdateText))" }) -join "`n"
+    if (-not (Confirm-AW "Install $($ids.Count) driver update(s) from Windows Update?`n`n$names`n`nA restore point is created first (if turned on). Some updates need a restart.")) { return }
+    Write-AWAction 'DriverUpdates' ($sel | ForEach-Object Name) @{ UpdateIds = $ids } 'Started'
+    $ui.DrvInstall.IsEnabled = $false; $ui.DrvCheck.IsEnabled = $false
+    $saved = $script:Target; $script:Target = $null
+    try {
+        Start-AWTask -Name 'Install driver updates' -Arguments @{ Ids = $ids; AutoRP = (Get-AWAutoRP 'installing driver updates') } -Work {
+            if ($AutoRP) { $Sync.Status = 'Creating a restore point first...'; [void](New-WRestorePoint $AutoRP) }
+            Install-WDriverUpdates $Ids
+        } -OnComplete {
+            param($r)
+            $ui.DrvCheck.IsEnabled = $true
+            $res = @($r | Where-Object { $_ -and $null -ne $_.Installed }) | Select-Object -Last 1
+            if ($res) {
+                Write-AWAction 'DriverUpdates' @("$($res.Installed) installed, $($res.Failed) failed") @{} $(if ($res.Failed) { 'Partly failed' } else { 'Done' })
+                Show-AWMessage ("{0} driver update(s) installed{1}.{2}" -f $res.Installed, $(if ($res.Failed) { ", $($res.Failed) failed (see Activity log)" } else { '' }), $(if ($res.Reboot) { "`n`nRestart the PC to finish." } else { '' }))
+            }
+            Start-AWDriverInventory
+        }
+    } finally { $script:Target = $saved }
+}
+
+# Most useful search term for the Update Catalog: PCI\VEN_xxxx&DEV_xxxx or USB\VID_xxxx&PID_xxxx, else the full ID.
+function Get-AWCatalogQuery([string]$HardwareId) {
+    if ($HardwareId -match '^((PCI|HDAUDIO|INTELAUDIO)\\.*?(VEN_[0-9A-F]{4})&(DEV_[0-9A-F]{4}))') { return $Matches[1] }
+    if ($HardwareId -match '^(USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4})') { return $Matches[1] }
+    $HardwareId
+}
+
+function Get-AWDriverFolder {
+    $sys = $script:DrvInv.System
+    $name = ('{0}_{1}' -f $script:DrvOemInfo.Maker, $script:DrvOemInfo.Model) -replace '[\\/:*?"<>|]', '_' -replace '\s+', '-'
+    if ($script:ResourcesRoot) { return (Join-Path $script:ResourcesRoot "drivers\$name") }
+    $null
+}
+
+$ui.DrvCheck.Add_Click({ Start-AWDriverCheck })
+$ui.DrvInstall.Add_Click({ Start-AWDriverInstall })
+$ui.DrvSearch.Add_TextChanged({ Update-AWDrvView })
+foreach ($c in @($ui.DrvHideMs, $ui.DrvOnlyIssues)) { $c.Add_Checked({ Update-AWDrvView }); $c.Add_Unchecked({ Update-AWDrvView }) }
+$ui.DrvOem.Add_Click({ if ($script:DrvOemInfo) { Start-Process $script:DrvOemInfo.Url } })
+$ui.DrvVendor.Add_Click({
+    $e = $ui.DrvList.SelectedItem
+    if (-not $e) { Show-AWMessage 'Select a device first.'; return }
+    if (Test-AWOffline) { Show-AWMessage 'This PC is offline. Use "Copy hardware ID" and look the driver up on a connected PC.'; return }
+    if ($e.VendorUrl) { Start-Process $e.VendorUrl }
+    elseif ($e.IsMicrosoft) { Show-AWMessage "$($e.Name) uses a driver built into Windows; it's updated by Windows Update. Use 'Search Update Catalog' for alternatives." }
+    else { Show-AWMessage "AWiper doesn't know $($e.Vendor)'s download page. Try the $($script:DrvOemInfo.Maker) driver page or 'Search Update Catalog'." }
+})
+$ui.DrvCatalog.Add_Click({
+    $e = $ui.DrvList.SelectedItem
+    if (-not $e -or -not $e.HardwareId) { Show-AWMessage 'Select a device first.'; return }
+    if (Test-AWOffline) { Show-AWMessage 'This PC is offline. Use "Copy hardware ID" and search the Microsoft Update Catalog on a connected PC.'; return }
+    Start-Process ('https://www.catalog.update.microsoft.com/Search.aspx?q=' + [uri]::EscapeDataString((Get-AWCatalogQuery $e.HardwareId)))
+})
+$ui.DrvCopyId.Add_Click({
+    $e = $ui.DrvList.SelectedItem
+    if (-not $e) { Show-AWMessage 'Select a device first.'; return }
+    $d = @($script:DrvInv.Drivers | Where-Object { $_.DeviceId -eq $e.DeviceId }) | Select-Object -First 1
+    $text = if ($d) { (@($d.HardwareIds) -join "`r`n") } else { [string]$e.HardwareId }
+    [System.Windows.Clipboard]::SetText("$($e.Name)`r`n$text")
+    Set-AWStatus "Copied the hardware IDs of $($e.Name)"
+})
+$ui.DrvBackup.Add_Click({
+    $dest = Get-AWDriverFolder
+    if (-not $dest) {
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = 'Back up all third-party drivers into this folder'
+        if ($dlg.ShowDialog() -ne 'OK') { return }
+        $dest = $dlg.SelectedPath
+    }
+    if (-not (Confirm-AW "Export every third-party driver on this PC to`n$dest ?`n`nUse 'Install from folder' to put them back - e.g. after reinstalling Windows, with no internet.")) { return }
+    if (-not (Test-Path -LiteralPath $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+    Write-AWAction 'DriverBackup' @($dest) @{} 'Started'
+    $saved = $script:Target; $script:Target = $null
+    try { Start-AWCommandTask 'Back up drivers' ([scriptblock]::Create("& pnputil.exe /export-driver * '$($dest -replace "'", "''")' 2>&1; ""AWEXIT `$LASTEXITCODE""")) }
+    finally { $script:Target = $saved }
+})
+$ui.DrvRestore.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Install every driver (.inf) found in this folder and its subfolders'
+    $def = Get-AWDriverFolder
+    if ($def -and (Test-Path -LiteralPath $def)) { $dlg.SelectedPath = $def }
+    if ($dlg.ShowDialog() -ne 'OK') { return }
+    $dir = $dlg.SelectedPath
+    $n = @(Get-ChildItem -LiteralPath $dir -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue).Count
+    if (-not $n) { Show-AWMessage 'No driver (.inf) files were found in that folder.'; return }
+    if (-not (Confirm-AW "Install drivers from $n .inf file(s) in`n$dir ?`n`nWindows only uses a driver if it matches a device and is better than the current one. A restore point is created first (if turned on).")) { return }
+    Write-AWAction 'DriverInstallFromFolder' @($dir) @{ InfCount = $n } 'Started'
+    $rp = Get-AWAutoRP 'installing drivers'
+    $pre = if ($rp) { "[void](New-WRestorePoint '$($rp -replace "'", "''")')`n" } else { '' }
+    $saved = $script:Target; $script:Target = $null
+    try { Start-AWCommandTask 'Install drivers from folder' ([scriptblock]::Create("$pre& pnputil.exe /add-driver '$((Join-Path $dir '*.inf') -replace "'", "''")' /subdirs /install 2>&1; ""AWEXIT `$LASTEXITCODE""")) }
+    finally { $script:Target = $saved }
+})
+#endregion
+
+#region ---------------------------------------------------------------- BIOS (view only)
+$script:BiosRows = @()
+
+function Update-AWBiosView {
+    $q = $ui.BiosSearch.Text.Trim()
+    $items = @(if ($q) { $script:BiosRows | Where-Object { $_.Name -like "*$q*" -or $_.Value -like "*$q*" -or $_.Section -like "*$q*" } } else { $script:BiosRows })
+    $ui.BiosList.ItemsSource = $items
+    $setup = @($script:BiosRows | Where-Object { $_.Section -like 'BIOS setup (*' }).Count
+    $ui.BiosInfo.Text = "$($items.Count) item(s)" + $(if ($setup) { " - including $setup BIOS setup option(s) read from the firmware" } else { '' })
+}
+
+function Start-AWBiosRead {
+    $ui.BiosSummary.Text = 'Reading firmware settings...'
+    $local = -not (Test-AWRemote)
+    $ui.BiosRestart.IsEnabled = $local -and $script:IsAdmin
+    $ui.BiosRestart.ToolTip = if (-not $local) { 'Only available on this PC' } elseif (-not $script:IsAdmin) { 'Needs administrator rights' } else { 'Restarts this PC straight into its UEFI firmware setup screen' }
+    [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($ui.BiosRestart, $true)
+    Start-AWTask -Name 'Read firmware settings' -Work { Invoke-WTarget { Get-WFirmwareInfo } } -OnComplete {
+        param($Result)
+        $script:BiosRows = @($Result | Where-Object { $_ -and $_.Section })
+        if (-not $script:BiosRows.Count) { $ui.BiosSummary.Text = 'Could not read firmware settings - see Activity log.'; return }
+        $get = { param($n) (@($script:BiosRows | Where-Object { $_.Name -eq $n }) | Select-Object -First 1).Value }
+        $warn = @($script:BiosRows | Where-Object { $_.Flag -eq 'Warn' }).Count
+        $ui.BiosSummary.Text = "$(& $get 'Maker') $(& $get 'Version') ($(& $get 'Release date')) - $(& $get 'Boot mode') - Secure Boot $(& $get 'Secure Boot')" +
+            $(if ($warn) { " - $warn item(s) worth a look" } else { '' })
+        $ui.BiosExport.IsEnabled = $true
+        if ((& $get 'Boot mode') -ne 'UEFI') { $ui.BiosRestart.IsEnabled = $false; $ui.BiosRestart.ToolTip = 'Only UEFI firmware supports restarting straight into setup' }
+        Update-AWBiosView
+    }
+}
+
+function Export-AWBios {
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $who = if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME }
+    $dlg.FileName = 'AWiper-bios-{0}-{1:yyyyMMdd}' -f $who, (Get-Date)
+    $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'
+    if (-not $dlg.ShowDialog($window)) { return }
+    $rows = $script:BiosRows | Select-Object Section, Name, Value, Note
+    if ($dlg.FileName -like '*.json') { ConvertTo-Json -InputObject @($rows) -Depth 3 | Set-Content -LiteralPath $dlg.FileName -Encoding UTF8 }
+    else { $rows | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding UTF8 }
+    Write-AWLog "Firmware settings exported to $($dlg.FileName)"
+}
+
+$ui.BiosRefresh.Add_Click({ Start-AWBiosRead })
+$ui.BiosExport.Add_Click({ Export-AWBios })
+$ui.BiosSearch.Add_TextChanged({ Update-AWBiosView })
+$ui.BiosRestart.Add_Click({
+    if (-not (Confirm-AW "Restart this PC into its BIOS / UEFI setup now?`n`nSave your work first - open apps will be closed. In setup, use the maker's 'Exit without saving' option if you only want to look.")) { return }
+    Write-AWAction 'RestartToFirmware' @($env:COMPUTERNAME) @{} 'Started'
+    Update-AWLogView
+    try { & shutdown.exe /r /fw /t 5 /c 'AWiper: restarting into BIOS setup' 2>&1 | Out-Null; if ($LASTEXITCODE) { throw "shutdown.exe exit code $LASTEXITCODE" } }
+    catch { Show-AWMessage "Could not restart into setup: $($_.Exception.Message)" 'Error' }
+})
 #endregion
 
 #region ---------------------------------------------------------------- Health Check
@@ -7051,6 +7767,8 @@ Enable-AWSort $ui.ProgList     @{ Name = 'Name'; Publisher = 'Publisher'; Versio
 Enable-AWSort $ui.StartupList  @{ Name = 'Name'; Scope = 'Scope'; Source = 'Location'; Status = 'Enabled' }
 Enable-AWSort $ui.CleanResults @{ Item = 'Name'; Group = 'Group'; Size = 'Bytes' }
 Enable-AWSort $ui.AppList      @{ App = 'Name'; Category = 'Category'; Notes = 'Note' }
+Enable-AWSort $ui.DrvList      @{ Device = 'Name'; Status = 'SortRank'; Vendor = 'Vendor'; Version = 'Version'; Date = 'Date'; Class = 'Class' }
+Enable-AWSort $ui.BiosList     @{ Section = 'Section'; Setting = 'Name'; Value = 'Value' }
 Enable-AWSort $ui.RebloatList  @{ App = 'Name'; Category = 'Category'; 'Comes back from' = 'Source'; Notes = 'Note' }
 Enable-AWSort $ui.BinList     @{ Name = 'Name'; Type = 'Kind'; Size = 'Size'; Deleted = 'Deleted'; 'Deleted by' = 'Owner'; 'Original location' = 'Folder' }
 Enable-AWSort $ui.ShadowResults @{ Name = 'Name'; Status = 'Status'; Size = 'Size'; Modified = 'Modified'; Folder = 'Folder' }

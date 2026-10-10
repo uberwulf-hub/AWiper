@@ -12,6 +12,8 @@ System cleanup, health check, debloat, recovery and repair toolkit for Windows, 
 | Recovery     | Recycle Bin restore, previous versions, native NTFS undelete, restore points, deep scan with Windows File Recovery |
 | Startup      | Enable / disable startup entries (same `StartupApproved` switches Task Manager uses) |
 | Programs     | Installed software list with size, search and uninstall |
+| Drivers      | Installed drivers with vendor, age and problems; updates from Windows Update; vendor and PC-maker download pages; driver backup / restore |
+| BIOS         | Firmware version, boot mode, Secure Boot, TPM, virtualization, boot order, and full BIOS setup options on Dell / HP / Lenovo business PCs - view only |
 | Debloat      | Remove preinstalled Store apps; turn off ads, suggestions, Bing in Start, Copilot, Recall, Widgets and more |
 | Rebloat      | Put back removed apps, set debloat tweaks back to Windows defaults, undo history |
 | Tools        | Offline kit, quick fixes, repair and maintenance (see below), plus the activity log |
@@ -19,6 +21,19 @@ System cleanup, health check, debloat, recovery and repair toolkit for Windows, 
 ### Health Check
 
 A read-only check that works offline and on remote PCs: disk health and reliability counters, SATA SMART failure prediction, free space, blue screens and unexpected shutdowns (30 days), WHEA hardware errors, the last memory-test result, Reliability Monitor's stability index, devices with driver problems, battery wear, Defender status and definition age (or a third-party antivirus), pending restart and uptime, and whether the local gateway answers. Each row has a status, the evidence and — where it helps — a button (Cleaner, Reliability Monitor, memory test, Device Manager, Defender update). Checks whose data isn't available on the hardware show **N/A** and are never counted as healthy. Reports save as HTML or JSON.
+
+### Drivers
+
+Lists every installed driver with the company it comes from, its version and date, and devices Windows reports problems for. Built-in Windows drivers are hidden by default; third-party drivers older than three years are flagged.
+
+- **Check for updates** asks **Windows Update** which driver updates this PC is offered (including BIOS/firmware updates the PC maker publishes there) and matches them to devices by hardware ID. **Install checked updates** installs them through Windows Update only — Microsoft-signed, with a restore point first. AWiper deliberately doesn't use third-party "driver updater" databases.
+- **Where a driver comes from** — *Vendor's site* opens the chip maker's download page (Intel, NVIDIA, AMD, Realtek, Qualcomm, Samsung, Logitech); the header button opens **the PC maker's driver page for this exact model** (Dell, HP, Lenovo, MSI, ASUS, Acer, Gigabyte, Surface, Framework). On laptops the maker's page is usually the right source for audio, touchpad and power drivers. Installed maker tools (MSI Center, Dell Command Update, Lenovo Vantage, NVIDIA App...) are listed.
+- **Search Update Catalog** looks the device's hardware ID up in the Microsoft Update Catalog; **Copy hardware ID** helps on an offline PC.
+- **Back up drivers** exports every third-party driver (`pnputil /export-driver`) — into `Resources\drivers\<Maker>_<Model>` when a Resources folder exists — and **Install from folder** puts them back (`pnputil /add-driver /subdirs /install`), e.g. after reinstalling Windows with no internet.
+
+### BIOS
+
+A view-only look at the firmware: maker, version and age, UEFI or legacy boot, Secure Boot, TPM version and state, virtualization-based security, CPU virtualization (VT-x / AMD-V), and the UEFI boot order. On Dell, HP and Lenovo business PCs, which publish their setup options to Windows, **every BIOS setup option and its current value** is listed too. Exports to CSV or JSON. **Restart into BIOS setup** reboots straight into the UEFI setup screen. AWiper never changes BIOS settings.
 
 ### Tools
 
@@ -78,6 +93,7 @@ Any of these parameters runs AWiper without a window — from a script, a schedu
 .\AWiper.ps1 -RemoveApp Recommended -Yes                    # recommended Store app removals
 .\AWiper.ps1 -Config .\monthly.json -Yes                    # everything from a profile
 .\AWiper.ps1 -ComputerName PC042 -UseSavedCredential -Clean WinTemp,WerSys -Yes
+.\AWiper.ps1 -CheckDrivers                                  # driver problems, Windows Update driver offers, maker page
 .\AWiper.ps1 -ListRules    # also -ListTweaks, -ListApps
 ```
 
@@ -101,7 +117,7 @@ Click **This PC** in the title bar to target another computer by hostname, FQDN 
 
 The remote PC needs PowerShell remoting enabled (`Enable-PSRemoting -Force`) and your account must be an administrator there.
 
-When a remote computer is targeted, these run on it: Health Check, Tools (except Explorer, Recycle Bin, Disk Cleanup, Storage Sense, and offline media repair), machine-wide Cleaner rules, Debloat apps and machine-wide tweaks, the Programs list and Recycle Bin restore. Per-user items, Dashboard, Space Map, Large Files and Startup stay on this PC and are labelled as such.
+When a remote computer is targeted, these run on it: Health Check, the driver list and update check, the BIOS view, Tools (except Explorer, Recycle Bin, Disk Cleanup, Storage Sense, and offline media repair), machine-wide Cleaner rules, Debloat apps and machine-wide tweaks, the Programs list and Recycle Bin restore. Per-user items, Dashboard, Space Map, Large Files and Startup stay on this PC and are labelled as such.
 
 ## Safety and audit trail
 
