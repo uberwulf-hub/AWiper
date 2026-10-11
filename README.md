@@ -6,11 +6,11 @@ System cleanup, health check, debloat, recovery and repair toolkit for Windows, 
 |--------------|--------------|
 | Dashboard    | Drive usage gauges, system summary, quick actions |
 | Health Check | Checks (disks incl. NVMe health, crashes, hardware errors, stability, devices, battery, antivirus...), Events, Startup time, Security, Privacy, Crashes, Sleep |
-| Cleaner      | Analyze / clean temp files, caches, error reports, crash dumps, update and Delivery Optimization caches, Recycle Bin |
-| Space Map    | SpaceMonger-style nested treemap of any drive or folder (drill down, recycle) |
-| Large Files  | The 1,000 largest files from the last scan — searchable, recycle or export |
+| Cleaner      | Analyze / clean temp files, caches, error reports, crash dumps, update and Delivery Optimization caches, GPU and Steam shader caches (every Steam library), Recycle Bin |
+| Space Map    | SpaceMonger-style nested treemap of any drive or folder (drill down, recycle), with totals by kind (videos, pictures, installers, archives...) and by extension |
+| Large Files  | **Largest** — the 1,000 largest files from the last scan. **Old downloads** — files in Downloads not opened for 30 days to a year. **Duplicates** — exact copies (size, then a hash of the first 64 KB, then full SHA-256) or similar photos (perceptual hash). Searchable, recycle or export |
 | Recovery     | Recycle Bin restore, previous versions, native NTFS undelete, restore points, versioned folder backup, deep scan with Windows File Recovery |
-| Startup      | Enable / disable startup entries (same `StartupApproved` switches Task Manager uses) |
+| Startup      | Enable / disable startup entries (same `StartupApproved` switches Task Manager uses). **Right-click menu** tab: turn off menu entries programs added (shell extensions and commands), with undo |
 | Programs     | Installed software list with size, search and uninstall |
 | Drivers      | Installed drivers with vendor, age and problems; updates from Windows Update; vendor and PC-maker download pages; driver backup / restore. **Windows updates** tab: missing-update scan online or offline, install from Resources |
 | IT Admin     | User profiles, printers, helpdesk actions, software push, security baseline audit, time sync and LAN speed test |
@@ -21,7 +21,7 @@ System cleanup, health check, debloat, recovery and repair toolkit for Windows, 
 
 ### Health Check
 
-A read-only check that works offline and on remote PCs: disk health and reliability counters, SATA SMART failure prediction, free space, blue screens and unexpected shutdowns (30 days), WHEA hardware errors, the last memory-test result, Reliability Monitor's stability index, devices with driver problems, battery wear, Defender status and definition age (or a third-party antivirus), pending restart and uptime, and whether the local gateway answers. Each row has a status, the evidence and — where it helps — a button (Cleaner, Reliability Monitor, memory test, Device Manager, Defender update). Checks whose data isn't available on the hardware show **N/A** and are never counted as healthy. Reports save as HTML or JSON. NVMe drives are read through their own SMART / health log (percentage used, spare capacity, temperature, media errors, unsafe shutdowns, data written) via the in-box Windows driver — no extra software.
+A read-only check that works offline and on remote PCs: disk health and reliability counters, SATA SMART failure prediction, free space, blue screens and unexpected shutdowns (30 days), WHEA hardware errors, the last memory-test result, Reliability Monitor's stability index, devices with driver problems, battery wear, Defender status and definition age (or a third-party antivirus), pending restart and uptime, and whether the local gateway answers. On Windows 10 it also checks **Windows 11 readiness** (processor, memory, disk, UEFI, Secure Boot, TPM 2.0) and whether an **Extended Security Updates** licence is active; fleet inventory reports the same. Each row has a status, the evidence and — where it helps — a button (Cleaner, Reliability Monitor, memory test, Device Manager, Defender update). Checks whose data isn't available on the hardware show **N/A** and are never counted as healthy. Reports save as HTML or JSON. NVMe drives are read through their own SMART / health log (percentage used, spare capacity, temperature, media errors, unsafe shutdowns, data written) via the in-box Windows driver — no extra software.
 
 The other Health Check tabs:
 
@@ -159,7 +159,8 @@ When a remote computer is targeted, these run on it: Health Check (and its Event
 ## Safety and audit trail
 
 - Nothing is deleted without an Analyze / confirm step; headless runs need `-Yes`.
-- Files removed from the Space Map and Large Files views go to the Recycle Bin.
+- Files removed from the Space Map and Large Files views go to the Recycle Bin. Duplicates won't let you recycle every copy in a group, and cloud-only (OneDrive "free up space") files are skipped so nothing gets downloaded.
+- Right-click menu changes are registry values recorded in the undo history.
 - Browser history, cookies and saved passwords are never touched.
 - A restore point is created before app removal and tweaks (can be turned off), and every tweak's previous values go to the undo journal.
 - **Action log** — every change (who, when, which computer, what, result) is appended to `%ProgramData%\AWiper\Logs\actions-<yyyy-MM>.jsonl` and, when elevated, to the Application event log (source `AWiper`) for event forwarding or a SIEM.

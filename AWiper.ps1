@@ -139,7 +139,7 @@
 
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.8.0
+    Version : 1.9.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -178,7 +178,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.8.0'
+$script:AppVersion = '1.9.0'
 $script:CliMode = [bool]($Config -or $Analyze -or $Clean -or $HealthCheck -or $ApplyTweak -or $RevertTweak -or $RemoveApp -or
                          $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps -or $CheckDrivers -or $Backup -or $Inventory -or $ExportNeeds -or $Fetch)
 
@@ -615,6 +615,141 @@ namespace AWiper
         private static TreeRect Make(DiskNode n, double x, double y, double w, double h)
         {
             var r = new TreeRect(); r.Node = n; r.X = x; r.Y = y; r.W = w; r.H = h; return r;
+        }
+    }
+
+    // ------------------------------------------------------------------ Duplicate files
+    // Same size -> same hash of the first 64 KB -> same full SHA-256. Cloud-only placeholders
+    // (OneDrive "free up space") are skipped so the scan never triggers downloads.
+    public class DuplicateFinder
+    {
+        public volatile bool Cancel;
+        public long FilesSeen, Candidates, Hashed, Groups, WastedBytes;
+        public volatile string Status = "";
+        public bool Completed;
+        public string Error;
+        public List<FileEntry> Results = new List<FileEntry>();
+
+        private static string HashFile(string path, long limit)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1 << 16))
+            {
+                if (limit <= 0) return BitConverter.ToString(sha.ComputeHash(fs));
+                byte[] buf = new byte[(int)Math.Min(limit, fs.Length)];
+                int read = 0, n;
+                while (read < buf.Length && (n = fs.Read(buf, read, buf.Length - read)) > 0) read += n;
+                return BitConverter.ToString(sha.ComputeHash(buf, 0, read));
+            }
+        }
+
+        public void Scan(string root, long minSize)
+        {
+            try
+            {
+                var bySize = new Dictionary<long, List<FileInfo>>();
+                var stack = new Stack<DirectoryInfo>();
+                stack.Push(new DirectoryInfo(root));
+                while (stack.Count > 0 && !Cancel)
+                {
+                    var d = stack.Pop();
+                    Status = d.FullName;
+                    FileSystemInfo[] entries;
+                    try { entries = d.GetFileSystemInfos(); } catch { continue; }
+                    foreach (var e in entries)
+                    {
+                        FileAttributes a;
+                        try { a = e.Attributes; } catch { continue; }
+                        if ((a & FileAttributes.ReparsePoint) != 0) continue;
+                        if ((a & FileAttributes.Directory) != 0) { stack.Push((DirectoryInfo)e); continue; }
+                        if ((a & FileAttributes.Offline) != 0 || ((int)a & 0x400000) != 0 || ((int)a & 0x40000) != 0) continue;
+                        var f = (FileInfo)e;
+                        long len;
+                        try { len = f.Length; } catch { continue; }
+                        if (len < minSize || len == 0) continue;
+                        FilesSeen++;
+                        List<FileInfo> l;
+                        if (!bySize.TryGetValue(len, out l)) { l = new List<FileInfo>(); bySize[len] = l; }
+                        l.Add(f);
+                    }
+                }
+                int group = 0;
+                foreach (var kv in bySize)
+                {
+                    if (Cancel) break;
+                    if (kv.Value.Count < 2) continue;
+                    Candidates += kv.Value.Count;
+                    var byPartial = new Dictionary<string, List<FileInfo>>();
+                    foreach (var f in kv.Value)
+                    {
+                        if (Cancel) break;
+                        try
+                        {
+                            Status = f.FullName;
+                            string h = HashFile(f.FullName, 65536);
+                            List<FileInfo> l;
+                            if (!byPartial.TryGetValue(h, out l)) { l = new List<FileInfo>(); byPartial[h] = l; }
+                            l.Add(f);
+                        }
+                        catch { }
+                    }
+                    foreach (var p in byPartial.Values)
+                    {
+                        if (p.Count < 2) continue;
+                        var byFull = new Dictionary<string, List<FileInfo>>();
+                        foreach (var f in p)
+                        {
+                            if (Cancel) break;
+                            try
+                            {
+                                Status = f.FullName;
+                                string h = kv.Key <= 65536 ? "small" : HashFile(f.FullName, 0);
+                                Hashed++;
+                                List<FileInfo> l;
+                                if (!byFull.TryGetValue(h, out l)) { l = new List<FileInfo>(); byFull[h] = l; }
+                                l.Add(f);
+                            }
+                            catch { }
+                        }
+                        foreach (var g in byFull.Values)
+                        {
+                            if (g.Count < 2) continue;
+                            group++; Groups++;
+                            WastedBytes += kv.Key * (g.Count - 1);
+                            foreach (var f in g)
+                            {
+                                var fe = new FileEntry();
+                                fe.Name = f.Name; fe.FullPath = f.FullName; fe.Size = kv.Key; fe.Extension = f.Extension.ToLowerInvariant();
+                                try { fe.Folder = f.DirectoryName; fe.Modified = f.LastWriteTime; } catch { }
+                                fe.Status = "Group " + group + " (" + g.Count + " copies)";
+                                Results.Add(fe);
+                            }
+                        }
+                    }
+                }
+                Completed = !Cancel;
+            }
+            catch (Exception ex) { Error = ex.Message; }
+        }
+    }
+
+    // Groups 64-bit perceptual hashes (dHash) whose Hamming distance is small: visually similar photos.
+    public static class PhotoMatch
+    {
+        private static int Bits(ulong v) { int c = 0; while (v != 0) { v &= v - 1; c++; } return c; }
+        public static int[] Group(ulong[] hashes, int maxDistance)
+        {
+            int n = hashes.Length;
+            int[] parent = new int[n];
+            for (int i = 0; i < n; i++) parent[i] = i;
+            Func<int, int> find = null;
+            find = x => { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+            for (int i = 0; i < n; i++)
+                for (int j = i + 1; j < n; j++)
+                    if (Bits(hashes[i] ^ hashes[j]) <= maxDistance) { int a = find(i), b = find(j); if (a != b) parent[b] = a; }
+            int[] g = new int[n];
+            for (int i = 0; i < n; i++) g[i] = find(i);
+            return g;
         }
     }
 
@@ -2859,6 +2994,7 @@ function Get-WInventory {
         CPU = ([string]$cpu.Name).Trim(); RamGB = [Math]::Round($cs.TotalPhysicalMemory / 1GB)
         SystemFreeGB = $(if ($sys) { [Math]::Round($sys.FreeSpace / 1GB, 1) } else { $null }); Disks = $disks
         SecureBoot = $sb; Tpm = $tpm; DefenderSigDays = $sig; RebootPending = $reboot; IPs = $ips; Programs = $apps
+        Win11Ready = $(if ([int]$cv.CurrentBuild -ge 22000) { 'Running Windows 11' } else { try { (Get-WWin11Readiness $true).Summary } catch { '?' } })
         Collected = (Get-Date).ToString('o')
     }
 }
@@ -2896,7 +3032,7 @@ function Invoke-WFleetInventory([string[]]$Hosts, [string]$OutRoot) {
         if ($c.Count -or $added.Count -or $removed.Count) { [pscustomobject]@{ Computer = $r.Computer; Changes = $c; Added = $added; Removed = $removed } }
     }
     ConvertTo-Json -InputObject $results.ToArray() -Depth 4 | Set-Content -LiteralPath (Join-Path $dir 'inventory.json') -Encoding UTF8   # (@(List) throws in PS 5.1)
-    $results | Select-Object Computer, Domain, User, Manufacturer, Model, Serial, Bios, OS, DisplayVersion, Build, Installed, LastBoot, CPU, RamGB, SystemFreeGB, SecureBoot, Tpm, DefenderSigDays, RebootPending,
+    $results | Select-Object Computer, Domain, User, Manufacturer, Model, Serial, Bios, OS, DisplayVersion, Build, Installed, LastBoot, CPU, RamGB, SystemFreeGB, SecureBoot, Tpm, DefenderSigDays, RebootPending, Win11Ready,
         @{ n = 'Disks'; e = { $_.Disks -join '; ' } }, @{ n = 'IPs'; e = { $_.IPs -join ', ' } }, @{ n = 'Programs'; e = { @($_.Programs).Count } } |
         Export-Csv -LiteralPath (Join-Path $dir 'inventory.csv') -NoTypeInformation -Encoding UTF8
     if ($fails.Count) { $fails | Export-Csv -LiteralPath (Join-Path $dir 'failed.csv') -NoTypeInformation -Encoding UTF8 }
@@ -2971,6 +3107,186 @@ function Invoke-WBackup($Job) {
     $res.Message = '{0} new or changed file(s) copied, {1} older version(s) kept{2}' -f $res.New, $res.Versioned, $(if ($res.Errors) { ", $($res.Errors) problem(s) - see the log" } else { '' })
     Write-WLog "Backup finished: $($res.Message)"
     [pscustomobject]$res
+}
+
+# ---------------------------------------------------------------- Windows 11 readiness + ESU
+# Checks Microsoft's published minimums. The CPU list is a heuristic (Intel 8th gen or newer, Core
+# Ultra, AMD Ryzen 2000 or newer, any ARM64); Microsoft's PC Health Check is the final word.
+function Get-WWin11Readiness([bool]$Quick = $true) {
+    $checks = New-Object System.Collections.Generic.List[object]
+    $add = { param($Name, $Ok, $Detail) $checks.Add([pscustomobject]@{ Name = $Name; Ok = $Ok; Detail = $Detail }) }
+    $cpu = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue)[0]
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $name = ([string]$cpu.Name).Trim()
+    $cpuOk = $null
+    if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $cpu.Architecture -eq 12) { $cpuOk = $true }
+    elseif ($name -match 'Core\(TM\) Ultra|Core Ultra') { $cpuOk = $true }
+    elseif ($name -match 'i[3579]-(\d{4,5})') { $n = $Matches[1]; $gen = if ($n.Length -eq 5) { [int]$n.Substring(0, 2) } else { [int]$n.Substring(0, 1) }; $cpuOk = $gen -ge 8 }
+    elseif ($name -match 'Core\(TM\) [3579] \d{3}') { $cpuOk = $true }
+    elseif ($name -match 'Ryzen.*?(\d)(\d{3})') { $cpuOk = [int]$Matches[1] -ge 2 -and $name -notmatch '\b(2200U|2300U|2500U|2700U|2800H)\b' }
+    elseif ($name -match 'Xeon|Pentium|Celeron|Atom|EPYC|Athlon') { $cpuOk = $null }
+    else { $cpuOk = $false }
+    $cores = [int]$cpu.NumberOfCores; $ghz = [Math]::Round($cpu.MaxClockSpeed / 1000.0, 1)
+    $basic = $cores -ge 2 -and $ghz -ge 1 -and [Environment]::Is64BitOperatingSystem
+    & $add 'Processor' $(if (-not $basic) { $false } else { $cpuOk }) ("$name ($cores cores, $ghz GHz)" + $(if ($null -eq $cpuOk) { ' - check this model on Microsoft''s supported CPU list' } elseif (-not $cpuOk) { ' - older than the supported list' } else { '' }))
+    $ram = [Math]::Round($cs.TotalPhysicalMemory / 1GB)
+    & $add 'Memory' ($ram -ge 4) "$ram GB (4 GB needed)"
+    $sd = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue
+    $gb = if ($sd) { [Math]::Round($sd.Size / 1GB) } else { 0 }
+    & $add 'System disk' ($gb -ge 64) "$gb GB (64 GB needed)"
+    # Windows sets %firmware_type% (UEFI / Legacy) in every process.
+    $uefi = if ($env:firmware_type) { $env:firmware_type -eq 'UEFI' } else { Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' }
+    & $add 'UEFI firmware' $uefi $(if ($uefi) { 'Booting in UEFI mode' } else { 'Legacy BIOS boot - convert the disk with mbr2gpt and switch to UEFI' })
+    $sb = $null; try { $sb = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -ErrorAction Stop).UEFISecureBootEnabled } catch { }
+    & $add 'Secure Boot' ([bool]$uefi) $(if ($sb -eq 1) { 'On' } elseif ($uefi) { 'Supported but off (capable is enough for the upgrade)' } else { 'Needs UEFI' })
+    $tpm = $null; try { $t = Get-CimInstance -Namespace root/cimv2/Security/MicrosoftTpm -ClassName Win32_Tpm -ErrorAction Stop; if ($t) { $tpm = ([string]$t.SpecVersion).Split(',')[0].Trim() } } catch { }
+    if ($tpm) { & $add 'TPM' ([version]$tpm -ge [version]'2.0') ("TPM $tpm" + $(if ([version]$tpm -lt [version]'2.0') { ' (2.0 needed)' } else { '' })) }
+    else {
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        & $add 'TPM' $(if ($isAdmin) { $false } else { $null }) $(if ($isAdmin) { 'No TPM found - it may be switched off in the BIOS (PTT / fTPM)' } else { 'Needs administrator rights to check' })
+    }
+    if (-not $Quick) {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('awiper-dx-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+        try {
+            $p = Start-Process dxdiag.exe -ArgumentList "/whql:off /t `"$tmp`"" -PassThru -WindowStyle Hidden; [void]$p.WaitForExit(60000)
+            $txt = Get-Content -LiteralPath $tmp -Raw -ErrorAction Stop
+            $dx = [regex]::Match($txt, 'DDI Version:\s*(\d+)').Groups[1].Value; $wddm = [regex]::Match($txt, 'Driver Model:\s*WDDM\s*([\d\.]+)').Groups[1].Value
+            & $add 'Graphics' ([int]$dx -ge 12 -and [double]$wddm -ge 2) "DirectX $dx, WDDM $wddm (DirectX 12 / WDDM 2.0 needed)"
+        } catch { & $add 'Graphics' $null 'Could not read dxdiag' }
+        finally { if (Test-Path -LiteralPath $tmp) { [IO.File]::Delete($tmp) } }
+    }
+    $fail = @($checks | Where-Object { $_.Ok -eq $false }); $unk = @($checks | Where-Object { $null -eq $_.Ok })
+    # Extended Security Updates: a Windows 10 ESU licence shows up as an activated licensing product.
+    $esu = $null
+    try {
+        $esu = @(Get-CimInstance SoftwareLicensingProduct -Filter "Name LIKE '%ESU%' AND PartialProductKey IS NOT NULL" -ErrorAction Stop |
+            ForEach-Object { '{0} ({1})' -f $_.Name, $(switch ([int]$_.LicenseStatus) { 1 { 'active' } 0 { 'not active' } default { "status $($_.LicenseStatus)" } }) })
+    } catch { }
+    [pscustomobject]@{
+        Ready = ($fail.Count -eq 0 -and $unk.Count -eq 0); Blockers = @($fail | ForEach-Object Name); Unknown = @($unk | ForEach-Object Name)
+        Checks = $checks.ToArray(); Esu = @($esu)
+        Summary = if ($fail.Count) { 'Not ready: ' + (($fail | ForEach-Object { "$($_.Name) - $($_.Detail)" }) -join '; ') } elseif ($unk.Count) { 'Probably ready - could not confirm: ' + (($unk | ForEach-Object Name) -join ', ') } else { 'Meets the Windows 11 requirements' }
+    }
+}
+
+# ---------------------------------------------------------------- Old downloads
+function Get-WDownloadsFolder {
+    $p = try { (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction Stop).'{374DE290-123F-4565-9164-39C4925E467B}' } catch { $null }
+    if ($p) { $p = [Environment]::ExpandEnvironmentVariables($p) } else { $p = Join-Path $env:USERPROFILE 'Downloads' }
+    $p
+}
+function Get-WFileKind([string]$Ext) {
+    switch -Regex ($Ext.ToLowerInvariant()) {
+        '^\.(exe|msi|msix|msixbundle|appx|appxbundle|msu|cab)$' { 'Installer'; break }
+        '^\.(iso|img|vhd|vhdx|vmdk|wim|esd)$' { 'Disk image'; break }
+        '^\.(zip|7z|rar|tar|gz|tgz|bz2|xz|zst)$' { 'Archive'; break }
+        '^\.(mp4|mkv|avi|mov|wmv|webm|m4v|flv|mpg|mpeg|ts)$' { 'Video'; break }
+        '^\.(jpg|jpeg|png|gif|bmp|tif|tiff|heic|heif|webp|raw|cr2|cr3|nef|arw|dng|psd)$' { 'Picture'; break }
+        '^\.(mp3|wav|flac|aac|m4a|ogg|wma|opus)$' { 'Music'; break }
+        '^\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|odt|ods|csv|md|epub)$' { 'Document'; break }
+        '^\.(ps1|py|js|ts|cs|cpp|c|h|java|go|rs|json|xml|yml|yaml|sql|sh|bat|cmd)$' { 'Code'; break }
+        default { 'Other' }
+    }
+}
+# Files in Downloads not modified or opened for $Days days, biggest first.
+function Get-WOldDownloads([int]$Days = 90) {
+    $root = Get-WDownloadsFolder
+    $cut = (Get-Date).AddDays(-$Days)
+    foreach ($f in @(Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue)) {
+        if ($f.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        if (([int]$f.Attributes -band 0x400000) -or ([int]$f.Attributes -band 0x40000)) { continue }   # cloud-only placeholder
+        if ($f.Name -eq 'desktop.ini') { continue }
+        $last = if ($f.LastAccessTime -gt $f.LastWriteTime) { $f.LastAccessTime } else { $f.LastWriteTime }
+        if ($last -gt $cut) { continue }
+        [pscustomobject]@{ Path = $f.FullName; Name = $f.Name; Folder = $f.DirectoryName; Size = $f.Length; Extension = $f.Extension.ToLowerInvariant(); Modified = $f.LastWriteTime; Kind = Get-WFileKind $f.Extension }
+    }
+}
+
+# ---------------------------------------------------------------- Right-click menu (context menu) entries
+# Shell extension handlers (shellex\ContextMenuHandlers) and static verbs (shell\<verb>) for files,
+# folders, the desktop / folder background and drives. Handlers are turned off through the system's
+# Shell Extensions\Blocked list; verbs with a LegacyDisable value. Both are undone by removing the value.
+function Get-WContextMenu {
+    $blocked = @{}
+    foreach ($bk in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Blocked', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Blocked') {
+        try { (Get-Item -LiteralPath $bk -ErrorAction Stop).GetValueNames() | ForEach-Object { if ($_) { $blocked[$_.ToUpperInvariant()] = $true } } } catch { }
+    }
+    $where = [ordered]@{ '*' = 'Files'; 'AllFilesystemObjects' = 'Files and folders'; 'Directory' = 'Folders'; 'Directory\Background' = 'Folder background'; 'Folder' = 'Folders'; 'Drive' = 'Drives'; 'DesktopBackground' = 'Desktop' }
+    $builtIn = '^(open|opennewwindow|opennewprocess|opennewtab|explore|find|print|printto|runas|runasuser|edit|properties|cmd|powershell|Powershell|pintohome|pintostartscreen|Windows\.Share|Windows\.ModernShare|UpdateEncryptionSettings.*|encrypt-bde.*|manage-bde|resume-bde.*|unlock-bde|change-passphrase|change-pin|format)$'
+    $seen = @{}
+    $companies = @{}
+    $companyOf = { param($f) if (-not $companies.ContainsKey($f)) { $companies[$f] = try { [string][Diagnostics.FileVersionInfo]::GetVersionInfo($f).CompanyName } catch { '' } }; $companies[$f] }
+    foreach ($hive in 'HKLM', 'HKCU') {
+        foreach ($cls in $where.Keys) {
+            $base = "$($hive):\SOFTWARE\Classes\$cls"
+            # Shell extension handlers.
+            foreach ($k in @(Get-ChildItem -LiteralPath "$base\shellex\ContextMenuHandlers" -ErrorAction SilentlyContinue)) {
+                $clsid = [string]$k.GetValue('')
+                if ($k.PSChildName -match '^\{[0-9A-Fa-f-]{36}\}$') { $clsid = $k.PSChildName }
+                if ($clsid -notmatch '^\{[0-9A-Fa-f-]{36}\}$') { continue }
+                $id = "H|$($clsid.ToUpperInvariant())|$cls"
+                if ($seen[$id]) { continue }; $seen[$id] = $true
+                $name = $null; $dll = $null
+                foreach ($root in 'HKLM:\SOFTWARE\Classes\CLSID', 'HKCU:\SOFTWARE\Classes\CLSID') {
+                    $ck = Get-Item -LiteralPath "$root\$clsid" -ErrorAction SilentlyContinue
+                    if ($ck) { if (-not $name) { $name = [string]$ck.GetValue('') }; if (-not $dll) { $dll = [string](Get-ItemProperty -LiteralPath "$root\$clsid\InprocServer32" -ErrorAction SilentlyContinue).'(default)' } }
+                }
+                $dllPath = if ($dll) { [Environment]::ExpandEnvironmentVariables($dll.Trim('"')) } else { '' }
+                $company = if ($dllPath -and (Test-Path -LiteralPath $dllPath)) { & $companyOf $dllPath } else { '' }
+                $label = if ($k.PSChildName -notmatch '^\{') { $k.PSChildName } elseif ($name) { $name } else { $clsid }
+                [pscustomobject]@{ Id = $id; Kind = 'Handler'; Name = $label.Trim(); Where = $where[$cls]; Company = [string]$company; Command = $dllPath; Clsid = $clsid; Key = "$base\shellex\ContextMenuHandlers\$($k.PSChildName)"
+                    Hive = $hive; Enabled = -not $blocked[$clsid.ToUpperInvariant()]; Microsoft = ($company -match '^Microsoft') }
+            }
+            # Static verbs.
+            foreach ($k in @(Get-ChildItem -LiteralPath "$base\shell" -ErrorAction SilentlyContinue)) {
+                if ($k.PSChildName -match $builtIn) { continue }
+                $names = @(); try { $names = $k.GetValueNames() } catch { }
+                if ($names -contains 'ProgrammaticAccessOnly') { continue }      # never shown in the menu
+                $id = "V|$hive|$cls|$($k.PSChildName)"
+                if ($seen[$id]) { continue }; $seen[$id] = $true
+                $label = [string]$k.GetValue('MUIVerb'); if (-not $label) { $label = [string]$k.GetValue('') }
+                if (-not $label -or $label -match '^@') { $label = $k.PSChildName }
+                $cmd = [string](Get-ItemProperty -LiteralPath "$($k.PSPath)\command" -ErrorAction SilentlyContinue).'(default)'
+                $exe = [regex]::Match($cmd, '^"([^"]+)"|^(\S+)'); $exePath = if ($exe.Groups[1].Success) { $exe.Groups[1].Value } else { $exe.Groups[2].Value }
+                $company = ''
+                if ($exePath) { $exePath = [Environment]::ExpandEnvironmentVariables($exePath); if (Test-Path -LiteralPath $exePath) { $company = & $companyOf $exePath } }
+                # Windows' own verbs: no program of their own, a shell32-style resource label or a COM command handler.
+                $mui = [string]$k.GetValue('MUIVerb')
+                $delegate = [string](Get-ItemProperty -LiteralPath "$($k.PSPath)\command" -ErrorAction SilentlyContinue).DelegateExecute
+                $winVerb = (-not $exePath -and ($delegate -or $mui -match '^@%?\w*%?\\?.*(shell32|windows\.storage|twinui|explorerframe|ntshrui)' -or $names -contains 'CommandStateHandler' -or $names -contains 'ExplorerCommandHandler')) -or
+                           ($exePath -and $exePath -like "$env:SystemRoot\*" -and (-not $company -or $company -match '^Microsoft'))
+                [pscustomobject]@{ Id = $id; Kind = 'Command'; Name = ($label -replace '&', '').Trim(); Where = $where[$cls]; Company = $(if ($winVerb -and -not $company) { 'Windows' } else { [string]$company }); Command = $cmd; Clsid = ''; Key = "$base\shell\$($k.PSChildName)"
+                    Hive = $hive; Enabled = $names -notcontains 'LegacyDisable'; Microsoft = ($winVerb -or $company -match '^Microsoft') }
+            }
+        }
+    }
+}
+
+# Turns one entry on or off and returns an undo capture (registry snapshot of the values it touched).
+# Handlers are blocked machine-wide with admin rights, otherwise for the signed-in user only.
+function Set-WContextMenuItem($Item, [bool]$Enabled) {
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $sub = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Blocked'
+    if ($Item.Kind -eq 'Handler') {
+        $keys = if ($Enabled) { @("HKCU:\$sub") + @(if ($isAdmin) { "HKLM:\$sub" }) } else { @(if ($isAdmin) { "HKLM:\$sub" } else { "HKCU:\$sub" }) }
+        $vals = @($keys | ForEach-Object { @{ Path = $_; Name = $Item.Clsid } })
+    } else {
+        if ($Item.Hive -eq 'HKLM' -and -not $isAdmin) { throw 'This entry is for all users - run AWiper as administrator to change it.' }
+        $vals = @(@{ Path = $Item.Key; Name = 'LegacyDisable' })
+    }
+    if ($Enabled -and $Item.Kind -eq 'Handler' -and -not $isAdmin -and $null -ne (Get-WRegValue "HKLM:\$sub" $Item.Clsid)) {
+        throw 'This entry is blocked for all users - run AWiper as administrator to turn it back on.'
+    }
+    $snap = @(Get-WRegSnapshot $vals)
+    foreach ($v in $vals) {
+        if ($Enabled) { Remove-ItemProperty -LiteralPath $v.Path -Name $v.Name -ErrorAction SilentlyContinue }
+        else {
+            if (-not (Test-Path -LiteralPath $v.Path)) { New-Item -Path $v.Path -Force -ErrorAction Stop | Out-Null }
+            New-ItemProperty -LiteralPath $v.Path -Name $v.Name -Value $(if ($Item.Kind -eq 'Handler') { [string]$Item.Name } else { '' }) -PropertyType String -Force -ErrorAction Stop | Out-Null
+        }
+    }
+    Write-WLog ("Right-click menu: {0} '{1}' ({2})" -f $(if ($Enabled) { 'turned on' } else { 'turned off' }), $Item.Name, $Item.Where)
+    [pscustomobject]@{ UndoKind = 'Registry'; Label = ('Right-click menu: {0} "{1}"' -f $(if ($Enabled) { 'turned on' } else { 'turned off' }), $Item.Name); Snapshot = $snap; RemoveKeys = @() }
 }
 
 # ---------------------------------------------------------------- Health check
@@ -3144,6 +3460,18 @@ function Get-WHealth {
         elseif (Test-Connection -ComputerName $gw.NextHop -Count 1 -Quiet -ErrorAction SilentlyContinue) { & $add 'Network' 'Local network' 'Good' "Gateway $($gw.NextHop) is reachable" '' }
         else { & $add 'Network' 'Local network' 'Warning' "Gateway $($gw.NextHop) did not answer a ping (it may block ping)" '' }
     } catch { & $add 'Network' 'Local network' 'Info' 'No default gateway - this PC is not on a routed network' '' }
+
+    # Windows 10 PCs: can they move to Windows 11, and are they covered by Extended Security Updates?
+    try {
+        $build = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).CurrentBuild
+        if ($build -lt 22000) {
+            $w = Get-WWin11Readiness $true
+            $esu = @($w.Esu | Where-Object { $_ -match 'active\)' -and $_ -notmatch 'not active' })
+            $esuText = if ($esu.Count) { " ESU: $($esu -join ', ')." } else { ' No Extended Security Updates licence - Windows 10 stopped getting security fixes in October 2025.' }
+            $st = if ($w.Ready) { 'Info' } elseif ($esu.Count) { 'Warning' } else { 'Problem' }
+            & $add 'Win11' 'Windows 11 readiness' $st ($w.Summary + '.' + $esuText) ''
+        }
+    } catch { & $add 'Win11' 'Windows 11 readiness' 'NA' $_.Exception.Message '' }
 
     $rows
 }
@@ -3322,6 +3650,30 @@ $script:CleanerRules = @(
     New-AWRule 'Clipboard'  'Privacy' 'Clipboard'               'Clears the current clipboard contents.' -Kind 'Action' -Action 'Clipboard' -Default $false
     New-AWRule 'Dns'        'Privacy' 'DNS resolver cache'      'Flushes cached DNS lookups (ipconfig /flushdns).' -Kind 'Action' -Action 'FlushDns' -Default $false
 )
+
+# Steam keeps a per-game shader pre-cache in every library folder (steamapps\shadercache). Libraries
+# can be on any drive, so they're read from Steam's own libraryfolders.vdf on this PC.
+function Get-AWSteamLibraries {
+    $steam = try { (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamPath } catch { $null }
+    if (-not $steam) { return @() }
+    $libs = New-Object System.Collections.Generic.List[string]
+    $libs.Add(($steam -replace '/', '\'))
+    $vdf = Join-Path $steam 'steamapps\libraryfolders.vdf'
+    if (Test-Path -LiteralPath $vdf) {
+        foreach ($m in [regex]::Matches((Get-Content -LiteralPath $vdf -Raw), '"path"\s+"([^"]+)"')) {
+            $p = $m.Groups[1].Value -replace '\\\\', '\' -replace '/', '\'
+            if ($libs -notcontains $p) { $libs.Add($p) }
+        }
+    }
+    @($libs | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'steamapps') })
+}
+$steamLibs = @(Get-AWSteamLibraries)
+if ($steamLibs.Count) {
+    $r = New-AWRule 'SteamShaders' 'Applications' 'Steam shader pre-caches' "Per-game shader caches in $($steamLibs.Count) Steam library folder(s). Steam downloads or rebuilds them when a game next starts." -Targets @($steamLibs | ForEach-Object { T (Join-Path $_ 'steamapps\shadercache') }) -Process 'steam' -ProcessLabel 'Steam' -Default $false
+    $r.UserScope = $true      # library paths are this PC's
+    $at = [array]::FindIndex([object[]]$script:CleanerRules, [Predicate[object]]{ param($x) $x.Id -eq 'Steam' }) + 1
+    $script:CleanerRules = @($script:CleanerRules[0..($at - 1)]) + @($r) + @($script:CleanerRules[$at..($script:CleanerRules.Count - 1)])
+}
 #endregion
 
 #region ---------------------------------------------------------------- Debloat catalog
@@ -5081,6 +5433,23 @@ if ($script:CliMode) {
                   </Border>
                   <Border Style="{StaticResource Card}" Margin="0,14,0,0">
                     <StackPanel>
+                      <TextBlock Text="BY KIND" Style="{StaticResource Caps}" Margin="0,0,0,6"/>
+                      <ItemsControl x:Name="MapKindList">
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate>
+                            <Grid Margin="0,4" ToolTip="{Binding PercentText}">
+                              <Grid.ColumnDefinitions><ColumnDefinition Width="86"/><ColumnDefinition Width="*"/><ColumnDefinition Width="72"/></Grid.ColumnDefinitions>
+                              <TextBlock Text="{Binding Extension}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                              <ProgressBar Grid.Column="1" Height="6" Maximum="100" Value="{Binding RelPercent, Mode=OneWay}" Foreground="{StaticResource TealGrad}" Margin="4,0,8,0"/>
+                              <TextBlock Grid.Column="2" Text="{Binding SizeText}" Foreground="#8C95BD" TextAlignment="Right"/>
+                            </Grid>
+                          </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
+                    </StackPanel>
+                  </Border>
+                  <Border Style="{StaticResource Card}" Margin="0,14,0,0">
+                    <StackPanel>
                       <TextBlock Text="FILE TYPES" Style="{StaticResource Caps}" Margin="0,0,0,6"/>
                       <ItemsControl x:Name="MapExtList">
                         <ItemsControl.ItemTemplate>
@@ -5103,8 +5472,37 @@ if ($script:CliMode) {
 
           <!-- ===== Large Files ===== -->
           <Grid x:Name="ViewLarge" Visibility="Collapsed">
-            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-            <Border Style="{StaticResource Card}" Padding="14,12">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Border Style="{StaticResource Card}" Padding="6" Margin="0,0,0,14">
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal">
+                  <RadioButton x:Name="LTabLargest" Style="{StaticResource SegBtn}" GroupName="LTab" IsChecked="True" Content="Largest" MinWidth="100"/>
+                  <RadioButton x:Name="LTabOld"     Style="{StaticResource SegBtn}" GroupName="LTab" Content="Old downloads" MinWidth="110"/>
+                  <RadioButton x:Name="LTabDupes"   Style="{StaticResource SegBtn}" GroupName="LTab" Content="Duplicates" MinWidth="100"/>
+                </StackPanel>
+                <StackPanel x:Name="OldBar" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" Visibility="Collapsed" Margin="0,0,6,0">
+                  <TextBlock Text="Not opened for" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                  <ComboBox x:Name="OldDays" Width="110" SelectedIndex="1">
+                    <ComboBoxItem Content="30 days" Tag="30"/><ComboBoxItem Content="90 days" Tag="90"/><ComboBoxItem Content="6 months" Tag="182"/><ComboBoxItem Content="1 year" Tag="365"/>
+                  </ComboBox>
+                  <Button x:Name="OldFind" Content="Find old downloads" Style="{StaticResource BtnPurple}" Padding="14,6" FontSize="12" Margin="8,0,0,0"/>
+                </StackPanel>
+                <StackPanel x:Name="DupeBar" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" Visibility="Collapsed" Margin="0,0,6,0">
+                  <TextBox x:Name="DupePath" Width="230" Tag="Folder to search" Padding="8,6"/>
+                  <Button x:Name="DupeBrowse" Content="Browse" Style="{StaticResource BtnChip}"/>
+                  <Border Background="#14FFFFFF" CornerRadius="8" Padding="3" Margin="4,0">
+                    <StackPanel Orientation="Horizontal">
+                      <RadioButton x:Name="DupeExact"   Style="{StaticResource SegBtn}" GroupName="DupeMode" IsChecked="True" Content="Exact copies"/>
+                      <RadioButton x:Name="DupePhotos"  Style="{StaticResource SegBtn}" GroupName="DupeMode" Content="Similar photos"/>
+                    </StackPanel>
+                  </Border>
+                  <Button x:Name="DupeFind" Content="Find duplicates" Style="{StaticResource BtnPurple}" Padding="14,6" FontSize="12" Margin="4,0,0,0"/>
+                  <Button x:Name="DupeStop" Content="Stop" Style="{StaticResource BtnChip}" IsEnabled="False"/>
+                </StackPanel>
+              </Grid>
+            </Border>
+            <Border Grid.Row="1" Style="{StaticResource Card}" Padding="14,12">
               <Grid>
                 <Grid.ColumnDefinitions><ColumnDefinition Width="320"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                 <Grid>
@@ -5116,13 +5514,14 @@ if ($script:CliMode) {
                 <TextBlock x:Name="LargeInfo" Grid.Column="1" Text="Run a scan in Space Map to list the largest files." Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="16,0"/>
                 <StackPanel Grid.Column="2" Orientation="Horizontal">
                   <Button x:Name="LargeScan" Content="Scan a drive" Style="{StaticResource BtnChip}"/>
+                  <Button x:Name="DupeKeep" Content="Tick extra copies" Style="{StaticResource BtnChip}" Visibility="Collapsed" ToolTip="In every group, keeps the newest copy unticked and ticks the rest"/>
                   <Button x:Name="LargeOpen" Content="Open location" Style="{StaticResource BtnChip}"/>
                   <Button x:Name="LargeExport" Content="Export CSV" Style="{StaticResource BtnChip}"/>
                   <Button x:Name="LargeRecycle" Content="Recycle checked" Style="{StaticResource BtnPurple}" Padding="14,6" FontSize="12"/>
                 </StackPanel>
               </Grid>
             </Border>
-            <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="12,10">
+            <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="12,10">
               <ListView x:Name="LargeList">
                 <ListView.View>
                   <GridView>
@@ -5137,6 +5536,9 @@ if ($script:CliMode) {
                     </GridViewColumn>
                     <GridViewColumn Header="Type" Width="70" DisplayMemberBinding="{Binding Extension}"/>
                     <GridViewColumn Header="Modified" Width="130" DisplayMemberBinding="{Binding ModifiedText}"/>
+                    <GridViewColumn x:Name="LargeStatusCol" Header="Group" Width="0">
+                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Status}" Foreground="#B58CFF" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
+                    </GridViewColumn>
                     <GridViewColumn Header="Folder" Width="460">
                       <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
@@ -5550,21 +5952,54 @@ if ($script:CliMode) {
 
           <!-- ===== Startup ===== -->
           <Grid x:Name="ViewStartup" Visibility="Collapsed">
-            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-            <Border Style="{StaticResource Card}" Padding="20,16">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Border Style="{StaticResource Card}" Padding="6" Margin="0,0,0,14" HorizontalAlignment="Left">
+              <StackPanel Orientation="Horizontal">
+                <RadioButton x:Name="STabStartup" Style="{StaticResource SegBtn}" GroupName="STab" IsChecked="True" Content="Startup" MinWidth="110"/>
+                <RadioButton x:Name="STabMenu"    Style="{StaticResource SegBtn}" GroupName="STab" Content="Right-click menu" MinWidth="130"/>
+              </StackPanel>
+            </Border>
+            <Border Grid.Row="1" Style="{StaticResource Card}" Padding="20,16">
               <Grid>
                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                 <StackPanel>
-                  <TextBlock Text="Startup programs" Style="{StaticResource H2}"/>
-                  <TextBlock x:Name="StartupInfo" Text="Disabled items stay installed, they just won't launch when you sign in. Uses the same switches as Task Manager." Style="{StaticResource Muted}" Margin="0,4,0,0"/>
+                  <TextBlock x:Name="StartupTitle" Text="Startup programs" Style="{StaticResource H2}"/>
+                  <TextBlock x:Name="StartupInfo" Text="Disabled items stay installed, they just won't launch when you sign in. Uses the same switches as Task Manager." Style="{StaticResource Muted}" Margin="0,4,0,0" TextWrapping="Wrap"/>
                 </StackPanel>
-                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <StackPanel x:Name="StartupButtons" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                   <Button x:Name="StartupOpen" Content="Open file location" Style="{StaticResource BtnChip}"/>
                   <Button x:Name="StartupRefresh" Content="Refresh" Style="{StaticResource BtnChip}" Margin="0"/>
                 </StackPanel>
+                <StackPanel x:Name="MenuButtons" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Visibility="Collapsed">
+                  <CheckBox x:Name="MenuShowMs" Content="Show Microsoft entries" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                  <Button x:Name="MenuOpen" Content="Open file location" Style="{StaticResource BtnChip}"/>
+                  <Button x:Name="MenuRestart" Content="Restart Explorer" Style="{StaticResource BtnChip}" ToolTip="Changes show up after Explorer restarts"/>
+                  <Button x:Name="MenuRefresh" Content="Refresh" Style="{StaticResource BtnChip}" Margin="0"/>
+                </StackPanel>
               </Grid>
             </Border>
-            <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="12,10">
+            <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="12,10">
+              <Grid>
+              <ListView x:Name="MenuList" Visibility="Collapsed">
+                <ListView.View>
+                  <GridView>
+                    <GridViewColumn Header="Status" Width="86">
+                      <GridViewColumn.CellTemplate><DataTemplate>
+                        <CheckBox Style="{StaticResource Switch}" IsChecked="{Binding Enabled, Mode=OneWay}" Margin="4,0,0,0"/>
+                      </DataTemplate></GridViewColumn.CellTemplate>
+                    </GridViewColumn>
+                    <GridViewColumn Header="Name" Width="230">
+                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
+                    </GridViewColumn>
+                    <GridViewColumn Header="Shows on" Width="130" DisplayMemberBinding="{Binding Where}"/>
+                    <GridViewColumn Header="Type" Width="90" DisplayMemberBinding="{Binding Kind}"/>
+                    <GridViewColumn Header="Company" Width="170" DisplayMemberBinding="{Binding Company}"/>
+                    <GridViewColumn Header="Runs" Width="420">
+                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Command}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Command}"/></DataTemplate></GridViewColumn.CellTemplate>
+                    </GridViewColumn>
+                  </GridView>
+                </ListView.View>
+              </ListView>
               <ListView x:Name="StartupList">
                 <ListView.View>
                   <GridView>
@@ -5584,6 +6019,7 @@ if ($script:CliMode) {
                   </GridView>
                 </ListView.View>
               </ListView>
+              </Grid>
             </Border>
           </Grid>
 
@@ -6483,6 +6919,13 @@ $script:Timer.Add_Tick({
             $ui.StatusProgress.Visibility = 'Visible'; $ui.StatusProgress.IsIndeterminate = $false
             $ui.StatusProgress.Value = [Math]::Min(100, $u.RecordsScanned * 100.0 / $u.RecordsTotal)
         }
+        elseif ($script:DupeRunning -and $script:Dupes) {
+            $d = $script:Dupes
+            $msg = if ($d.FilesSeen -and $d.Candidates) { 'Comparing {0:N0} same-size files of {1:N0} - {2:N0} group(s) so far - {3}' -f $d.Candidates, $d.FilesSeen, $d.Groups, $d.Status }
+                   else { 'Listing files: {0:N0} - {1}' -f $d.FilesSeen, $d.Status }
+            Set-AWStatus $msg
+            $ui.StatusProgress.Visibility = 'Visible'; $ui.StatusProgress.IsIndeterminate = $true
+        }
         elseif ($script:Jobs.Count -gt 0) {
             Set-AWStatus $Sync.Status
             $ui.StatusProgress.Visibility = 'Visible'
@@ -6742,7 +7185,7 @@ $script:CleanerBusy = $false
 
 # Rules that live in the signed-in user's profile only make sense on this PC.
 function Test-AWUserScopeRule($Rule) {
-    if ($Rule.Kind -eq 'RecycleBin' -or $Rule.Action -eq 'Clipboard') { return $true }
+    if ($Rule.UserScope -or $Rule.Kind -eq 'RecycleBin' -or $Rule.Action -eq 'Clipboard') { return $true }
     foreach ($t in $Rule.Targets) { if ($t.Path -match '%(TEMP|LOCALAPPDATA|APPDATA|USERPROFILE)%') { return $true } }
     $false
 }
@@ -7042,6 +7485,27 @@ function Request-AWMapRedraw { $script:MapRedrawTimer.Stop(); $script:MapRedrawT
 $ui.MapCanvas.Add_SizeChanged({ Request-AWMapRedraw })
 $ui.MapCanvas.Add_MouseLeftButtonDown({ Select-AWMapNode $null $null })
 
+# The UI thread needs the worker library's file-kind table too.
+. ([scriptblock]::Create([regex]::Match($Sync.WorkerLib, '(?s)function Get-WFileKind\(.*?\r?\n\}\r?\n').Value))
+
+# Rolls the per-extension totals up into kinds (Videos, Pictures, Installers...).
+function Get-AWKindStats($ExtensionList) {
+    $tot = @{}; $cnt = @{}; $all = [long]0
+    foreach ($e in $ExtensionList) {
+        $k = Get-WFileKind ([string]$e.Extension)
+        $tot[$k] = [long]$tot[$k] + $e.Size; $cnt[$k] = [long]$cnt[$k] + $e.Count; $all += $e.Size
+    }
+    if ($all -le 0) { return @() }
+    $max = ($tot.Values | Measure-Object -Maximum).Maximum
+    $plural = @{ Installer = 'Installers'; 'Disk image' = 'Disk images'; Archive = 'Archives'; Video = 'Videos'; Picture = 'Pictures'; Document = 'Documents' }
+    foreach ($k in ($tot.Keys | Sort-Object { $tot[$_] } -Descending)) {
+        $x = New-Object AWiper.ExtStat
+        $x.Extension = if ($plural[$k]) { $plural[$k] } else { $k }
+        $x.Size = $tot[$k]; $x.Count = $cnt[$k]; $x.Percent = $tot[$k] * 100.0 / $all; $x.RelPercent = $tot[$k] * 100.0 / $max
+        $x
+    }
+}
+
 function Start-AWMapScan([string]$Path) {
     if ($Sync.Scanning) { return }
     if (-not $Path) { $Path = $ui.MapPath.Text }
@@ -7051,6 +7515,7 @@ function Start-AWMapScan([string]$Path) {
     $ui.MapPath.Text = $Path
 
     $script:ScanExpected = 0
+    $ui.MapKindList.ItemsSource = $null
     try {
         $di = New-Object System.IO.DriveInfo($Path)
         if ($di.RootDirectory.FullName -eq (New-Object System.IO.DirectoryInfo($Path)).FullName) {
@@ -7075,6 +7540,7 @@ function Start-AWMapScan([string]$Path) {
         $script:MapRoot = $s.Root
         Set-AWMapCurrent $s.Root
         $ui.MapExtList.ItemsSource = @($s.ExtensionList | Select-Object -First 12)
+        $ui.MapKindList.ItemsSource = @(Get-AWKindStats $s.ExtensionList)
         Update-AWLargeList
         $state = if ($s.Completed) { 'Scan complete' } else { 'Scan stopped (partial results)' }
         $script:IdleStatus = '{0}: {1:N0} files, {2} in {3:0.0}s - {4:N0} folders unreadable' -f $state, $s.FilesScanned, (Format-AWSize $s.BytesScanned), $s.ElapsedSeconds, $s.Errors
@@ -7163,19 +7629,173 @@ function Initialize-AWMapDrives {
 #endregion
 
 #region ---------------------------------------------------------------- Large files
-function Update-AWLargeList {
-    if (-not $script:Scanner -or -not $script:Scanner.TopFiles) { return }
-    $all = $script:Scanner.TopFiles
-    $q = $ui.LargeSearch.Text.Trim()
-    $items = @(if ($q) {
-        $all | Where-Object { $_.Name -like "*$q*" -or $_.Folder -like "*$q*" -or $_.Extension -like "*$q*" }
-    } else { $all })
-    $ui.LargeList.ItemsSource = $items
-    [long]$sum = 0; foreach ($f in $items) { $sum += $f.Size }
-    $ui.LargeInfo.Text = '{0:N0} files - {1} total - from scan of {2}' -f $items.Count, (Format-AWSize $sum), $script:Scanner.Root.FullPath
+# Three lists share one view: the Space Map's largest files, old downloads and duplicate groups.
+$script:LargeTab = 'Largest'
+$script:OldFiles = New-Object System.Collections.Generic.List[object]
+$script:DupeFiles = New-Object System.Collections.Generic.List[object]
+$script:DupeNote = ''
+
+function Get-AWLargeSource {
+    switch ($script:LargeTab) {
+        'Old'   { $script:OldFiles }
+        'Dupes' { $script:DupeFiles }
+        default { if ($script:Scanner -and $script:Scanner.TopFiles) { $script:Scanner.TopFiles } else { $null } }
+    }
 }
 
-function Get-AWCheckedLarge { @($script:Scanner.TopFiles | Where-Object { $_.IsChecked }) }
+function Update-AWLargeList {
+    $all = Get-AWLargeSource
+    if (-not $all -or $all.Count -eq 0) {
+        $ui.LargeList.ItemsSource = $null
+        $ui.LargeInfo.Text = switch ($script:LargeTab) {
+            'Old'   { "Lists files in $(Get-AWDownloadsFolder) you haven't opened in a while." }
+            'Dupes' { if ($script:DupeNote) { $script:DupeNote } else { 'Pick a folder and find exact copies (byte-for-byte) or similar photos.' } }
+            default { 'Run a scan in Space Map to list the largest files.' }
+        }
+        return
+    }
+    $q = $ui.LargeSearch.Text.Trim()
+    $items = @(foreach ($f in $all) { if (-not $q -or $f.Name -like "*$q*" -or $f.Folder -like "*$q*" -or $f.Extension -like "*$q*" -or $f.Status -like "*$q*") { $f } })
+    $ui.LargeList.ItemsSource = $items
+    [long]$sum = 0; foreach ($f in $items) { $sum += $f.Size }
+    $ui.LargeInfo.Text = switch ($script:LargeTab) {
+        'Old'   { '{0:N0} old download(s) - {1} total' -f $items.Count, (Format-AWSize $sum) }
+        'Dupes' { $script:DupeNote }
+        default { '{0:N0} files - {1} total - from scan of {2}' -f $items.Count, (Format-AWSize $sum), $script:Scanner.Root.FullPath }
+    }
+}
+
+function Get-AWCheckedLarge { @(foreach ($f in (Get-AWLargeSource)) { if ($f.IsChecked) { $f } }) }
+
+function Get-AWDownloadsFolder {
+    $p = try { (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction Stop).'{374DE290-123F-4565-9164-39C4925E467B}' } catch { $null }
+    if ($p) { [Environment]::ExpandEnvironmentVariables($p) } else { Join-Path $env:USERPROFILE 'Downloads' }
+}
+
+function Set-AWLargeTab([string]$Tab) {
+    $script:LargeTab = $Tab
+    $ui.OldBar.Visibility = if ($Tab -eq 'Old') { 'Visible' } else { 'Collapsed' }
+    $ui.DupeBar.Visibility = if ($Tab -eq 'Dupes') { 'Visible' } else { 'Collapsed' }
+    $ui.DupeKeep.Visibility = if ($Tab -eq 'Dupes') { 'Visible' } else { 'Collapsed' }
+    $ui.LargeScan.Visibility = if ($Tab -eq 'Largest') { 'Visible' } else { 'Collapsed' }
+    $ui.LargeStatusCol.Header = if ($Tab -eq 'Old') { 'Kind' } else { 'Group' }
+    $ui.LargeStatusCol.Width = if ($Tab -eq 'Largest') { 0 } else { 170 }
+    if ($Tab -eq 'Dupes' -and -not $ui.DupePath.Text) { $ui.DupePath.Text = $env:USERPROFILE }
+    Update-AWLargeList
+}
+$ui.LTabLargest.Add_Checked({ Set-AWLargeTab 'Largest' })
+$ui.LTabOld.Add_Checked({ Set-AWLargeTab 'Old' })
+$ui.LTabDupes.Add_Checked({ Set-AWLargeTab 'Dupes' })
+
+$ui.OldFind.Add_Click({
+    if (Test-AWRemote) { Show-AWMessage 'Old downloads looks at your own Downloads folder on this PC.' }
+    $days = [int]$ui.OldDays.SelectedItem.Tag
+    $ui.OldFind.IsEnabled = $false
+    Start-AWTask -Name 'Finding old downloads' -Arguments @{ Days = $days } -Work { @(Get-WOldDownloads $Days) } -OnComplete {
+        param($r)
+        $ui.OldFind.IsEnabled = $true
+        $script:OldFiles.Clear()
+        foreach ($x in @($r | Sort-Object Size -Descending)) {
+            $fe = New-Object AWiper.FileEntry
+            $fe.Name = $x.Name; $fe.FullPath = $x.Path; $fe.Folder = $x.Folder; $fe.Size = $x.Size; $fe.Extension = $x.Extension; $fe.Modified = $x.Modified; $fe.Status = $x.Kind
+            $fe.IsChecked = $x.Kind -in 'Installer', 'Disk image'      # the usual leftovers
+            $script:OldFiles.Add($fe)
+        }
+        Update-AWLargeList
+        $script:IdleStatus = "Found $($script:OldFiles.Count) old download(s) - installers and disk images are ticked"
+        Set-AWStatus $script:IdleStatus
+    }
+})
+
+$ui.DupeBrowse.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Choose a folder to search for duplicates'
+    if ($ui.DupePath.Text -and (Test-Path -LiteralPath $ui.DupePath.Text)) { $dlg.SelectedPath = $ui.DupePath.Text }
+    if ($dlg.ShowDialog() -eq 'OK') { $ui.DupePath.Text = $dlg.SelectedPath }
+})
+$ui.DupeStop.Add_Click({ if ($script:Dupes) { $script:Dupes.Cancel = $true }; $Sync.DupeCancel = $true; $ui.DupeStop.IsEnabled = $false })
+
+$ui.DupeFind.Add_Click({
+    $path = [Environment]::ExpandEnvironmentVariables($ui.DupePath.Text.Trim().Trim('"'))
+    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Container)) { Show-AWMessage "Folder not found:`n$path" 'Warning'; return }
+    $script:DupeFiles.Clear(); $script:DupeNote = ''; Update-AWLargeList
+    $ui.DupeFind.IsEnabled = $false; $ui.DupeStop.IsEnabled = $true
+    $Sync.DupeCancel = $false
+    if ($ui.DupeExact.IsChecked) {
+        $script:Dupes = New-Object AWiper.DuplicateFinder
+        $script:DupeRunning = $true
+        Start-AWTask -Name "Finding duplicates in $path" -Arguments @{ Finder = $script:Dupes; Root = $path } -Work { $Finder.Scan($Root, 1024) } -OnComplete {
+            param($r)
+            $script:DupeRunning = $false; $ui.DupeFind.IsEnabled = $true; $ui.DupeStop.IsEnabled = $false
+            $d = $script:Dupes
+            foreach ($f in $d.Results) { $script:DupeFiles.Add($f) }
+            $script:DupeNote = if ($d.Error) { "Search failed: $($d.Error)" } else {
+                '{0:N0} group(s) of identical files - {1} could be freed by keeping one copy of each{2}' -f $d.Groups, (Format-AWSize $d.WastedBytes), $(if (-not $d.Completed) { ' (stopped early)' } else { '' }) }
+            Update-AWLargeList
+            $script:IdleStatus = $script:DupeNote; Set-AWStatus $script:IdleStatus
+        }
+    } else {
+        $script:Dupes = $null
+        Start-AWTask -Name "Finding similar photos in $path" -Arguments @{ Root = $path } -Work {
+            Add-Type -AssemblyName PresentationCore
+            $exts = '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tif', '.tiff', '.webp', '.heic'
+            $files = @(Get-ChildItem -LiteralPath $Root -File -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {
+                $_.Extension.ToLowerInvariant() -in $exts -and $_.Length -ge 8KB -and -not ([int]$_.Attributes -band 0x400) -and -not ([int]$_.Attributes -band 0x440000) })
+            $hashes = New-Object System.Collections.Generic.List[uint64]; $keep = New-Object System.Collections.Generic.List[object]
+            $px = New-Object byte[] 72
+            $i = 0
+            foreach ($f in $files) {
+                if ($Sync.DupeCancel) { break }
+                $i++; if ($i % 20 -eq 0) { $Sync.Status = "Fingerprinting photos: $i of $($files.Count)"; $Sync.Progress = [int]($i * 100 / $files.Count) }
+                try {
+                    $bi = New-Object System.Windows.Media.Imaging.BitmapImage
+                    $bi.BeginInit(); $bi.CacheOption = 'OnLoad'; $bi.CreateOptions = 'IgnoreColorProfile'
+                    $bi.UriSource = New-Object Uri($f.FullName); $bi.DecodePixelWidth = 9; $bi.DecodePixelHeight = 8; $bi.EndInit()
+                    $g = New-Object System.Windows.Media.Imaging.FormatConvertedBitmap($bi, [System.Windows.Media.PixelFormats]::Gray8, $null, 0)
+                    $sc = New-Object System.Windows.Media.Imaging.TransformedBitmap($g, (New-Object System.Windows.Media.ScaleTransform((9.0 / $g.PixelWidth), (8.0 / $g.PixelHeight))))
+                    if ($sc.PixelWidth -ne 9 -or $sc.PixelHeight -ne 8) { continue }
+                    $sc.CopyPixels($px, 9, 0)
+                    [uint64]$h = 0
+                    for ($y = 0; $y -lt 8; $y++) { for ($x = 0; $x -lt 8; $x++) { $h = $h -shl 1; if ($px[$y * 9 + $x] -gt $px[$y * 9 + $x + 1]) { $h = $h -bor 1 } } }
+                    $hashes.Add($h); $keep.Add($f)
+                } catch { }
+            }
+            $groups = [AWiper.PhotoMatch]::Group($hashes.ToArray(), 8)
+            $out = New-Object System.Collections.Generic.List[object]
+            $n = 0
+            foreach ($grp in @(0..($keep.Count - 1) | Where-Object { $keep.Count } | Group-Object { $groups[$_] } | Where-Object Count -gt 1)) {
+                $n++
+                foreach ($ix in $grp.Group) { $f = $keep[[int]$ix]; $out.Add([pscustomobject]@{ Name = $f.Name; Path = $f.FullName; Folder = $f.DirectoryName; Size = $f.Length; Extension = $f.Extension.ToLowerInvariant(); Modified = $f.LastWriteTime; Group = "Group $n ($($grp.Count) photos)" }) }
+            }
+            [pscustomobject]@{ Files = $out.ToArray(); Groups = $n; Scanned = $keep.Count; Stopped = [bool]$Sync.DupeCancel }
+        } -OnComplete {
+            param($r)
+            $ui.DupeFind.IsEnabled = $true; $ui.DupeStop.IsEnabled = $false
+            $r = @($r)[0]
+            if (-not $r) { $script:DupeNote = 'Search failed - see the log'; Update-AWLargeList; return }
+            foreach ($x in $r.Files) {
+                $fe = New-Object AWiper.FileEntry
+                $fe.Name = $x.Name; $fe.FullPath = $x.Path; $fe.Folder = $x.Folder; $fe.Size = $x.Size; $fe.Extension = $x.Extension; $fe.Modified = $x.Modified; $fe.Status = $x.Group
+                $script:DupeFiles.Add($fe)
+            }
+            $script:DupeNote = '{0:N0} group(s) of similar photos among {1:N0} checked{2} - look before you tick: edits and bursts count as similar' -f $r.Groups, $r.Scanned, $(if ($r.Stopped) { ' (stopped early)' } else { '' })
+            Update-AWLargeList
+            $script:IdleStatus = $script:DupeNote; Set-AWStatus $script:IdleStatus
+        }
+    }
+})
+
+# In every group keep the newest copy (or the largest photo) and tick the rest.
+$ui.DupeKeep.Add_Click({
+    if (-not $script:DupeFiles.Count) { return }
+    foreach ($g in ($script:DupeFiles | Group-Object Status)) {
+        $best = $g.Group | Sort-Object @{ e = 'Size'; Descending = $true }, @{ e = 'Modified'; Descending = $true } | Select-Object -First 1
+        foreach ($f in $g.Group) { $f.IsChecked = -not [object]::ReferenceEquals($f, $best) }
+    }
+    $ui.LargeList.Items.Refresh()
+    $n = @(Get-AWCheckedLarge).Count; [long]$sum = 0; foreach ($f in (Get-AWCheckedLarge)) { $sum += $f.Size }
+    Set-AWStatus ("Ticked {0:N0} extra cop(ies) - {1}. Review them, then Recycle checked." -f $n, (Format-AWSize $sum))
+})
 
 $ui.LargeSearch.Add_TextChanged({ Update-AWLargeList })
 $ui.LargeScan.Add_Click({ Select-AWView 'Map' })
@@ -7185,9 +7805,14 @@ $ui.LargeOpen.Add_Click({
     if ($f) { Open-AWExplorer $f.FullPath } else { Show-AWMessage 'Select a file first.' }
 })
 $ui.LargeRecycle.Add_Click({
-    if (-not $script:Scanner) { return }
+    $src = Get-AWLargeSource
+    if (-not $src) { return }
     $sel = Get-AWCheckedLarge
     if ($sel.Count -eq 0) { Show-AWMessage 'Tick the files you want to remove first.'; return }
+    if ($script:LargeTab -eq 'Dupes') {
+        $all = @($src | Group-Object Status | Where-Object { @($_.Group | Where-Object { -not $_.IsChecked }).Count -eq 0 } | ForEach-Object Name)
+        if ($all.Count) { Show-AWMessage ("Every copy is ticked in {0} - leave at least one unticked:`n{1}" -f $(if ($all.Count -eq 1) { 'this group' } else { "$($all.Count) groups" }), (($all | Select-Object -First 5) -join "`n")) 'Warning'; return }
+    }
     [long]$sum = 0; foreach ($f in $sel) { $sum += $f.Size }
     if (-not (Confirm-AW ("Send {0} file(s) ({1}) to the Recycle Bin?" -f $sel.Count, (Format-AWSize $sum)))) { return }
     $ok = 0; $fail = 0
@@ -7195,22 +7820,23 @@ $ui.LargeRecycle.Add_Click({
         if (Test-AWProtectedPath $f.FullPath) { $fail++; continue }
         try {
             Send-AWToRecycle $f.FullPath
-            [void]$script:Scanner.TopFiles.Remove($f)
+            [void]$src.Remove($f)
             Write-AWLog "Recycled $($f.FullPath) ($($f.SizeText))"
             $ok++
         } catch { $fail++; Write-AWLog "Could not recycle $($f.FullPath): $($_.Exception.Message)" 'WARN' }
     }
     Update-AWLargeList
-    $script:IdleStatus = "Recycled $ok file(s)" + $(if ($fail) { ", $fail failed" } else { '' }) + ' - rescan to refresh the Space Map'
+    $script:IdleStatus = "Recycled $ok file(s)" + $(if ($fail) { ", $fail failed" } else { '' }) + $(if ($script:LargeTab -eq 'Largest') { ' - rescan to refresh the Space Map' } else { '' })
     Set-AWStatus $script:IdleStatus
 })
 $ui.LargeExport.Add_Click({
-    if (-not $script:Scanner -or -not $script:Scanner.TopFiles.Count) { Show-AWMessage 'Run a scan first.'; return }
+    $src = Get-AWLargeSource
+    if (-not $src -or -not $src.Count) { Show-AWMessage 'Nothing to export yet.'; return }
     $dlg = New-Object Microsoft.Win32.SaveFileDialog
     $dlg.Filter = 'CSV file (*.csv)|*.csv'
-    $dlg.FileName = 'AWiper-LargeFiles-{0:yyyyMMdd-HHmm}.csv' -f (Get-Date)
+    $dlg.FileName = 'AWiper-{0}-{1:yyyyMMdd-HHmm}.csv' -f @{ Largest = 'LargeFiles'; Old = 'OldDownloads'; Dupes = 'Duplicates' }[$script:LargeTab], (Get-Date)
     if ($dlg.ShowDialog($window)) {
-        $script:Scanner.TopFiles | Select-Object Name, Size, SizeText, Extension, ModifiedText, FullPath |
+        $src | Select-Object Name, Size, SizeText, Extension, ModifiedText, Status, FullPath |
             Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding UTF8
         Write-AWLog "Exported large files list to $($dlg.FileName)"
         Set-AWStatus "Exported to $($dlg.FileName)"
@@ -7327,6 +7953,72 @@ $ui.StartupOpen.Add_Click({
     $target = if ($it.FilePath) { $it.FilePath } else { Get-AWExeFromCommand $it.Command }
     if ($target -and (Test-Path -LiteralPath $target)) { Open-AWExplorer $target }
     else { Show-AWMessage "Couldn't find the file for this entry:`n$($it.Command)" 'Warning' }
+})
+
+# ---- Right-click menu entries (shell extensions and added commands)
+$script:MenuItems = @()
+function Set-AWStartupTab([string]$Tab) {
+    $menu = $Tab -eq 'Menu'
+    $ui.MenuList.Visibility = if ($menu) { 'Visible' } else { 'Collapsed' }
+    $ui.StartupList.Visibility = if ($menu) { 'Collapsed' } else { 'Visible' }
+    $ui.MenuButtons.Visibility = if ($menu) { 'Visible' } else { 'Collapsed' }
+    $ui.StartupButtons.Visibility = if ($menu) { 'Collapsed' } else { 'Visible' }
+    $ui.StartupTitle.Text = if ($menu) { 'Right-click menu' } else { 'Startup programs' }
+    if ($menu) { if (-not $script:MenuItems.Count) { Update-AWMenuList } else { Update-AWMenuView } }
+    else { Update-AWStartupList }
+}
+function Update-AWMenuView {
+    $items = @(if ($ui.MenuShowMs.IsChecked) { $script:MenuItems } else { $script:MenuItems | Where-Object { -not $_.Microsoft } })
+    $ui.MenuList.ItemsSource = $items
+    $off = @($script:MenuItems | Where-Object { -not $_.Enabled }).Count
+    $ui.StartupInfo.Text = "$($items.Count) entries added by programs$(if ($off) { ", $off turned off" }). Turning one off hides it from the menu without uninstalling anything - a slow or crashing entry is a common cause of a sluggish right-click. Windows 11's new top-level menu entries from Store apps aren't listed; most of these show under 'Show more options'." +
+        $(if (-not $script:IsAdmin) { ' All-users commands need admin rights to change.' } else { '' })
+}
+function Update-AWMenuList {
+    $ui.StartupInfo.Text = 'Reading right-click menu entries...'
+    $ui.MenuRefresh.IsEnabled = $false
+    Start-AWTask -Name 'Read right-click menu entries' -Work { @(Get-WContextMenu) } -OnComplete {
+        param($r)
+        $ui.MenuRefresh.IsEnabled = $true
+        $script:MenuItems = @($r | Sort-Object @{ e = 'Microsoft' }, Name)
+        Update-AWMenuView
+    }
+}
+$ui.STabStartup.Add_Checked({ Set-AWStartupTab 'Startup' })
+$ui.STabMenu.Add_Checked({ Set-AWStartupTab 'Menu' })
+$ui.MenuShowMs.Add_Click({ Update-AWMenuView })
+$ui.MenuRefresh.Add_Click({ Update-AWMenuList })
+$ui.MenuRestart.Add_Click({ Restart-AWExplorer })
+$ui.MenuOpen.Add_Click({
+    $it = $ui.MenuList.SelectedItem
+    if (-not $it) { Show-AWMessage 'Select an entry first.'; return }
+    $target = if ($it.Kind -eq 'Handler') { $it.Command } else { Get-AWExeFromCommand $it.Command }
+    if ($target -and (Test-Path -LiteralPath $target)) { Open-AWExplorer $target }
+    else { Show-AWMessage "Couldn't find the file for this entry:`n$($it.Command)" 'Warning' }
+})
+$ui.MenuList.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, [System.Windows.RoutedEventHandler]{
+    param($s, $e)
+    $cb = $e.OriginalSource
+    if ($cb -isnot [System.Windows.Controls.CheckBox]) { return }
+    $item = $cb.DataContext
+    if (Test-AWRemote) { $cb.IsChecked = $item.Enabled; Show-AWMessage 'The right-click menu list is for this PC. Switch the target back to this PC to change it.'; return }
+    $want = [bool]$cb.IsChecked
+    $script:PendingMenu = @{ Item = $item; Box = $cb; Want = $want }
+    Start-AWTask -Name "Right-click menu: $($item.Name)" -Arguments @{ Item = $item; Want = $want } -Work {
+        try { Set-WContextMenuItem $Item $Want } catch { [pscustomobject]@{ Error = $_.Exception.Message } }
+    } -OnComplete {
+        param($r)
+        $p = $script:PendingMenu; $r = @($r)[0]
+        if (-not $r -or $r.Error) {
+            $p.Box.IsChecked = $p.Item.Enabled
+            Show-AWMessage "Could not change '$($p.Item.Name)':`n$(if ($r) { $r.Error } else { 'see the log' })" 'Error'; return
+        }
+        $p.Item.Enabled = $p.Want
+        $uid = Add-AWUndoEntry $r
+        Write-AWAction 'ContextMenu' @("$($p.Item.Name) ($($p.Item.Where)) -> $(if ($p.Want) { 'on' } else { 'off' })") @{} 'Done' $uid
+        Update-AWMenuView
+        Set-AWStatus ("'{0}' turned {1} - restart Explorer (button above) to see the change" -f $p.Item.Name, $(if ($p.Want) { 'on' } else { 'off' }))
+    }
 })
 #endregion
 
@@ -10659,7 +11351,8 @@ function Enable-AWSort($ListView, [hashtable]$Map) {
         $view.SortDescriptions.Add((New-Object System.ComponentModel.SortDescription($prop, $dir)))
     })
 }
-Enable-AWSort $ui.LargeList    @{ Name = 'Name'; Size = 'Size'; Type = 'Extension'; Modified = 'Modified'; Folder = 'Folder' }
+Enable-AWSort $ui.LargeList    @{ Name = 'Name'; Size = 'Size'; Type = 'Extension'; Modified = 'Modified'; Folder = 'Folder'; Group = 'Status'; Kind = 'Status' }
+Enable-AWSort $ui.MenuList     @{ Name = 'Name'; 'Shows on' = 'Where'; Type = 'Kind'; Company = 'Company'; Status = 'Enabled' }
 Enable-AWSort $ui.ProgList     @{ Name = 'Name'; Publisher = 'Publisher'; Version = 'Version'; Installed = 'Installed'; Size = 'SizeBytes'; Scope = 'Scope' }
 Enable-AWSort $ui.StartupList  @{ Name = 'Name'; Scope = 'Scope'; Source = 'Location'; Status = 'Enabled' }
 Enable-AWSort $ui.CleanResults @{ Item = 'Name'; Group = 'Group'; Size = 'Bytes' }
