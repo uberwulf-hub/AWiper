@@ -139,7 +139,7 @@
 
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.9.0
+    Version : 1.9.1
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -178,7 +178,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.9.0'
+$script:AppVersion = '1.9.1'
 $script:CliMode = [bool]($Config -or $Analyze -or $Clean -or $HealthCheck -or $ApplyTweak -or $RevertTweak -or $RemoveApp -or
                          $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps -or $CheckDrivers -or $Backup -or $Inventory -or $ExportNeeds -or $Fetch)
 
@@ -1484,7 +1484,7 @@ $script:StateFile = Join-Path $script:DataDir 'state.json'
 if (-not (Test-Path -LiteralPath $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
 
 $script:State = @{ TotalFreed = [long]0; Cleans = 0; LastClean = ''; RecentTargets = @(); AutoRestorePoint = $true; ResourcesPath = ''; ForceOffline = $false
-                   FleetHosts = ''; Backup = @{ Sources = @(); Dest = ''; DestVolumeId = ''; Keep = 10; Daily = $false; Time = '19:00'; LastRun = ''; LastResult = '' } }
+                   FleetHosts = ''; OldFolders = @('Downloads'); Backup = @{ Sources = @(); Dest = ''; DestVolumeId = ''; Keep = 10; Daily = $false; Time = '19:00'; LastRun = ''; LastResult = '' } }
 try {
     if (Test-Path -LiteralPath $script:StateFile) {
         $j = Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json
@@ -1496,6 +1496,7 @@ try {
         if ($j.ResourcesPath) { $script:State.ResourcesPath = [string]$j.ResourcesPath }
         if ($null -ne $j.ForceOffline) { $script:State.ForceOffline = [bool]$j.ForceOffline }
         if ($j.FleetHosts) { $script:State.FleetHosts = [string]$j.FleetHosts }
+        if ($j.OldFolders) { $script:State.OldFolders = @($j.OldFolders | ForEach-Object { [string]$_ }) }
         if ($j.Backup) {
             foreach ($k in 'Dest', 'DestVolumeId', 'Time', 'LastRun', 'LastResult') { if ($j.Backup.$k) { $script:State.Backup[$k] = [string]$j.Backup.$k } }
             if ($j.Backup.Sources) { $script:State.Backup.Sources = @($j.Backup.Sources | ForEach-Object { [string]$_ }) }
@@ -3169,12 +3170,15 @@ function Get-WWin11Readiness([bool]$Quick = $true) {
     }
 }
 
-# ---------------------------------------------------------------- Old downloads
-function Get-WDownloadsFolder {
-    $p = try { (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction Stop).'{374DE290-123F-4565-9164-39C4925E467B}' } catch { $null }
-    if ($p) { $p = [Environment]::ExpandEnvironmentVariables($p) } else { $p = Join-Path $env:USERPROFILE 'Downloads' }
-    $p
+# ---------------------------------------------------------------- Old files (Downloads, Desktop, Documents...)
+# The signed-in user's folders, wherever they've been redirected (OneDrive, another drive...).
+function Get-WUserFolder([string]$Name) {
+    $value = @{ Downloads = '{374DE290-123F-4565-9164-39C4925E467B}'; Desktop = 'Desktop'; Documents = 'Personal'; Pictures = 'My Pictures'; Videos = 'My Video'; Music = 'My Music' }[$Name]
+    if (-not $value) { return $Name }                                     # already a path
+    $p = try { (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction Stop).$value } catch { $null }
+    if ($p) { [Environment]::ExpandEnvironmentVariables($p) } else { Join-Path $env:USERPROFILE $Name }
 }
+function Get-WDownloadsFolder { Get-WUserFolder 'Downloads' }
 function Get-WFileKind([string]$Ext) {
     switch -Regex ($Ext.ToLowerInvariant()) {
         '^\.(exe|msi|msix|msixbundle|appx|appxbundle|msu|cab)$' { 'Installer'; break }
@@ -3188,17 +3192,46 @@ function Get-WFileKind([string]$Ext) {
         default { 'Other' }
     }
 }
-# Files in Downloads not modified or opened for $Days days, biggest first.
-function Get-WOldDownloads([int]$Days = 90) {
-    $root = Get-WDownloadsFolder
+# Files not modified or opened for $Days days and at least $MinBytes, in the given folders (names like
+# 'Downloads' or full paths). Junctions, cloud-only placeholders, hidden system files and developer
+# folders (.git, node_modules...) are skipped. "Last opened" is only as good as Windows' last-access
+# time, so the newer of modified / accessed is used. Each result says which folder it came from and
+# flags archives that were already extracted next to themselves.
+function Get-WOldFiles([string[]]$Folders, [int]$Days = 90, [long]$MinBytes = 0) {
     $cut = (Get-Date).AddDays(-$Days)
-    foreach ($f in @(Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue)) {
-        if ($f.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
-        if (([int]$f.Attributes -band 0x400000) -or ([int]$f.Attributes -band 0x40000)) { continue }   # cloud-only placeholder
-        if ($f.Name -eq 'desktop.ini') { continue }
-        $last = if ($f.LastAccessTime -gt $f.LastWriteTime) { $f.LastAccessTime } else { $f.LastWriteTime }
-        if ($last -gt $cut) { continue }
-        [pscustomobject]@{ Path = $f.FullName; Name = $f.Name; Folder = $f.DirectoryName; Size = $f.Length; Extension = $f.Extension.ToLowerInvariant(); Modified = $f.LastWriteTime; Kind = Get-WFileKind $f.Extension }
+    $skipDirs = '^(\.git|\.svn|\.hg|node_modules|__pycache__|\.vs|\.venv|venv|bin|obj)$'
+    $seen = @{}
+    $clouds = @($env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' } | Select-Object -Unique)
+    foreach ($name in $Folders) {
+        $root = Get-WUserFolder $name
+        if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        $label = if ($root -eq $name) { Split-Path $root -Leaf } else { $name }
+        $cloud = [bool]@($clouds | Where-Object { ($root.TrimEnd('\') + '\').StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count
+        $stack = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
+        $stack.Push((New-Object System.IO.DirectoryInfo $root))
+        while ($stack.Count) {
+            $d = $stack.Pop()
+            if ($seen[$d.FullName]) { continue }; $seen[$d.FullName] = $true   # e.g. Pictures inside Documents
+            $Sync.Status = "Looking for old files: $($d.FullName)"
+            $entries = try { $d.GetFileSystemInfos() } catch { @() }
+            $dirs = @{}
+            foreach ($e in $entries) { if ($e -is [System.IO.DirectoryInfo]) { $dirs[$e.Name.ToLowerInvariant()] = $true } }
+            foreach ($e in $entries) {
+                $a = [int]$e.Attributes
+                if ($a -band 0x400) { continue }                                   # junction / symlink
+                if ($e -is [System.IO.DirectoryInfo]) { if ($e.Name -notmatch $skipDirs -and -not (($a -band 2) -and ($a -band 4))) { $stack.Push($e) }; continue }
+                if (($a -band 0x400000) -or ($a -band 0x40000) -or ($a -band 0x1000)) { continue }   # cloud-only / offline
+                if (($a -band 2) -and ($a -band 4)) { continue }                   # hidden + system
+                if ($e.Name -eq 'desktop.ini' -or $e.Length -lt $MinBytes) { continue }
+                $last = if ($e.LastAccessTime -gt $e.LastWriteTime) { $e.LastAccessTime } else { $e.LastWriteTime }
+                if ($last -gt $cut) { continue }
+                $kind = Get-WFileKind $e.Extension
+                $base = [IO.Path]::GetFileNameWithoutExtension($e.Name) -replace '\.tar$', ''
+                $extracted = $kind -eq 'Archive' -and $dirs[$base.ToLowerInvariant()]
+                [pscustomobject]@{ Path = $e.FullName; Name = $e.Name; Folder = $e.DirectoryName; Size = $e.Length; Extension = $e.Extension.ToLowerInvariant(); Modified = $e.LastWriteTime
+                    LastUsed = $last; Kind = $kind; Root = $(if ($cloud) { "$label (OneDrive)" } else { $label }); Extracted = [bool]$extracted; Cloud = $cloud }
+            }
+        }
     }
 }
 
@@ -4773,6 +4806,55 @@ if ($script:CliMode) {
         </Setter.Value>
       </Setter>
     </Style>
+    <Style TargetType="ComboBox">
+      <Setter Property="Foreground" Value="#E9ECF8"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Height" Value="32"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBox">
+            <Grid>
+              <ToggleButton Focusable="False" ClickMode="Press" IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                <ToggleButton.Template>
+                  <ControlTemplate TargetType="ToggleButton">
+                    <Border x:Name="Bd" Background="#1B2139" BorderBrush="#3A4470" BorderThickness="1" CornerRadius="8">
+                      <TextBlock Text="&#x25BE;" Foreground="#8C95BD" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#6A5BEF"/></Trigger>
+                    </ControlTemplate.Triggers>
+                  </ControlTemplate>
+                </ToggleButton.Template>
+              </ToggleButton>
+              <ContentPresenter IsHitTestVisible="False" Content="{TemplateBinding SelectionBoxItem}" Margin="12,0,26,0" VerticalAlignment="Center" HorizontalAlignment="Left" TextElement.Foreground="#E9ECF8"/>
+              <Popup IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True" Focusable="False" PopupAnimation="Fade">
+                <Border Background="#232A45" BorderBrush="#46507A" BorderThickness="1" CornerRadius="8" Padding="4" Margin="0,4,0,0" MinWidth="{TemplateBinding ActualWidth}">
+                  <ScrollViewer MaxHeight="320" VerticalScrollBarVisibility="Auto"><StackPanel IsItemsHost="True"/></ScrollViewer>
+                </Border>
+              </Popup>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="ComboBoxItem">
+      <Setter Property="Foreground" Value="#E9ECF8"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBoxItem">
+            <Border x:Name="Bd" Background="Transparent" CornerRadius="6" Padding="10,6">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="Bd" Property="Background" Value="#37436F"/></Trigger>
+              <Trigger Property="IsSelected" Value="True"><Setter Property="Foreground" Value="#19C3B1"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
     <Style x:Key="CtxItem" TargetType="MenuItem">
       <Setter Property="Foreground" Value="#E9ECF8"/>
       <Setter Property="Cursor" Value="Hand"/>
@@ -5478,15 +5560,23 @@ if ($script:CliMode) {
                 <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal">
                   <RadioButton x:Name="LTabLargest" Style="{StaticResource SegBtn}" GroupName="LTab" IsChecked="True" Content="Largest" MinWidth="100"/>
-                  <RadioButton x:Name="LTabOld"     Style="{StaticResource SegBtn}" GroupName="LTab" Content="Old downloads" MinWidth="110"/>
+                  <RadioButton x:Name="LTabOld"     Style="{StaticResource SegBtn}" GroupName="LTab" Content="Old files" MinWidth="100"/>
                   <RadioButton x:Name="LTabDupes"   Style="{StaticResource SegBtn}" GroupName="LTab" Content="Duplicates" MinWidth="100"/>
                 </StackPanel>
                 <StackPanel x:Name="OldBar" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" Visibility="Collapsed" Margin="0,0,6,0">
-                  <TextBlock Text="Not opened for" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                  <ComboBox x:Name="OldDays" Width="110" SelectedIndex="1">
-                    <ComboBoxItem Content="30 days" Tag="30"/><ComboBoxItem Content="90 days" Tag="90"/><ComboBoxItem Content="6 months" Tag="182"/><ComboBoxItem Content="1 year" Tag="365"/>
+                  <Button x:Name="OldFolders" Content="Folders: Downloads  &#x25BE;" Style="{StaticResource BtnChip}" MaxWidth="260" ToolTip="Which of your folders to look in">
+                    <Button.ContextMenu><ContextMenu Style="{StaticResource CtxMenu}"/></Button.ContextMenu>
+                  </Button>
+                  <ComboBox x:Name="OldDays" Width="165" SelectedIndex="1" ToolTip="Not modified or opened since">
+                    <ComboBoxItem Content="Unused 30+ days" Tag="30"/><ComboBoxItem Content="Unused 90+ days" Tag="90"/><ComboBoxItem Content="Unused 6+ months" Tag="182"/><ComboBoxItem Content="Unused 1+ year" Tag="365"/><ComboBoxItem Content="Unused 2+ years" Tag="730"/>
                   </ComboBox>
-                  <Button x:Name="OldFind" Content="Find old downloads" Style="{StaticResource BtnPurple}" Padding="14,6" FontSize="12" Margin="8,0,0,0"/>
+                  <ComboBox x:Name="OldMin" Width="110" SelectedIndex="1" Margin="8,0,0,0" ToolTip="Smallest file to list">
+                    <ComboBoxItem Content="Any size" Tag="0"/><ComboBoxItem Content="1 MB+" Tag="1048576"/><ComboBoxItem Content="10 MB+" Tag="10485760"/><ComboBoxItem Content="100 MB+" Tag="104857600"/>
+                  </ComboBox>
+                  <ComboBox x:Name="OldKind" Width="120" SelectedIndex="0" Margin="8,0,0,0" ToolTip="Show only one kind of file">
+                    <ComboBoxItem Content="All kinds"/><ComboBoxItem Content="Installer"/><ComboBoxItem Content="Disk image"/><ComboBoxItem Content="Archive"/><ComboBoxItem Content="Video"/><ComboBoxItem Content="Picture"/><ComboBoxItem Content="Music"/><ComboBoxItem Content="Document"/><ComboBoxItem Content="Code"/><ComboBoxItem Content="Other"/>
+                  </ComboBox>
+                  <Button x:Name="OldFind" Content="Find old files" Style="{StaticResource BtnPurple}" Padding="14,6" FontSize="12" Margin="8,0,0,0"/>
                 </StackPanel>
                 <StackPanel x:Name="DupeBar" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" Visibility="Collapsed" Margin="0,0,6,0">
                   <TextBox x:Name="DupePath" Width="230" Tag="Folder to search" Padding="8,6"/>
@@ -7629,7 +7719,7 @@ function Initialize-AWMapDrives {
 #endregion
 
 #region ---------------------------------------------------------------- Large files
-# Three lists share one view: the Space Map's largest files, old downloads and duplicate groups.
+# Three lists share one view: the Space Map's largest files, old files and duplicate groups.
 $script:LargeTab = 'Largest'
 $script:OldFiles = New-Object System.Collections.Generic.List[object]
 $script:DupeFiles = New-Object System.Collections.Generic.List[object]
@@ -7648,29 +7738,28 @@ function Update-AWLargeList {
     if (-not $all -or $all.Count -eq 0) {
         $ui.LargeList.ItemsSource = $null
         $ui.LargeInfo.Text = switch ($script:LargeTab) {
-            'Old'   { "Lists files in $(Get-AWDownloadsFolder) you haven't opened in a while." }
+            'Old'   { if ($script:OldSearched) { 'No files of that size went unused since {0:MMM d, yyyy} in {1}.' -f $script:OldSince, (($script:State.OldFolders | ForEach-Object { if ($_ -match '\\') { Split-Path $_ -Leaf } else { $_ } }) -join ', ') } else { "Lists files in your $(($script:State.OldFolders | ForEach-Object { if ($_ -match '\\') { Split-Path $_ -Leaf } else { $_ } }) -join ', ') folder(s) that haven't been modified or opened in a while. Nothing is ticked unless it's an obvious leftover." } }
             'Dupes' { if ($script:DupeNote) { $script:DupeNote } else { 'Pick a folder and find exact copies (byte-for-byte) or similar photos.' } }
             default { 'Run a scan in Space Map to list the largest files.' }
         }
         return
     }
     $q = $ui.LargeSearch.Text.Trim()
-    $items = @(foreach ($f in $all) { if (-not $q -or $f.Name -like "*$q*" -or $f.Folder -like "*$q*" -or $f.Extension -like "*$q*" -or $f.Status -like "*$q*") { $f } })
+    $kind = if ($script:LargeTab -eq 'Old' -and $ui.OldKind.SelectedIndex -gt 0) { [string]$ui.OldKind.SelectedItem.Content } else { '' }
+    $items = @(foreach ($f in $all) {
+        if ($kind -and $f.Status -notlike "$kind*") { continue }
+        if (-not $q -or $f.Name -like "*$q*" -or $f.Folder -like "*$q*" -or $f.Extension -like "*$q*" -or $f.Status -like "*$q*") { $f }
+    })
     $ui.LargeList.ItemsSource = $items
     [long]$sum = 0; foreach ($f in $items) { $sum += $f.Size }
     $ui.LargeInfo.Text = switch ($script:LargeTab) {
-        'Old'   { '{0:N0} old download(s) - {1} total' -f $items.Count, (Format-AWSize $sum) }
+        'Old'   { '{0:N0} file(s) not modified or opened since {1:MMM d, yyyy} - {2} total{3}' -f $items.Count, $script:OldSince, (Format-AWSize $sum), $(if ($kind) { " ($kind only)" } else { '' }) }
         'Dupes' { $script:DupeNote }
         default { '{0:N0} files - {1} total - from scan of {2}' -f $items.Count, (Format-AWSize $sum), $script:Scanner.Root.FullPath }
     }
 }
 
 function Get-AWCheckedLarge { @(foreach ($f in (Get-AWLargeSource)) { if ($f.IsChecked) { $f } }) }
-
-function Get-AWDownloadsFolder {
-    $p = try { (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction Stop).'{374DE290-123F-4565-9164-39C4925E467B}' } catch { $null }
-    if ($p) { [Environment]::ExpandEnvironmentVariables($p) } else { Join-Path $env:USERPROFILE 'Downloads' }
-}
 
 function Set-AWLargeTab([string]$Tab) {
     $script:LargeTab = $Tab
@@ -7679,7 +7768,7 @@ function Set-AWLargeTab([string]$Tab) {
     $ui.DupeKeep.Visibility = if ($Tab -eq 'Dupes') { 'Visible' } else { 'Collapsed' }
     $ui.LargeScan.Visibility = if ($Tab -eq 'Largest') { 'Visible' } else { 'Collapsed' }
     $ui.LargeStatusCol.Header = if ($Tab -eq 'Old') { 'Kind' } else { 'Group' }
-    $ui.LargeStatusCol.Width = if ($Tab -eq 'Largest') { 0 } else { 170 }
+    $ui.LargeStatusCol.Width = if ($Tab -eq 'Largest') { 0 } elseif ($Tab -eq 'Old') { 230 } else { 170 }
     if ($Tab -eq 'Dupes' -and -not $ui.DupePath.Text) { $ui.DupePath.Text = $env:USERPROFILE }
     Update-AWLargeList
 }
@@ -7687,22 +7776,76 @@ $ui.LTabLargest.Add_Checked({ Set-AWLargeTab 'Largest' })
 $ui.LTabOld.Add_Checked({ Set-AWLargeTab 'Old' })
 $ui.LTabDupes.Add_Checked({ Set-AWLargeTab 'Dupes' })
 
+# ---- Old files: which folders to look in (remembered between runs)
+$script:OldKnown = 'Downloads', 'Desktop', 'Documents', 'Pictures', 'Videos', 'Music'
+$script:OldSince = Get-Date
+function Update-AWOldFolderButton {
+    $names = @($script:State.OldFolders | ForEach-Object { if ($_ -match '\\') { Split-Path $_ -Leaf } else { $_ } })
+    $ui.OldFolders.Content = 'Folders: ' + $(if ($names.Count -le 2) { $names -join ', ' } else { "$($names[0]) +$($names.Count - 1)" }) + "  $([char]0x25BE)"
+    $ui.OldFolders.ToolTip = 'Looking in: ' + ($names -join ', ')
+}
+function Build-AWOldFolderMenu {
+    $m = $ui.OldFolders.ContextMenu
+    $m.Items.Clear()
+    $style = $window.FindResource('CtxItem')
+    $custom = @($script:State.OldFolders | Where-Object { $_ -notin $script:OldKnown })
+    foreach ($f in @($script:OldKnown) + $custom) {
+        $on = $script:State.OldFolders -contains $f
+        $mi = New-Object System.Windows.Controls.MenuItem
+        $mi.Style = $style; $mi.StaysOpenOnClick = $true; $mi.Tag = $f
+        $mi.Header = '{0}  {1}' -f $(if ($on) { [char]0x2714 } else { [char]0x2003 }), $f
+        $mi.Add_Click({
+            param($s, $e)
+            $f = [string]$s.Tag
+            if ($script:State.OldFolders -contains $f) {
+                if (@($script:State.OldFolders).Count -le 1) { return }                     # keep at least one
+                $script:State.OldFolders = @($script:State.OldFolders | Where-Object { $_ -ne $f })
+            } else { $script:State.OldFolders = @($script:State.OldFolders) + $f }
+            Save-AWState; Update-AWOldFolderButton; Build-AWOldFolderMenu
+        })
+        [void]$m.Items.Add($mi)
+    }
+    $add = New-Object System.Windows.Controls.MenuItem
+    $add.Style = $style; $add.Header = "$([char]0x2003)  Add another folder..."
+    $add.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = 'Choose another folder to look for old files in'
+        if ($dlg.ShowDialog() -eq 'OK' -and $script:State.OldFolders -notcontains $dlg.SelectedPath) {
+            if (Test-AWProtectedPath $dlg.SelectedPath) { Show-AWMessage "AWiper won't look for old files in system locations:`n$($dlg.SelectedPath)" 'Warning'; return }
+            $script:State.OldFolders = @($script:State.OldFolders) + $dlg.SelectedPath
+            Save-AWState; Update-AWOldFolderButton; Build-AWOldFolderMenu
+        }
+    })
+    [void]$m.Items.Add($add)
+}
+$ui.OldFolders.Add_Click({ Build-AWOldFolderMenu; $ui.OldFolders.ContextMenu.PlacementTarget = $ui.OldFolders; $ui.OldFolders.ContextMenu.Placement = 'Bottom'; $ui.OldFolders.ContextMenu.IsOpen = $true })
+$ui.OldKind.Add_SelectionChanged({ if ($script:LargeTab -eq 'Old') { Update-AWLargeList } })
+$ui.OldDays.Add_SelectionChanged({ $script:OldSearched = $false })
+$ui.OldMin.Add_SelectionChanged({ $script:OldSearched = $false })
+Update-AWOldFolderButton
+
 $ui.OldFind.Add_Click({
-    if (Test-AWRemote) { Show-AWMessage 'Old downloads looks at your own Downloads folder on this PC.' }
+    if (Test-AWRemote) { Show-AWMessage 'Old files looks in your own folders on this PC.' }
     $days = [int]$ui.OldDays.SelectedItem.Tag
+    $min = [long]$ui.OldMin.SelectedItem.Tag
+    $script:OldSince = (Get-Date).AddDays(-$days)
     $ui.OldFind.IsEnabled = $false
-    Start-AWTask -Name 'Finding old downloads' -Arguments @{ Days = $days } -Work { @(Get-WOldDownloads $Days) } -OnComplete {
+    Start-AWTask -Name 'Finding old files' -Arguments @{ Days = $days; MinBytes = $min; Folders = @($script:State.OldFolders) } -Work { @(Get-WOldFiles $Folders $Days $MinBytes) } -OnComplete {
         param($r)
         $ui.OldFind.IsEnabled = $true
-        $script:OldFiles.Clear()
+        $script:OldFiles.Clear(); $script:OldSearched = $true
+        $ticked = 0
         foreach ($x in @($r | Sort-Object Size -Descending)) {
             $fe = New-Object AWiper.FileEntry
-            $fe.Name = $x.Name; $fe.FullPath = $x.Path; $fe.Folder = $x.Folder; $fe.Size = $x.Size; $fe.Extension = $x.Extension; $fe.Modified = $x.Modified; $fe.Status = $x.Kind
-            $fe.IsChecked = $x.Kind -in 'Installer', 'Disk image'      # the usual leftovers
+            $fe.Name = $x.Name; $fe.FullPath = $x.Path; $fe.Folder = $x.Folder; $fe.Size = $x.Size; $fe.Extension = $x.Extension; $fe.Modified = $x.Modified
+            $fe.Status = '{0}{1} - {2}' -f $x.Kind, $(if ($x.Extracted) { ' (already extracted)' } else { '' }), $x.Root
+            # Only the obvious leftovers are pre-ticked: installers and disk images in Downloads, and archives already extracted.
+            $fe.IsChecked = ($x.Root -eq 'Downloads' -and $x.Kind -in 'Installer', 'Disk image') -or $x.Extracted
+            if ($fe.IsChecked) { $ticked++ }
             $script:OldFiles.Add($fe)
         }
         Update-AWLargeList
-        $script:IdleStatus = "Found $($script:OldFiles.Count) old download(s) - installers and disk images are ticked"
+        $script:IdleStatus = "Found $($script:OldFiles.Count) old file(s)" + $(if ($ticked) { " - $ticked obvious leftover(s) ticked (installers and disk images in Downloads, archives already extracted)" } else { '' })
         Set-AWStatus $script:IdleStatus
     }
 })
@@ -7814,7 +7957,9 @@ $ui.LargeRecycle.Add_Click({
         if ($all.Count) { Show-AWMessage ("Every copy is ticked in {0} - leave at least one unticked:`n{1}" -f $(if ($all.Count -eq 1) { 'this group' } else { "$($all.Count) groups" }), (($all | Select-Object -First 5) -join "`n")) 'Warning'; return }
     }
     [long]$sum = 0; foreach ($f in $sel) { $sum += $f.Size }
-    if (-not (Confirm-AW ("Send {0} file(s) ({1}) to the Recycle Bin?" -f $sel.Count, (Format-AWSize $sum)))) { return }
+    $inCloud = @($sel | Where-Object { $_.Status -like '*(OneDrive)*' }).Count
+    $cloudNote = if ($inCloud) { "`n`n$inCloud of them are in OneDrive: they'll also disappear from OneDrive and your other devices (OneDrive keeps them in its own recycle bin for about 30 days)." } else { '' }
+    if (-not (Confirm-AW ("Send {0} file(s) ({1}) to the Recycle Bin?{2}" -f $sel.Count, (Format-AWSize $sum), $cloudNote))) { return }
     $ok = 0; $fail = 0
     foreach ($f in $sel) {
         if (Test-AWProtectedPath $f.FullPath) { $fail++; continue }
@@ -7834,7 +7979,7 @@ $ui.LargeExport.Add_Click({
     if (-not $src -or -not $src.Count) { Show-AWMessage 'Nothing to export yet.'; return }
     $dlg = New-Object Microsoft.Win32.SaveFileDialog
     $dlg.Filter = 'CSV file (*.csv)|*.csv'
-    $dlg.FileName = 'AWiper-{0}-{1:yyyyMMdd-HHmm}.csv' -f @{ Largest = 'LargeFiles'; Old = 'OldDownloads'; Dupes = 'Duplicates' }[$script:LargeTab], (Get-Date)
+    $dlg.FileName = 'AWiper-{0}-{1:yyyyMMdd-HHmm}.csv' -f @{ Largest = 'LargeFiles'; Old = 'OldFiles'; Dupes = 'Duplicates' }[$script:LargeTab], (Get-Date)
     if ($dlg.ShowDialog($window)) {
         $src | Select-Object Name, Size, SizeText, Extension, ModifiedText, Status, FullPath |
             Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding UTF8

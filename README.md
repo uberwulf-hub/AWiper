@@ -8,7 +8,7 @@ System cleanup, health check, debloat, recovery and repair toolkit for Windows, 
 | Health Check | Checks (disks incl. NVMe health, crashes, hardware errors, stability, devices, battery, antivirus...), Events, Startup time, Security, Privacy, Crashes, Sleep |
 | Cleaner      | Analyze / clean temp files, caches, error reports, crash dumps, update and Delivery Optimization caches, GPU and Steam shader caches (every Steam library), Recycle Bin |
 | Space Map    | SpaceMonger-style nested treemap of any drive or folder (drill down, recycle), with totals by kind (videos, pictures, installers, archives...) and by extension |
-| Large Files  | **Largest** — the 1,000 largest files from the last scan. **Old downloads** — files in Downloads not opened for 30 days to a year. **Duplicates** — exact copies (size, then a hash of the first 64 KB, then full SHA-256) or similar photos (perceptual hash). Searchable, recycle or export |
+| Large Files  | **Largest** — the 1,000 largest files from the last scan. **Old files** — files in your Downloads, Desktop, Documents, Pictures, Videos, Music or any folder you add, not modified or opened for 30 days to 2 years, filtered by size and kind; only obvious leftovers (installers and disk images in Downloads, archives already extracted) are pre-ticked, and OneDrive files are labelled. **Duplicates** — exact copies (size, then a hash of the first 64 KB, then full SHA-256) or similar photos (perceptual hash). Searchable, recycle or export |
 | Recovery     | Recycle Bin restore, previous versions, native NTFS undelete, restore points, versioned folder backup, deep scan with Windows File Recovery |
 | Startup      | Enable / disable startup entries (same `StartupApproved` switches Task Manager uses). **Right-click menu** tab: turn off menu entries programs added (shell extensions and commands), with undo |
 | Programs     | Installed software list with size, search and uninstall |
@@ -172,6 +172,7 @@ When a remote computer is targeted, these run on it: Health Check (and its Event
 .\tests\Test-Cli.ps1                                      # no admin: exercises the headless mode
 .\tests\Test-AirGap.ps1                                   # internet: needs list -> catalog driver + baselines -> manifest
 .\tests\Test-Backup.ps1                                   # no admin: backup versions, mirror and drive guard
+.\tests\Test-OldFiles.ps1                                 # no admin: old-files age / size limits, skipped folders, extracted archives
 .\tests\Test-UndeleteSynthetic.ps1                        # no admin: builds a tiny NTFS image and checks the undelete engine
 .\tests\Test-UndeleteLive.ps1 -Drive H: -Dest C:\Temp\R   # admin: deletes a test file on H:, recovers it, compares hashes
 ```
