@@ -5,14 +5,15 @@ System cleanup, health check, debloat, recovery and repair toolkit for Windows, 
 | View         | What it does |
 |--------------|--------------|
 | Dashboard    | Drive usage gauges, system summary, quick actions |
-| Health Check | Checks (disks incl. NVMe health, crashes, hardware errors, stability, devices, battery, antivirus...), Events, Startup time, Security, Privacy |
+| Health Check | Checks (disks incl. NVMe health, crashes, hardware errors, stability, devices, battery, antivirus...), Events, Startup time, Security, Privacy, Crashes, Sleep |
 | Cleaner      | Analyze / clean temp files, caches, error reports, crash dumps, update and Delivery Optimization caches, Recycle Bin |
 | Space Map    | SpaceMonger-style nested treemap of any drive or folder (drill down, recycle) |
 | Large Files  | The 1,000 largest files from the last scan — searchable, recycle or export |
 | Recovery     | Recycle Bin restore, previous versions, native NTFS undelete, restore points, versioned folder backup, deep scan with Windows File Recovery |
 | Startup      | Enable / disable startup entries (same `StartupApproved` switches Task Manager uses) |
 | Programs     | Installed software list with size, search and uninstall |
-| Drivers      | Installed drivers with vendor, age and problems; updates from Windows Update; vendor and PC-maker download pages; driver backup / restore |
+| Drivers      | Installed drivers with vendor, age and problems; updates from Windows Update; vendor and PC-maker download pages; driver backup / restore. **Windows updates** tab: missing-update scan online or offline, install from Resources |
+| IT Admin     | User profiles, printers, helpdesk actions, software push, security baseline audit, time sync and LAN speed test |
 | BIOS         | Firmware version, boot mode, Secure Boot, TPM, virtualization, boot order, and full BIOS setup options on Dell / HP / Lenovo business PCs - view only |
 | Debloat      | Remove preinstalled Store apps; turn off ads, suggestions, Bing in Start, Copilot, Recall, Widgets and more |
 | Rebloat      | Put back removed apps, set debloat tweaks back to Windows defaults, undo history |
@@ -27,6 +28,8 @@ The other Health Check tabs:
 - **Events** — groups the last 7 or 30 days of event-log trouble (blue screens, unexpected restarts, disk and file-system errors, hardware errors, crashing apps and services, failed updates, time-sync and Group Policy failures, failed sign-ins) with what each means and what to do. **Create support bundle** zips the System / Application logs, system and network info, drivers, programs and AWiper's reports for a technician.
 - **Startup time** — a chart of recent startups (time to desktop vs. settling) and the apps, drivers and services Windows says slowed them, linked to the Startup manager (needs admin).
 - **Security** — about 20 checks (firewall, Defender, SMB1, LLMNR, Guest, admins, Remote Desktop / NLA, PowerShell logging, AutoRun, UAC, LSA protection, Credential Guard, BitLocker, LAPS, shares, open ports, expiring certificates, USB storage). A short list of safe, reversible fixes can be applied — each goes into the undo history; settings enforced by Group Policy are labelled.
+- **Crashes** — reads the blue-screen dumps (and the event log when a dump wasn't kept), names each bug check in plain English (e.g. *0x124 = the hardware reported a fatal error*) and links the suggested fix: memory test, drivers, disk check, system-file repair, BIOS update.
+- **Sleep** — what woke the PC and when, which devices may wake it (with a reversible *stop this one waking it*), what's keeping it awake right now, wake timers and available sleep states, plus the battery and sleep-study reports.
 - **Privacy** — which apps last used the camera, microphone or location (and whether they're using them now), plus a report-only sweep for forced browser extensions, hijacked search / home-page policies, unsigned startup programs and scheduled tasks in user folders, proxies and hosts-file redirects.
 
 ### Drivers
@@ -44,9 +47,21 @@ A view-only look at the firmware: maker, version and age, UEFI or legacy boot, S
 
 **BIOS updates** — **Find BIOS update** opens the PC maker's support page for this exact model (or the motherboard maker's for custom-built PCs), **Check Windows Update** shows whether Windows Update already offers a BIOS / firmware update, and when BitLocker is on, **Suspend BitLocker for 1 restart** prevents the recovery-key prompt after flashing.
 
+### IT Admin
+
+- **User profiles** — every profile with its real last sign-in, size and status (temporary / corrupted profiles flagged); check the ones unused for N days and remove them (typed confirmation; profiles in use can't be selected).
+- **Printers** — printers, ports and drivers, with leftovers no printer uses; remove checked items, add a printer by IP address, reset the print spooler and clear stuck jobs.
+- **Helpdesk** — signed-in sessions and the heaviest processes: send a message, sign a user out, end a process, schedule or cancel a restart with a countdown, and launch Remote Assistance or a Remote Desktop shadow (the user is asked to allow it).
+- **Software push** — installs an `.msi` or `.exe` on several PCs: the file is copied to each one, hash-checked and run silently there (no file share or credential double-hop), with plain-English results for each MSI exit code.
+- **Baseline audit** — checks the PC against a security baseline in [HardeningKitty](https://github.com/scipag/HardeningKitty) CSV format (Microsoft, CIS, BSI, DoD lists): compliance score, failed settings by severity, CSV export. Audit only.
+- **Time and network** — time-sync status, point PCs at a local time server (undoable), and a LAN speed test that copies 256 MB to another PC and back.
+
+Most of these work on the remote PC selected in the title bar.
+
 ### Tools
 
 - **Offline kit** — find, create, verify and hash a Resources folder (see [Offline use](#offline-use)); update Defender from `Resources\defs`.
+- **Automation** — **Scheduled maintenance** runs a profile daily or weekly as SYSTEM from an admin-only copy of AWiper, saving each run's JSON results (e.g. to a shared folder for central collection).
 - **Fleet** — inventory several PCs over WinRM (hardware, serial, BIOS, Windows build, security state, programs) into one HTML / CSV / JSON report, with changes since the previous run.
 - **Quick fixes** — flush DNS, Group Policy update (`gpupdate /force`), restart Explorer, reset default app associations, empty Recycle Bin
 - **Repair** — System File Checker (`sfc /scannow`), DISM `/RestoreHealth` (from Windows Update, or offline from Windows media), .NET Framework 3.5, reset Windows Update, repair the Configuration Manager client (Software Center)
@@ -92,6 +107,12 @@ Offline alternatives come from a **Resources folder**, found automatically next 
 
 **Build manifest** hashes every file into `manifest.json` (SHA-256); **Verify Resources** checks a stick against it before use.
 
+**The air-gap round trip** keeps an isolated PC current with one USB stick:
+
+1. On the offline PC: **Drivers > Windows updates > Scan offline** (uses `updates\wsusscn2.cab`), then **Export needs list** — missing updates, problem devices, Defender age and apps to put back go to `needs\<PC>.json`.
+2. On any connected PC: **Tools > Fetch downloads** (or `AWiper.ps1 -Fetch -Yes`) downloads exactly that — update packages from the Microsoft Update Catalog (prerequisites included), drivers for the problem devices, Store app packages, fresh Defender definitions and scan file, and baseline lists — and refreshes the manifest.
+3. Back on the offline PC: **Install from Resources**, Defender offline update, **Install from folder** for drivers, and Rebloat (staged apps show as *Resources*).
+
 ## Command line (headless)
 
 Any of these parameters runs AWiper without a window — from a script, a scheduled task, or against other PCs. Changes are **only previewed unless `-Yes` is given**.
@@ -107,6 +128,9 @@ Any of these parameters runs AWiper without a window — from a script, a schedu
 .\AWiper.ps1 -CheckDrivers                                  # driver problems, Windows Update driver offers, maker page
 .\AWiper.ps1 -Inventory PC01,PC02,localhost                 # fleet inventory report + changes since last run
 .\AWiper.ps1 -Backup -Yes                                   # run the backup set up in the window
+.\AWiper.ps1 -ExportNeeds                                   # offline PC: save what it's missing to Resources\needs
+.\AWiper.ps1 -Fetch -Yes                                    # connected PC: download it all into Resources
+.\AWiper.ps1 -Config p.json -Yes -OutFile \\srv\drop\{computer}-{date}.json   # tokens expand per run
 .\AWiper.ps1 -ListRules    # also -ListTweaks, -ListApps
 ```
 
@@ -145,6 +169,7 @@ When a remote computer is targeted, these run on it: Health Check (and its Event
 
 ```powershell
 .\tests\Test-Cli.ps1                                      # no admin: exercises the headless mode
+.\tests\Test-AirGap.ps1                                   # internet: needs list -> catalog driver + baselines -> manifest
 .\tests\Test-Backup.ps1                                   # no admin: backup versions, mirror and drive guard
 .\tests\Test-UndeleteSynthetic.ps1                        # no admin: builds a tiny NTFS image and checks the undelete engine
 .\tests\Test-UndeleteLive.ps1 -Drive H: -Dest C:\Temp\R   # admin: deletes a test file on H:, recovers it, compares hashes
