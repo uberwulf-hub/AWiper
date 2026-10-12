@@ -139,7 +139,7 @@
 
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.9.1
+    Version : 1.10.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -178,7 +178,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.9.1'
+$script:AppVersion = '1.10.0'
 $script:CliMode = [bool]($Config -or $Analyze -or $Clean -or $HealthCheck -or $ApplyTweak -or $RevertTweak -or $RemoveApp -or
                          $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps -or $CheckDrivers -or $Backup -or $Inventory -or $ExportNeeds -or $Fetch)
 
@@ -2996,6 +2996,8 @@ function Get-WInventory {
         SystemFreeGB = $(if ($sys) { [Math]::Round($sys.FreeSpace / 1GB, 1) } else { $null }); Disks = $disks
         SecureBoot = $sb; Tpm = $tpm; DefenderSigDays = $sig; RebootPending = $reboot; IPs = $ips; Programs = $apps
         Win11Ready = $(if ([int]$cv.CurrentBuild -ge 22000) { 'Running Windows 11' } else { try { (Get-WWin11Readiness $true).Summary } catch { '?' } })
+        SecureBootCerts = $(try { (Get-WSecureBootCerts).Status } catch { '?' })
+        BitLockerKey = $(try { $b = Get-WBitLockerSummary (Get-WBitLockerInfo); "$($b.Health): $($b.Text)" } catch { '?' })
         Collected = (Get-Date).ToString('o')
     }
 }
@@ -3028,19 +3030,19 @@ function Invoke-WFleetInventory([string[]]$Hosts, [string]$OutRoot) {
     $changes = foreach ($r in $results) {
         $o = $prev[[string]$r.Computer]
         if (-not $o) { continue }
-        $c = @(foreach ($f in 'Model', 'Serial', 'Bios', 'OS', 'Build', 'RamGB', 'Tpm', 'SecureBoot') { if ("$($r.$f)" -ne "$($o.$f)") { "$($f): $($o.$f) -> $($r.$f)" } })
+        $c = @(foreach ($f in 'Model', 'Serial', 'Bios', 'OS', 'Build', 'RamGB', 'Tpm', 'SecureBoot', 'SecureBootCerts') { if ("$($r.$f)" -ne "$($o.$f)") { "$($f): $($o.$f) -> $($r.$f)" } })
         $added = @($r.Programs | Where-Object { $_ -notin @($o.Programs) }); $removed = @($o.Programs | Where-Object { $_ -notin @($r.Programs) })
         if ($c.Count -or $added.Count -or $removed.Count) { [pscustomobject]@{ Computer = $r.Computer; Changes = $c; Added = $added; Removed = $removed } }
     }
     ConvertTo-Json -InputObject $results.ToArray() -Depth 4 | Set-Content -LiteralPath (Join-Path $dir 'inventory.json') -Encoding UTF8   # (@(List) throws in PS 5.1)
-    $results | Select-Object Computer, Domain, User, Manufacturer, Model, Serial, Bios, OS, DisplayVersion, Build, Installed, LastBoot, CPU, RamGB, SystemFreeGB, SecureBoot, Tpm, DefenderSigDays, RebootPending, Win11Ready,
+    $results | Select-Object Computer, Domain, User, Manufacturer, Model, Serial, Bios, OS, DisplayVersion, Build, Installed, LastBoot, CPU, RamGB, SystemFreeGB, SecureBoot, Tpm, DefenderSigDays, RebootPending, Win11Ready, SecureBootCerts, BitLockerKey,
         @{ n = 'Disks'; e = { $_.Disks -join '; ' } }, @{ n = 'IPs'; e = { $_.IPs -join ', ' } }, @{ n = 'Programs'; e = { @($_.Programs).Count } } |
         Export-Csv -LiteralPath (Join-Path $dir 'inventory.csv') -NoTypeInformation -Encoding UTF8
     if ($fails.Count) { $fails | Export-Csv -LiteralPath (Join-Path $dir 'failed.csv') -NoTypeInformation -Encoding UTF8 }
     $e = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
     $rows = foreach ($r in $results) {
         $flag = if ($r.RebootPending) { ' (restart pending)' } else { '' }
-        "<tr><td><b>$(& $e $r.Computer)</b><br><small>$(& $e $r.User)</small></td><td>$(& $e "$($r.Manufacturer) $($r.Model)")<br><small>S/N $(& $e $r.Serial)</small></td><td>$(& $e $r.OS)<br><small>$(& $e $r.DisplayVersion) build $(& $e $r.Build)$flag</small></td><td>$(& $e $r.Bios)</td><td>$(& $e $r.CPU)<br><small>$($r.RamGB) GB RAM</small></td><td>$($r.SystemFreeGB) GB</td><td>SB $(& $e $r.SecureBoot), TPM $(& $e $r.Tpm), Defender defs $(& $e $r.DefenderSigDays) d</td><td>$(@($r.Programs).Count)</td></tr>"
+        "<tr><td><b>$(& $e $r.Computer)</b><br><small>$(& $e $r.User)</small></td><td>$(& $e "$($r.Manufacturer) $($r.Model)")<br><small>S/N $(& $e $r.Serial)</small></td><td>$(& $e $r.OS)<br><small>$(& $e $r.DisplayVersion) build $(& $e $r.Build)$flag</small></td><td>$(& $e $r.Bios)</td><td>$(& $e $r.CPU)<br><small>$($r.RamGB) GB RAM</small></td><td>$($r.SystemFreeGB) GB</td><td>SB $(& $e $r.SecureBoot) (certs $(& $e $r.SecureBootCerts)), TPM $(& $e $r.Tpm), Defender defs $(& $e $r.DefenderSigDays) d</td><td>$(@($r.Programs).Count)</td></tr>"
     }
     $chg = foreach ($c in @($changes)) {
         "<h3>$(& $e $c.Computer)</h3><ul>" + (($c.Changes | ForEach-Object { "<li>$(& $e $_)</li>" }) -join '') + (($c.Added | ForEach-Object { "<li style='color:#1f9e8f'>+ $(& $e $_)</li>" }) -join '') + (($c.Removed | ForEach-Object { "<li style='color:#c8344f'>- $(& $e $_)</li>" }) -join '') + '</ul>'
@@ -3168,6 +3170,225 @@ function Get-WWin11Readiness([bool]$Quick = $true) {
         Checks = $checks.ToArray(); Esu = @($esu)
         Summary = if ($fail.Count) { 'Not ready: ' + (($fail | ForEach-Object { "$($_.Name) - $($_.Detail)" }) -join '; ') } elseif ($unk.Count) { 'Probably ready - could not confirm: ' + (($unk | ForEach-Object Name) -join ', ') } else { 'Meets the Windows 11 requirements' }
     }
+}
+
+# ---------------------------------------------------------------- Recovery readiness
+function Test-WAdmin { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+
+# Secure Boot certificate rollover (KB5062710 / KB5068202): the 2011 Microsoft certificates expire in
+# 2026 (KEK and UEFI CA in June, Windows Production PCA on Oct 19). PCs that don't move to the 2023
+# certificates keep booting but stop getting boot manager and DBX security fixes. Status comes from
+# Windows' own servicing keys and TPM-WMI events; the firmware's DB / KEK are read when elevated.
+function Get-WSecureBootCerts {
+    $r = [ordered]@{ Applies = $true; SecureBootOn = $false; Status = 'Unknown'; Health = 'NA'; Summary = ''; Advice = ''; State = ''; Capable = $null
+                     ErrorCode = 0; AvailableUpdates = $null; OptedOut = $false; Db2023 = $null; Kek2023 = $null; LastEvent = $null; BitLockerRisk = $false; Blocked = $false; TaskFound = $false }
+    if ($env:firmware_type -and $env:firmware_type -ne 'UEFI') {
+        $r.Applies = $false; $r.Status = 'NotApplicable'; $r.Summary = 'This PC boots in legacy BIOS mode, so Secure Boot certificates do not apply'; return [pscustomobject]$r
+    }
+    $r.SecureBootOn = (Get-WRegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled') -eq 1
+    foreach ($k in 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing', 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot') {
+        if (-not $r.State) { $r.State = [string](Get-WRegValue $k 'UEFICA2023Status') }
+        if ($null -eq $r.Capable) { $r.Capable = Get-WRegValue $k 'WindowsUEFICA2023Capable' }
+        $e = Get-WRegValue $k 'UEFICA2023Error'; if ($e) { $r.ErrorCode = [int64]$e }
+    }
+    $r.AvailableUpdates = Get-WRegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot' 'AvailableUpdates'
+    $r.OptedOut = (Get-WRegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot' 'HighConfidenceOptOut') -eq 1
+    $r.TaskFound = [bool](Get-ScheduledTask -TaskPath '\Microsoft\Windows\PI\' -TaskName 'Secure-Boot-Update' -ErrorAction SilentlyContinue)
+    $meaning = @{ 1808 = 'certificates updated'; 1799 = '2023 boot manager installed'; 1801 = 'update waiting for the firmware'; 1800 = 'a restart is needed'
+                  1795 = 'the firmware rejected the update - a BIOS update from the PC maker is needed first'; 1796 = 'an unexpected error'
+                  1802 = 'blocked because of a known firmware problem on this model'; 1803 = 'the PC maker has not provided a signed key for this model yet'
+                  1032 = 'held back because BitLocker would ask for the recovery key'; 1043 = 'new KEK added'; 1044 = 'Option ROM CA 2023 added'; 1045 = 'UEFI CA 2023 added' }
+    $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = @($meaning.Keys); StartTime = (Get-Date).AddDays(-180) } -MaxEvents 50 -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProviderName -match 'TPM-WMI' })
+    if ($ev.Count) { $r.LastEvent = [pscustomobject]@{ Id = $ev[0].Id; Time = $ev[0].TimeCreated; Meaning = $meaning[$ev[0].Id] } }
+    $latestKey = @($ev | Where-Object { $_.Id -in 1808, 1801, 1800, 1795, 1802, 1803, 1032, 1796 }) | Select-Object -First 1
+    $r.BitLockerRisk = [bool](@($ev | Where-Object { $_.Id -eq 1032 -and $_.TimeCreated -gt (Get-Date).AddDays(-30) }).Count)
+    if (Test-WAdmin) {
+        try { $r.Db2023 = [Text.Encoding]::ASCII.GetString((Get-SecureBootUEFI -Name db -ErrorAction Stop).Bytes) -match 'Windows UEFI CA 2023' } catch { }
+        try { $r.Kek2023 = [Text.Encoding]::ASCII.GetString((Get-SecureBootUEFI -Name KEK -ErrorAction Stop).Bytes) -match 'KEK 2K CA 2023' } catch { }
+    }
+    if ($r.State -eq 'Updated' -or $r.Capable -eq 2 -or ($latestKey -and $latestKey.Id -eq 1808)) {
+        $r.Status = 'Updated'; $r.Health = 'Good'; $r.Summary = 'This PC has the 2023 Secure Boot certificates and boots with the 2023-signed boot manager'
+    } elseif ($latestKey -and $latestKey.Id -in 1795, 1802, 1803) {
+        $r.Status = 'Blocked'; $r.Blocked = $true; $r.Health = 'Warning'; $r.Summary = "Secure Boot certificate update blocked: $($meaning[$latestKey.Id])"
+        $r.Advice = 'Install the latest BIOS / UEFI update from the PC maker, then check again.'
+    } elseif ($r.State -eq 'InProgress' -or $r.Capable -eq 1 -or ($latestKey -and $latestKey.Id -in 1801, 1800, 1032)) {
+        $r.Status = 'InProgress'; $r.Health = $(if ($r.BitLockerRisk) { 'Warning' } else { 'Info' })
+        $r.Summary = 'The Secure Boot certificate update has started' + $(if ($latestKey) { " - last step: $($meaning[$latestKey.Id])" } else { '' })
+        $r.Advice = if ($r.BitLockerRisk) { 'Make sure the BitLocker recovery key is saved, then let AWiper suspend BitLocker for two restarts and finish the update.' } else { 'Restart the PC (twice if asked) to let it finish.' }
+    } else {
+        $r.Status = 'NotStarted'; $r.Health = 'Warning'
+        $r.Summary = 'This PC still uses the 2011 Secure Boot certificates. They expire in 2026 (the last on Oct 19), after which boot security fixes stop'
+        $r.Advice = if ($r.OptedOut) { 'Automatic rollout is turned off here (HighConfidenceOptOut). Use "Update certificates" after saving the BitLocker recovery key.' } else { 'Windows rolls this out automatically through monthly updates; you can start it now with "Update certificates".' }
+    }
+    if (-not $r.SecureBootOn -and $r.Status -ne 'Updated') { $r.Health = 'Info'; $r.Summary += ' (Secure Boot is currently off)' }
+    if ($r.ErrorCode -and $r.Status -ne 'Updated') { $r.Summary += (' - error 0x{0:X}' -f $r.ErrorCode) }
+    [pscustomobject]$r
+}
+
+# Starts the Secure Boot certificate update the way Microsoft documents for IT-managed PCs:
+# AvailableUpdates = 0x5944, then the Secure-Boot-Update task. Optionally suspends BitLocker for
+# two restarts first. Firmware changes can't be rolled back, so this isn't put in the undo journal.
+function Start-WSecureBootUpdate([bool]$SuspendBitLocker) {
+    if (-not (Test-WAdmin)) { throw 'Needs administrator rights.' }
+    $c = Get-WSecureBootCerts
+    if (-not $c.Applies) { throw $c.Summary }
+    if ($c.Blocked) { throw "$($c.Summary). $($c.Advice)" }
+    if ($SuspendBitLocker) {
+        $v = Get-CimInstance -Namespace root/cimv2/Security/MicrosoftVolumeEncryption -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$($env:SystemDrive)'" -ErrorAction SilentlyContinue
+        if ($v -and $v.ProtectionStatus -eq 1) {
+            $x = Invoke-CimMethod -InputObject $v -MethodName DisableKeyProtectors -Arguments @{ DisableCount = [uint32]2 }
+            if ($x.ReturnValue -ne 0) { throw "Could not suspend BitLocker (code $($x.ReturnValue))" }
+            Write-WLog "BitLocker suspended on $($env:SystemDrive) for two restarts"
+        }
+    }
+    Set-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot' -Name 'AvailableUpdates' -Value 0x5944 -Type DWord -ErrorAction Stop
+    try { Start-ScheduledTask -TaskPath '\Microsoft\Windows\PI\' -TaskName 'Secure-Boot-Update' -ErrorAction Stop } catch { Write-WLog "Secure-Boot-Update task: $($_.Exception.Message) - it runs on its own within 12 hours" 'WARN' }
+    Write-WLog 'Secure Boot certificate update requested (AvailableUpdates=0x5944). Restart the PC, twice if Windows asks.'
+    Start-Sleep -Seconds 5
+    Get-WSecureBootCerts
+}
+
+# BitLocker per volume, plus where (if anywhere) Windows says the recovery key was backed up.
+# Recovery passwords themselves are never returned here.
+function Get-WBitLockerInfo {
+    $admin = Test-WAdmin
+    $join = @{ Domain = $false; Entra = $false }
+    try { $ds = (& dsregcmd.exe /status 2>$null) -join "`n"; $join.Domain = $ds -match 'DomainJoined\s*:\s*YES'; $join.Entra = $ds -match 'AzureAdJoined\s*:\s*YES' } catch { }
+    $escrow = @{}
+    foreach ($e in @(Get-WinEvent -LogName 'Microsoft-Windows-BitLocker/BitLocker Management' -MaxEvents 400 -ErrorAction SilentlyContinue)) {
+        if ($e.Message -notmatch 'backed up|backup') { continue }
+        if ($e.LevelDisplayName -match 'Error|Warning' -or $e.Level -in 2, 3) { continue }
+        $dest = if ($e.Message -match 'Azure|Entra') { 'Microsoft Entra ID' } elseif ($e.Message -match 'Active Directory') { 'Active Directory' } else { 'a directory service' }
+        foreach ($m in [regex]::Matches($e.Message, '\{[0-9A-Fa-f-]{36}\}')) { if (-not $escrow[$m.Value.ToUpperInvariant()]) { $escrow[$m.Value.ToUpperInvariant()] = $dest } }
+    }
+    $vols = New-Object System.Collections.Generic.List[object]
+    if ($admin -and (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
+        foreach ($v in @(Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
+            $rp = @($v.KeyProtector | Where-Object { "$($_.KeyProtectorType)" -eq 'RecoveryPassword' })
+            $esc = @($rp | ForEach-Object { $escrow[([string]$_.KeyProtectorId).ToUpperInvariant()] } | Where-Object { $_ } | Select-Object -Unique)
+            $vs = "$($v.VolumeStatus)"; $ps = "$($v.ProtectionStatus)"
+            $state = if ($vs -eq 'FullyDecrypted') { 'Off' } elseif (-not @($v.KeyProtector).Count -and $vs -ne 'FullyDecrypted') { 'Waiting' } elseif ($ps -eq 'Off') { 'Suspended' } elseif ($vs -match 'Progress') { 'Encrypting' } else { 'On' }
+            $vols.Add([pscustomobject]@{ Mount = [string]$v.MountPoint; Type = "$($v.VolumeType)"; State = $state; Percent = [int]$v.EncryptionPercentage
+                Protectors = @($v.KeyProtector | ForEach-Object { "$($_.KeyProtectorType)" }); RecoveryPasswords = $rp.Count; EscrowedTo = $esc })
+        }
+    } else {
+        # Without admin rights only Explorer's BitLocker icon state is readable.
+        try {
+            $sh = New-Object -ComObject Shell.Application
+            foreach ($d in [IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' }) {
+                $p = $sh.NameSpace(17).ParseName($d.Name.TrimEnd('\')).ExtendedProperty('System.Volume.BitLockerProtection')
+                $state = switch ([int]$p) { 1 { 'On' } 3 { 'Encrypting' } 5 { 'Suspended' } 2 { 'Off' } 0 { 'Off' } default { 'Unknown' } }
+                $vols.Add([pscustomobject]@{ Mount = $d.Name.TrimEnd('\'); Type = $(if ($d.Name.TrimEnd('\') -eq $env:SystemDrive) { 'OperatingSystem' } else { 'Data' }); State = $state; Percent = -1; Protectors = @(); RecoveryPasswords = -1; EscrowedTo = @() })
+            }
+        } catch { }
+    }
+    $pde = Get-WRegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker' 'PreventDeviceEncryption'
+    [pscustomobject]@{ Admin = $admin; Volumes = $vols.ToArray(); Domain = $join.Domain; Entra = $join.Entra; PreventDeviceEncryption = ($pde -eq 1) }
+}
+
+# One summary line + status for the Health Check and inventory.
+function Get-WBitLockerSummary($Info) {
+    $enc = @($Info.Volumes | Where-Object { $_.State -in 'On', 'Suspended', 'Encrypting', 'Waiting' })
+    if (-not $Info.Volumes.Count) { return [pscustomobject]@{ Health = 'NA'; Text = 'BitLocker status is not available' } }
+    if (-not $enc.Count) {
+        if (-not $Info.Admin) { return [pscustomobject]@{ Health = 'Info'; Text = 'No drives appear to be encrypted with BitLocker (run as administrator for a definite answer)' } }
+        return [pscustomobject]@{ Health = 'Info'; Text = 'No drives are encrypted with BitLocker - nothing to lose if the PC''s security chip or firmware changes' }
+    }
+    $names = ($enc | ForEach-Object Mount) -join ', '
+    if (-not $Info.Admin) { return [pscustomobject]@{ Health = 'Info'; Text = "BitLocker is on for $names. Run as administrator to check that a recovery key exists and where it's saved" } }
+    $noKey = @($enc | Where-Object { $_.State -ne 'Waiting' -and $_.RecoveryPasswords -eq 0 })
+    if ($noKey.Count) { return [pscustomobject]@{ Health = 'Problem'; Text = "$(($noKey | ForEach-Object Mount) -join ', ') is encrypted without a recovery password - if Windows ever asks for one, the data can't be unlocked. Add one and save it" } }
+    $waiting = @($enc | Where-Object { $_.State -eq 'Waiting' })
+    $susp = @($enc | Where-Object { $_.State -eq 'Suspended' })
+    $unknown = @($enc | Where-Object { $_.State -ne 'Waiting' -and -not @($_.EscrowedTo).Count })
+    $parts = @()
+    if ($susp.Count) { $parts += "Protection is suspended on $(($susp | ForEach-Object Mount) -join ', ') (it resumes after the set number of restarts)" }
+    if ($waiting.Count) { $parts += "$(($waiting | ForEach-Object Mount) -join ', ') is encrypted but waiting for activation - a recovery key is created and protection turns on when someone signs in with a Microsoft or work account" }
+    if ($waiting.Count -eq $enc.Count) { return [pscustomobject]@{ Health = 'Info'; Text = $parts -join '. ' } }
+    if ($unknown.Count) {
+        $where = if ($Info.Entra -or $Info.Domain) { 'Windows has no record of it being backed up to your organization' } else { 'check it is in your Microsoft account (aka.ms/myrecoverykey) or save a copy now' }
+        return [pscustomobject]@{ Health = 'Warning'; Text = "BitLocker is on for $names. Make sure the recovery key is saved somewhere other than this PC: $where" + $(if ($parts) { '. Also: ' + ($parts -join '; ') } else { '' }) }
+    }
+    $prot = @($enc | Where-Object { $_.State -ne 'Waiting' })
+    [pscustomobject]@{ Health = $(if ($susp.Count) { 'Warning' } else { 'Good' }); Text = "BitLocker is on for $(($prot | ForEach-Object Mount) -join ', ') and the recovery key is backed up to $((@($prot | ForEach-Object { $_.EscrowedTo }) | Select-Object -Unique) -join ', ')" + $(if ($parts) { '. ' + ($parts -join '. ') } else { '' }) }
+}
+
+# Recovery passwords for one volume - only on explicit request, never logged.
+function Get-WBitLockerRecoveryKeys([string]$Mount) {
+    if (-not (Test-WAdmin)) { throw 'Needs administrator rights.' }
+    @((Get-BitLockerVolume -MountPoint $Mount -ErrorAction Stop).KeyProtector | Where-Object { "$($_.KeyProtectorType)" -eq 'RecoveryPassword' } |
+        ForEach-Object { [pscustomobject]@{ Id = [string]$_.KeyProtectorId; Password = [string]$_.RecoveryPassword } })
+}
+function Add-WBitLockerRecoveryPassword([string]$Mount) {
+    if (-not (Test-WAdmin)) { throw 'Needs administrator rights.' }
+    [void](Add-BitLockerKeyProtector -MountPoint $Mount -RecoveryPasswordProtector -ErrorAction Stop -WarningAction SilentlyContinue)
+    Write-WLog "BitLocker: added a recovery password to $Mount"
+}
+function Backup-WBitLockerKey([string]$Mount, [string]$To) {
+    if (-not (Test-WAdmin)) { throw 'Needs administrator rights.' }
+    $n = 0
+    foreach ($kp in @((Get-BitLockerVolume -MountPoint $Mount -ErrorAction Stop).KeyProtector | Where-Object { "$($_.KeyProtectorType)" -eq 'RecoveryPassword' })) {
+        if ($To -eq 'Entra') { [void](BackupToAAD-BitLockerKeyProtector -MountPoint $Mount -KeyProtectorId $kp.KeyProtectorId -ErrorAction Stop) }
+        else { [void](Backup-BitLockerKeyProtector -MountPoint $Mount -KeyProtectorId $kp.KeyProtectorId -ErrorAction Stop) }
+        $n++
+    }
+    Write-WLog "BitLocker: backed up $n recovery key(s) for $Mount to $(if ($To -eq 'Entra') { 'Microsoft Entra ID' } else { 'Active Directory' })"
+    $n
+}
+
+# Windows RE, Quick Machine Recovery and Point-in-time Restore.
+function Get-WRecoveryEnv {
+    $r = [ordered]@{ Admin = (Test-WAdmin); WinRE = 'Unknown'; WinREPath = ''; Qmr = 'Unknown'; QmrAuto = 'Unknown'; Pitr = 'Unknown'; RestorePoints = -1; LastRestorePoint = $null; ProtectionOn = $null }
+    if ($r.Admin) {
+        $info = (& reagentc.exe /info 2>&1) -join "`n"
+        if ($info -match 'Windows RE status:\s*(\w+)') { $r.WinRE = $Matches[1] }
+        if ($info -match 'Windows RE location:\s*(\S.*)') { $r.WinREPath = $Matches[1].Trim() }
+        $xml = (& reagentc.exe /getrecoverysettings 2>&1) -join "`n"
+        if ($xml -match '<') {
+            # Only read the two switches; the XML can contain a saved Wi-Fi password, which is never kept.
+            $cloud = [regex]::Match($xml, 'CloudRemediation[^>]*?state\s*=\s*"(\d)"', 'IgnoreCase'); if (-not $cloud.Success) { $cloud = [regex]::Match($xml, '<CloudRemediation[^>]*>\s*(\w+)', 'IgnoreCase') }
+            $auto = [regex]::Match($xml, 'AutoRemediation[^>]*?state\s*=\s*"(\d)"', 'IgnoreCase'); if (-not $auto.Success) { $auto = [regex]::Match($xml, '<AutoRemediation[^>]*>\s*(\w+)', 'IgnoreCase') }
+            $map = { param($v) switch -Regex ([string]$v) { '^(1|true|on|enabled)$' { 'On' } '^(0|false|off|disabled)$' { 'Off' } default { 'Unknown' } } }
+            if ($cloud.Success) { $r.Qmr = & $map $cloud.Groups[1].Value }
+            if ($auto.Success) { $r.QmrAuto = & $map $auto.Groups[1].Value }
+        } else { $r.Qmr = 'NotSupported' }
+        try {
+            $pts = @(Get-CimInstance -Namespace root/default -ClassName SystemRestore -ErrorAction Stop)
+            $r.RestorePoints = $pts.Count
+            if ($pts.Count) { $r.LastRestorePoint = ($pts | ForEach-Object { try { [datetime]::SpecifyKind([datetime]::ParseExact(([string]$_.CreationTime).Substring(0, 14), 'yyyyMMddHHmmss', $null), 'Utc').ToLocalTime() } catch { } } | Sort-Object -Descending | Select-Object -First 1) }
+        } catch { }
+    }
+    $r.ProtectionOn = (Get-WRegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' 'RPSessionInterval') -eq 1
+    # Point-in-time Restore (Windows 11, 2026): not documented for scripts; this value is what the Settings toggle writes.
+    $pitr = Get-WRegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\Recovery\PITR\Settings' 'Active_UX'
+    $r.Pitr = if ($pitr -eq 1) { 'On' } elseif ($pitr -eq 0) { 'Off' } elseif (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\Recovery\PITR') { 'Available' } else { 'NotAvailable' }
+    [pscustomobject]$r
+}
+
+# Windows 10 consumer Extended Security Updates (now through Oct 12, 2027): what's missing to enroll.
+function Get-WEsuEligibility {
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $build = [int]$cv.CurrentBuild
+    if ($build -ge 22000) { return [pscustomobject]@{ Applies = $false; Ready = $false; Missing = @(); Enrolled = $null; Summary = 'Windows 11 - ESU does not apply' } }
+    $miss = New-Object System.Collections.Generic.List[string]
+    if ($build -ne 19045) { $miss.Add("version 22H2 (this PC is build $build)") }
+    if ([string]$cv.EditionID -notmatch '^(Core|CoreSingleLanguage|CoreCountrySpecific|Professional|ProfessionalEducation|ProfessionalWorkstation)') { $miss.Add("a Home or Pro edition (this is $($cv.EditionID); businesses buy ESU through volume licensing)") }
+    $hf = @(Get-HotFix -ErrorAction SilentlyContinue)
+    if (-not ($hf | Where-Object HotFixID -eq 'KB5126256')) {
+        $pkg = $false; try { $pkg = [bool](Get-WindowsPackage -Online -ErrorAction Stop | Where-Object PackageName -match '5126256') } catch { }
+        if (-not $pkg) { $miss.Add('the ESU licensing preparation update KB5126256') }
+    }
+    $last = $hf | Where-Object InstalledOn | Sort-Object InstalledOn -Descending | Select-Object -First 1
+    if ($last -and $last.InstalledOn -lt (Get-Date).AddDays(-45)) { $miss.Add(('the latest cumulative update (last update installed {0:MMM d, yyyy})' -f $last.InstalledOn)) }
+    try { $ds = (& dsregcmd.exe /status 2>$null) -join "`n"; if ($ds -match 'DomainJoined\s*:\s*YES' -or $ds -match 'AzureAdJoined\s*:\s*YES') { $miss.Add('a PC that is not joined to a domain or Entra ID (organizations use commercial ESU)') } } catch { }
+    if (@(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue | Where-Object { $_.GetValue('UPN') }).Count) { $miss.Add('a PC that is not managed by MDM / Intune') }
+    $enrolled = $null
+    try { $enrolled = [bool]@(Get-CimInstance SoftwareLicensingProduct -Filter "Name LIKE '%ESU%' AND LicenseStatus = 1" -ErrorAction Stop).Count } catch { }
+    $summary = if ($enrolled) { 'Extended Security Updates are active on this PC (through Oct 12, 2027)' }
+               elseif ($miss.Count) { 'Not eligible for consumer Extended Security Updates yet - needs ' + ($miss -join '; ') }
+               else { 'Eligible for free consumer Extended Security Updates through Oct 12, 2027 - enroll in Settings > Windows Update with a Microsoft account that is an administrator' }
+    [pscustomobject]@{ Applies = $true; Ready = ($miss.Count -eq 0); Missing = $miss.ToArray(); Enrolled = $enrolled; Summary = $summary }
 }
 
 # ---------------------------------------------------------------- Old files (Downloads, Desktop, Documents...)
@@ -3499,12 +3720,30 @@ function Get-WHealth {
         $build = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).CurrentBuild
         if ($build -lt 22000) {
             $w = Get-WWin11Readiness $true
-            $esu = @($w.Esu | Where-Object { $_ -match 'active\)' -and $_ -notmatch 'not active' })
-            $esuText = if ($esu.Count) { " ESU: $($esu -join ', ')." } else { ' No Extended Security Updates licence - Windows 10 stopped getting security fixes in October 2025.' }
-            $st = if ($w.Ready) { 'Info' } elseif ($esu.Count) { 'Warning' } else { 'Problem' }
-            & $add 'Win11' 'Windows 11 readiness' $st ($w.Summary + '.' + $esuText) ''
+            $e = Get-WEsuEligibility
+            $st = if ($e.Enrolled) { 'Info' } elseif ($w.Ready -or $e.Ready) { 'Warning' } else { 'Problem' }
+            & $add 'Win11' 'Windows 11 readiness' $(if ($w.Ready) { 'Info' } else { 'Warning' }) ($w.Summary + '.') ''
+            & $add 'Esu' 'Windows 10 security updates' $st ("Windows 10 support ended Oct 14, 2025. " + $e.Summary + '.') ''
         }
     } catch { & $add 'Win11' 'Windows 11 readiness' 'NA' $_.Exception.Message '' }
+
+    # Can this PC be recovered if it won't start? Secure Boot certificates, BitLocker recovery key, Windows RE.
+    try {
+        $sb = Get-WSecureBootCerts
+        if ($sb.Applies) { & $add 'SecureBootCA' 'Secure Boot certificates' $sb.Health ($sb.Summary + $(if ($sb.Advice) { ". $($sb.Advice)" } else { '' })) 'Readiness' }
+    } catch { & $add 'SecureBootCA' 'Secure Boot certificates' 'NA' $_.Exception.Message '' }
+    try {
+        $bl = Get-WBitLockerSummary (Get-WBitLockerInfo)
+        & $add 'BitLockerKey' 'BitLocker recovery key' $bl.Health $bl.Text 'Readiness'
+    } catch { & $add 'BitLockerKey' 'BitLocker recovery key' 'NA' $_.Exception.Message '' }
+    if ($isAdmin) {
+        try {
+            $re = Get-WRecoveryEnv
+            if ($re.WinRE -eq 'Enabled') { & $add 'WinRE' 'Recovery environment' 'Good' ('Windows RE is enabled' + $(if ($re.Qmr -eq 'On') { ', and Quick Machine Recovery can fetch fixes if Windows stops starting' } else { '' })) 'Readiness' }
+            elseif ($re.WinRE -eq 'Disabled') { & $add 'WinRE' 'Recovery environment' 'Problem' 'Windows RE is disabled - Startup Repair, Reset this PC and Quick Machine Recovery won''t work if Windows stops starting' 'Readiness' }
+            else { & $add 'WinRE' 'Recovery environment' 'NA' 'Could not read the Windows RE status' '' }
+        } catch { & $add 'WinRE' 'Recovery environment' 'NA' $_.Exception.Message '' }
+    } else { & $add 'WinRE' 'Recovery environment' 'NA' 'Needs administrator rights to check' '' }
 
     $rows
 }
@@ -5658,6 +5897,7 @@ if ($script:CliMode) {
                     <RadioButton x:Name="RecTabRP"     Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Restore points"/>
                     <RadioButton x:Name="RecTabBackup" Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Backup"/>
                     <RadioButton x:Name="RecTabDeep"   Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Deep scan"/>
+                    <RadioButton x:Name="RecTabReady"  Style="{StaticResource SegBtn}" GroupName="RecTab" Content="Readiness" ToolTip="If this PC won't start tomorrow, can you get it back?"/>
                   </StackPanel>
                 </Border>
               </Grid>
@@ -5668,6 +5908,22 @@ if ($script:CliMode) {
             </ScrollViewer>
 
             <Grid Grid.Row="2" Margin="0,14,0,16">
+              <!-- Readiness: can this PC be recovered? -->
+              <Border x:Name="RecPanelReady" Style="{StaticResource Card}" Padding="18,14" Visibility="Collapsed">
+                <DockPanel>
+                  <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <StackPanel>
+                      <TextBlock Text="If this PC won't start tomorrow, can you get it back?" Style="{StaticResource H2}"/>
+                      <TextBlock x:Name="ReadyInfo" Text="Checks the BitLocker recovery key, Secure Boot certificates, the recovery environment, restore points and backups." Style="{StaticResource Muted}" Margin="0,4,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <Button x:Name="ReadyRefresh" Grid.Column="1" Content="Check again" Style="{StaticResource BtnChip}" VerticalAlignment="Center" Margin="0"/>
+                  </Grid>
+                  <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="ReadyRows"/>
+                  </ScrollViewer>
+                </DockPanel>
+              </Border>
               <!-- Recycle Bin -->
               <Border x:Name="RecPanelBin" Style="{StaticResource Card}" Padding="14,12">
                 <DockPanel>
@@ -6309,6 +6565,8 @@ if ($script:CliMode) {
                   <Button x:Name="BiosExport" Content="Export..." Style="{StaticResource BtnChip}" IsEnabled="False"/>
                   <Button x:Name="BiosRestart" Content="Restart into BIOS setup" Style="{StaticResource BtnPurple}" Padding="14,7" FontSize="12"
                           ToolTip="Restarts this PC straight into its UEFI firmware setup screen"/>
+                  <Button x:Name="BiosAdvStart" Content="Advanced Startup" Style="{StaticResource BtnChip}" Margin="8,0,0,0"
+                          ToolTip="Restarts into the Windows recovery menu: Startup Repair, System Restore, Safe Mode, UEFI settings"/>
                 </StackPanel>
               </Grid>
             </Border>
@@ -9537,6 +9795,9 @@ function Start-AWBiosRead {
     $ui.BiosSummary.Text = 'Reading firmware settings...'
     $local = -not (Test-AWRemote)
     $ui.BiosRestart.IsEnabled = $local -and $script:IsAdmin
+    $ui.BiosAdvStart.IsEnabled = $local
+    $ui.BiosAdvStart.ToolTip = if ($local) { 'Restarts into the Windows recovery menu: Startup Repair, System Restore, Safe Mode, UEFI settings' } else { 'Only available on this PC' }
+    [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($ui.BiosAdvStart, $true)
     $ui.BiosRestart.ToolTip = if (-not $local) { 'Only available on this PC' } elseif (-not $script:IsAdmin) { 'Needs administrator rights' } else { 'Restarts this PC straight into its UEFI firmware setup screen' }
     [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($ui.BiosRestart, $true)
     Start-AWTask -Name 'Read firmware settings' -Work { Invoke-WTarget { Get-WFirmwareInfo } } -OnComplete {
@@ -9570,7 +9831,7 @@ function Update-AWBiosUpdateCard {
     $ui.BiosWu.IsEnabled = -not (Test-AWOffline)
     $blOn = (& $get "BitLocker on $($env:SystemDrive)") -eq 'On'
     $ui.BiosBitlocker.Visibility = if ($blOn -and $script:IsAdmin -and -not (Test-AWRemote)) { 'Visible' } else { 'Collapsed' }
-    if ($blOn) { $ui.BiosUpdTips.Text = "Before updating: suspend BitLocker (button), plug a laptop into power, close your apps, follow the maker's instructions, and never turn the PC off during the update." }
+    if ($blOn) { $ui.BiosUpdTips.Text = "Before updating: make sure the BitLocker recovery key is saved off this PC (Recovery > Readiness), suspend BitLocker (button), plug a laptop into power, close your apps, follow the maker's instructions, and never turn the PC off during the update." }
 }
 
 function Start-AWBiosWuCheck {
@@ -9624,6 +9885,7 @@ function Export-AWBios {
 }
 
 $ui.BiosRefresh.Add_Click({ Start-AWBiosRead })
+$ui.BiosAdvStart.Add_Click({ Restart-AWAdvancedStartup })
 $ui.BiosExport.Add_Click({ Export-AWBios })
 $ui.BiosSearch.Add_TextChanged({ Update-AWBiosView })
 $ui.BiosRestart.Add_Click({
@@ -9656,6 +9918,7 @@ function Get-AWHealthAction([string]$Id) {
         'Cleaner'     { @{ Text = 'Open Cleaner'; Local = $false; Run = { Select-AWView 'Cleaner' } } }
         'Reliability' { @{ Text = 'Reliability Monitor'; Local = $true; Run = { Start-Process perfmon.exe -ArgumentList '/rel' } } }
         'Devices'     { @{ Text = 'Device Manager'; Local = $true; Run = { Start-Process devmgmt.msc } } }
+        'Readiness'   { @{ Text = 'Open Readiness'; Local = $false; Run = { Select-AWView 'Recovery'; $ui.RecTabReady.IsChecked = $true } } }
         'Memory'      { @{ Text = 'Test memory'; Local = $true; Run = {
                             if (Confirm-AW "Windows Memory Diagnostic restarts the PC and tests memory before Windows starts (about 15-30 minutes).`n`nSave your work, then choose 'Restart now' in the next window. Results show up here afterwards.") { Start-Process mdsched.exe }
                         } } }
@@ -11371,6 +11634,242 @@ function Update-AWRecoveryButtons {
     if ($remote -and -not $ui.RecTabBin.IsChecked) { $ui.RecTabBin.IsChecked = $true }
 }
 
+# ---- Readiness: BitLocker key, Secure Boot certificates, Windows RE / QMR / PITR, restore points, backup
+$script:Ready = $null
+function New-AWReadyRow([string]$Status, [string]$Title, [string[]]$Lines, $Buttons) {
+    $st = Get-AWStatusStyle $Status
+    $row = New-Object System.Windows.Controls.Border
+    $row.CornerRadius = 10; $row.Padding = '14,12'; $row.Margin = '0,5'
+    $row.Background = New-Brush '#1C2240'; $row.BorderBrush = $window.FindResource('LineBrush'); $row.BorderThickness = 1
+    $g = New-Object System.Windows.Controls.Grid
+    foreach ($w in 'Auto', '*') { $c = New-Object System.Windows.Controls.ColumnDefinition; $c.Width = $w; $g.ColumnDefinitions.Add($c) }
+    $pill = New-Object System.Windows.Controls.Border
+    $pill.CornerRadius = 9; $pill.Padding = '0,3'; $pill.Width = 78; $pill.VerticalAlignment = 'Top'; $pill.Margin = '0,2,0,0'; $pill.BorderThickness = 1
+    $pill.Background = New-Brush $st.Bg; $pill.BorderBrush = New-Brush $st.Border
+    $pt = New-AWText $st.Label 10 $st.Fg 'Bold'; $pt.HorizontalAlignment = 'Center'; $pill.Child = $pt
+    [void]$g.Children.Add($pill)
+    $sp = New-Object System.Windows.Controls.StackPanel; $sp.Margin = '16,0,0,0'
+    [void]$sp.Children.Add((New-AWText $Title 14 $null 'SemiBold'))
+    foreach ($l in $Lines) { if (-not $l) { continue }; $d = New-AWText $l 12.5 $script:Res.Muted; $d.TextWrapping = 'Wrap'; $d.Margin = '0,3,0,0'; [void]$sp.Children.Add($d) }
+    $bp = New-Object System.Windows.Controls.WrapPanel; $bp.Margin = '0,8,0,0'
+    foreach ($b in @($Buttons)) {
+        if (-not $b) { continue }
+        $btn = New-Object System.Windows.Controls.Button
+        $btn.Content = $b.Text; $btn.Style = $window.FindResource($(if ($b.Primary) { 'BtnPurple' } else { 'BtnChip' })); $btn.Margin = '0,0,8,0'
+        if ($b.Primary) { $btn.Padding = '14,6'; $btn.FontSize = 12 }
+        $btn.Tag = $b.Run; $btn.IsEnabled = $b.Enabled -ne $false
+        if ($b.Tip) { $btn.ToolTip = $b.Tip; [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($btn, $true) }
+        $btn.Add_Click({ param($s, $e) try { & $s.Tag } catch { Show-AWMessage $_.Exception.Message 'Error' } })
+        [void]$bp.Children.Add($btn)
+    }
+    if ($bp.Children.Count) { [void]$sp.Children.Add($bp) }
+    [System.Windows.Controls.Grid]::SetColumn($sp, 1); [void]$g.Children.Add($sp)
+    $row.Child = $g
+    [void]$ui.ReadyRows.Children.Add($row)
+}
+
+function Update-AWReadiness {
+    $ui.ReadyRefresh.IsEnabled = $false
+    $ui.ReadyRows.Children.Clear()
+    $who = if (Test-AWRemote) { $script:Target.ComputerName } else { 'this PC' }
+    $ui.ReadyInfo.Text = "Checking $who..."
+    Start-AWTask -Name 'Check recovery readiness' -Work {
+        Invoke-WTarget {
+            $bl = Get-WBitLockerInfo
+            [pscustomobject]@{ SB = (Get-WSecureBootCerts); BL = $bl; BLSum = (Get-WBitLockerSummary $bl); RE = (Get-WRecoveryEnv); Esu = (Get-WEsuEligibility); Admin = (Test-WAdmin) }
+        }
+    } -OnComplete {
+        param($Result)
+        $ui.ReadyRefresh.IsEnabled = $true
+        $r = @($Result | Where-Object { $_ -and $_.SB }) | Select-Object -Last 1
+        if (-not $r) { $ui.ReadyInfo.Text = 'Could not check - see the Activity log.'; return }
+        $script:Ready = $r
+        Show-AWReadiness
+    }
+}
+
+function Show-AWReadiness {
+    $r = $script:Ready
+    $ui.ReadyRows.Children.Clear()
+    $remote = Test-AWRemote; $offline = Test-AWOffline
+    $adminTip = 'Needs administrator rights - use "Restart as admin" in the title bar'
+    $who = if ($remote) { $script:Target.ComputerName } else { 'this PC' }
+
+    # 1. BitLocker recovery key
+    $enc = @($r.BL.Volumes | Where-Object { $_.State -in 'On', 'Suspended', 'Encrypting', 'Waiting' })
+    $lines = @($r.BLSum.Text)
+    foreach ($v in $enc) {
+        $lines += '{0} {1}: {2}{3}{4}' -f $v.Mount, $(if ($v.Type -eq 'OperatingSystem') { '(Windows)' } else { '(data)' }), $v.State,
+            $(if ($v.RecoveryPasswords -ge 0) { ", $($v.RecoveryPasswords) recovery password(s)" } else { '' }),
+            $(if (@($v.EscrowedTo).Count) { ", backed up to $(@($v.EscrowedTo) -join ', ')" } else { '' })
+    }
+    if ($enc.Count -and -not ($r.BL.Domain -or $r.BL.Entra)) { $lines += 'Signed in with a Microsoft account? Windows usually saves the key there automatically - check that it appears at aka.ms/myrecoverykey. A printed or USB copy is a good second place.' }
+    $canKeys = $r.Admin -and @($enc | Where-Object { $_.RecoveryPasswords -gt 0 }).Count
+    $noKey = @($enc | Where-Object { $_.State -ne 'Waiting' -and $_.RecoveryPasswords -eq 0 })
+    $btns = @()
+    if ($enc.Count) {
+        $btns += @{ Text = 'Save recovery key...'; Primary = $true; Enabled = [bool]$canKeys; Tip = $(if (-not $r.Admin) { $adminTip } else { 'Saves the recovery password(s) to a file you choose - put it on a USB stick or print it, not on this PC' }); Run = { Save-AWBitLockerKey } }
+        if ($noKey.Count) { $btns += @{ Text = 'Add a recovery password'; Enabled = $r.Admin; Tip = $(if (-not $r.Admin) { $adminTip } else { $null }); Run = { Add-AWRecoveryPassword } } }
+        if ($r.BL.Entra) { $btns += @{ Text = 'Back up to Entra ID'; Enabled = [bool]$canKeys; Run = { Backup-AWBitLockerKey 'Entra' } } }
+        if ($r.BL.Domain) { $btns += @{ Text = 'Back up to Active Directory'; Enabled = [bool]$canKeys; Run = { Backup-AWBitLockerKey 'AD' } } }
+        if (-not $remote) { $btns += @{ Text = 'Open aka.ms/myrecoverykey'; Enabled = -not $offline; Run = { Start-Process 'https://aka.ms/myrecoverykey' } } }
+    }
+    New-AWReadyRow $r.BLSum.Health 'BitLocker recovery key' $lines $btns
+
+    # 2. Secure Boot certificates
+    $sb = $r.SB
+    $lines = @($sb.Summary)
+    if ($sb.Advice) { $lines += $sb.Advice }
+    $facts = @()
+    if ($sb.Applies) {
+        $facts += "Secure Boot $(if ($sb.SecureBootOn) { 'on' } else { 'off' })"
+        if ($null -ne $sb.Db2023) { $facts += "2023 CA in firmware DB: $(if ($sb.Db2023) { 'yes' } else { 'no' })" }
+        if ($null -ne $sb.Kek2023) { $facts += "2023 KEK: $(if ($sb.Kek2023) { 'yes' } else { 'no' })" }
+        if ($sb.LastEvent) { $facts += ('last event {0} on {1:MMM d}: {2}' -f $sb.LastEvent.Id, $sb.LastEvent.Time, $sb.LastEvent.Meaning) }
+        $lines += ($facts -join ' - ')
+    }
+    $btns = @()
+    if ($sb.Applies -and $sb.Status -in 'NotStarted', 'InProgress') {
+        $btns += @{ Text = 'Update certificates...'; Primary = $true; Enabled = $r.Admin; Tip = $(if (-not $r.Admin) { $adminTip } else { 'Starts the Microsoft-signed certificate update (needs one or two restarts)' }); Run = { Start-AWSecureBootUpdate } }
+    }
+    if ($sb.Applies -and -not $remote) { $btns += @{ Text = 'Windows Security'; Run = { Start-Process 'windowsdefender://devicesecurity' } } }
+    New-AWReadyRow $(if ($sb.Applies) { $sb.Health } else { 'NA' }) 'Secure Boot certificates (2011 -> 2023)' $lines $btns
+
+    # 3. Recovery environment
+    $re = $r.RE
+    $lines = @()
+    $reStatus = 'NA'
+    if (-not $re.Admin) { $lines += 'Run as administrator to check Windows RE and Quick Machine Recovery.' }
+    else {
+        $lines += switch ($re.WinRE) { 'Enabled' { 'Windows RE is enabled - Startup Repair, System Restore from boot and Reset this PC are available.' } 'Disabled' { 'Windows RE is DISABLED - if Windows stops starting, there is no repair menu. Turn it back on.' } default { 'Could not read the Windows RE status.' } }
+        $lines += switch ($re.Qmr) { 'On' { 'Quick Machine Recovery is on: if Windows keeps failing to start, it can fetch a fix from Windows Update.' } 'Off' { 'Quick Machine Recovery is off.' } 'NotSupported' { 'Quick Machine Recovery needs Windows 11 24H2 (build 26100.4700) or later.' } default { '' } }
+        $reStatus = switch ($re.WinRE) { 'Enabled' { 'Good' } 'Disabled' { 'Problem' } default { 'NA' } }
+    }
+    $lines += switch ($re.Pitr) { 'On' { 'Point-in-time Restore looks turned on (Settings > System > Recovery).' } 'Off' { 'Point-in-time Restore looks off - it keeps rolling snapshots for up to 72 hours (Settings > System > Recovery).' } 'Available' { 'Point-in-time Restore is available on this PC - check whether it is on in Settings > System > Recovery (it keeps rolling snapshots for up to 72 hours).' } default { '' } }
+    $btns = @()
+    if ($re.WinRE -eq 'Disabled') { $btns += @{ Text = 'Turn on Windows RE'; Primary = $true; Enabled = $r.Admin; Run = { Enable-AWWinRE } } }
+    if (-not $remote) {
+        $btns += @{ Text = 'Recovery settings'; Run = { Start-Process 'ms-settings:recovery' } }
+        $btns += @{ Text = 'Restart to Advanced Startup'; Run = { Restart-AWAdvancedStartup } }
+    }
+    New-AWReadyRow $reStatus 'Recovery environment' $lines $btns
+
+    # 4. Restore points and backup
+    $lines = @()
+    $rpStatus = 'NA'
+    if ($re.Admin) {
+        if (-not $re.ProtectionOn -and $re.RestorePoints -le 0) { $lines += 'System Protection looks off and there are no restore points.'; $rpStatus = 'Warning' }
+        elseif ($re.RestorePoints -gt 0) {
+            $age = [int]((Get-Date) - $re.LastRestorePoint).TotalDays
+            $lines += ('{0} restore point(s), newest {1:MMM d, yyyy} ({2} day(s) ago).' -f $re.RestorePoints, $re.LastRestorePoint, $age); $rpStatus = $(if ($age -gt 30) { 'Warning' } else { 'Good' })
+        } else { $lines += 'No restore points yet.'; $rpStatus = 'Warning' }
+    } else { $lines += 'Run as administrator to read restore points.' }
+    if (-not $remote) {
+        $bk = $script:State.Backup
+        $lines += if ($bk.LastRun) { 'Last AWiper backup: {0} - {1}' -f ([datetime]$bk.LastRun).ToString('MMM d, yyyy h:mm tt'), $bk.LastResult } else { 'No AWiper folder backup set up - restore points do not include your files.' }
+        if (-not $bk.LastRun -and $rpStatus -eq 'Good') { $rpStatus = 'Info' }
+    }
+    New-AWReadyRow $rpStatus 'Restore points and backup' $lines @(
+        @{ Text = 'Restore points'; Run = { $ui.RecTabRP.IsChecked = $true } }
+        $(if (-not $remote) { @{ Text = 'Backup'; Run = { $ui.RecTabBackup.IsChecked = $true } } }))
+
+    # 5. Windows 10 ESU
+    if ($r.Esu.Applies) {
+        New-AWReadyRow $(if ($r.Esu.Enrolled) { 'Good' } elseif ($r.Esu.Ready) { 'Warning' } else { 'Problem' }) 'Windows 10 security updates' @("Windows 10 support ended Oct 14, 2025; consumer Extended Security Updates run through Oct 12, 2027.", $r.Esu.Summary) @(
+            $(if (-not $remote) { @{ Text = 'Windows Update'; Run = { Start-Process 'ms-settings:windowsupdate' } } }))
+    }
+    $bad = @($ui.ReadyRows.Children | Where-Object { $_.Child.Children[0].Child.Text -in 'PROBLEM', 'WARNING' }).Count
+    $ui.ReadyInfo.Text = "Checked $who at $((Get-Date).ToString('h:mm tt'))." + $(if ($bad) { " $bad item(s) need attention." } else { ' Nothing urgent.' })
+}
+
+function Save-AWBitLockerKey {
+    $mounts = @($script:Ready.BL.Volumes | Where-Object { $_.RecoveryPasswords -gt 0 } | ForEach-Object Mount)
+    if (-not $mounts.Count) { return }
+    $who = if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.Filter = 'Text file (*.txt)|*.txt'; $dlg.FileName = "BitLocker recovery key - $who.txt"
+    $dlg.Title = 'Save the recovery key somewhere other than this PC (USB stick, another computer)'
+    if (-not $dlg.ShowDialog($window)) { return }
+    $file = $dlg.FileName
+    if (-not (Test-AWRemote)) {
+        $drv = [IO.Path]::GetPathRoot($file).TrimEnd('\')
+        if ($drv -in $mounts -and -not (Confirm-AW "That file would be on $drv, which is one of the encrypted drives. If the PC asks for the key, you won't be able to open this file.`n`nSave it there anyway (for example, to copy it elsewhere afterwards)?")) { return }
+    }
+    $script:PendingKeyFile = $file
+    Start-AWTask -Name 'Read BitLocker recovery key' -Arguments @{ Mounts = $mounts } -Work {
+        Invoke-WTarget { param($M) foreach ($m in $M) { foreach ($k in @(Get-WBitLockerRecoveryKeys $m)) { [pscustomobject]@{ Mount = $m; Id = $k.Id; Password = $k.Password } } } } -ArgumentList (, $Mounts)
+    } -OnComplete {
+        param($Result)
+        $keys = @($Result | Where-Object { $_ -and $_.Password })
+        if (-not $keys.Count) { Show-AWMessage 'Could not read the recovery key - see the Activity log.' 'Error'; return }
+        $who = if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME }
+        $text = "BitLocker recovery key(s) for $who`r`nSaved by AWiper on $((Get-Date).ToString('f'))`r`n`r`nIf the PC asks for a BitLocker recovery key, match the Key ID it shows with the one below and type the 48-digit recovery key.`r`n"
+        foreach ($k in $keys) { $text += "`r`nDrive:         $($k.Mount)`r`nKey ID:        $($k.Id)`r`nRecovery key:  $($k.Password)`r`n" }
+        try {
+            [IO.File]::WriteAllText($script:PendingKeyFile, $text)
+            Write-AWAction 'SaveBitLockerKey' @("$(@($keys | ForEach-Object Mount | Select-Object -Unique) -join ', ') -> $($script:PendingKeyFile)") @{} 'Done'   # never the key itself
+            if (Confirm-AW "Saved to:`n$($script:PendingKeyFile)`n`nPrint a copy too? (Keep the paper somewhere safe - anyone with it can unlock the drive.)") { Start-Process notepad.exe -ArgumentList "/p `"$($script:PendingKeyFile)`"" }
+        } catch { Show-AWMessage "Could not save the file: $($_.Exception.Message)" 'Error' }
+        $script:PendingKeyFile = $null
+    }
+}
+
+function Add-AWRecoveryPassword {
+    $mounts = @($script:Ready.BL.Volumes | Where-Object { $_.State -in 'On', 'Suspended', 'Encrypting' -and $_.RecoveryPasswords -eq 0 } | ForEach-Object Mount)
+    if (-not (Confirm-AW "Add a 48-digit recovery password to $($mounts -join ', ')?`n`nThis doesn't change how you sign in. Save the new key straight afterwards.")) { return }
+    Start-AWTask -Name 'Add BitLocker recovery password' -Arguments @{ Mounts = $mounts } -Work { Invoke-WTarget { param($M) foreach ($m in $M) { Add-WBitLockerRecoveryPassword $m } } -ArgumentList (, $Mounts) } -OnComplete {
+        param($r)
+        Write-AWAction 'AddBitLockerRecoveryPassword' @($script:Ready.BL.Volumes | ForEach-Object Mount) @{} 'Done'
+        Show-AWMessage 'Recovery password added. Use "Save recovery key..." now to keep a copy.'
+        Update-AWReadiness
+    }
+}
+
+function Backup-AWBitLockerKey([string]$To) {
+    $mounts = @($script:Ready.BL.Volumes | Where-Object { $_.RecoveryPasswords -gt 0 } | ForEach-Object Mount)
+    Start-AWTask -Name "Back up BitLocker key to $To" -Arguments @{ Mounts = $mounts; To = $To } -Work {
+        Invoke-WTarget { param($M, $T) $n = 0; foreach ($m in $M) { $n += Backup-WBitLockerKey $m $T }; $n } -ArgumentList $Mounts, $To
+    } -OnComplete {
+        param($r)
+        $n = [int](@($r) | Select-Object -Last 1)
+        if ($n) { Write-AWAction 'BackupBitLockerKey' @($script:Ready.BL.Volumes | Where-Object { $_.RecoveryPasswords -gt 0 } | ForEach-Object Mount) @{} 'Done'; Show-AWMessage "$n recovery key(s) backed up." } else { Show-AWMessage 'Nothing was backed up - see the Activity log.' 'Warning' }
+        Update-AWReadiness
+    }
+}
+
+function Start-AWSecureBootUpdate {
+    $sysVol = @($script:Ready.BL.Volumes | Where-Object { $_.Type -eq 'OperatingSystem' -and $_.State -in 'On', 'Encrypting' })
+    $msg = "Start the Secure Boot certificate update now?`n`nWindows adds Microsoft's 2023 certificates to the firmware and switches to the 2023-signed boot manager. It's the same update Windows rolls out on its own; it needs one or two restarts and can't be undone.`n`nIf the PC maker's firmware rejects it, Windows stops and AWiper will show that a BIOS update is needed."
+    if ($sysVol.Count) { $msg += "`n`nBitLocker is on. Make sure the recovery key is saved off this PC first - AWiper will suspend BitLocker for two restarts so the firmware change doesn't trigger a recovery prompt." }
+    if (-not (Confirm-AW $msg)) { return }
+    if ($sysVol.Count -and -not (Confirm-AW 'Is the BitLocker recovery key saved somewhere other than this PC (Microsoft account, USB stick, paper or your organization)?')) {
+        Show-AWMessage 'Save the recovery key first ("Save recovery key..." above), then start the update.'; return
+    }
+    Write-AWAction 'SecureBootCertUpdate' @($(if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME })) @{ SuspendBitLocker = [bool]$sysVol.Count } 'Started'
+    Start-AWTask -Name 'Secure Boot certificate update' -Arguments @{ Suspend = [bool]$sysVol.Count } -Work { Invoke-WTarget { param($S) try { Start-WSecureBootUpdate $S } catch { [pscustomobject]@{ Error = $_.Exception.Message } } } -ArgumentList $Suspend } -OnComplete {
+        param($res)
+        $x = @($res) | Select-Object -Last 1
+        if ($x.Error) { Show-AWMessage "The update didn't start:`n$($x.Error)" 'Warning' }
+        else { Show-AWMessage "Update requested. Restart the PC (twice if Windows asks), then check again here.`n`nCurrent status: $($x.Summary)" }
+        Update-AWReadiness
+    }
+}
+
+function Enable-AWWinRE {
+    if (-not (Confirm-AW 'Turn Windows RE back on (reagentc /enable)?')) { return }
+    Start-AWCommandTask 'Turn on Windows RE' { & reagentc.exe /enable 2>&1; "AWEXIT $LASTEXITCODE" }
+}
+
+function Restart-AWAdvancedStartup {
+    if (-not (Confirm-AW "Restart into Advanced Startup now?`n`nSave your work first. From there you can use Startup Repair, System Restore, Safe Mode, UEFI settings or Reset this PC - or choose Continue to go back to Windows.")) { return }
+    Write-AWAction 'RestartToAdvancedStartup' @($env:COMPUTERNAME) @{} 'Started'
+    Update-AWLogView
+    try { & shutdown.exe /r /o /t 5 /c 'AWiper: restarting into Advanced Startup' 2>&1 | Out-Null; if ($LASTEXITCODE) { throw "shutdown.exe exit code $LASTEXITCODE" } }
+    catch { Show-AWMessage "Could not restart into Advanced Startup: $($_.Exception.Message)" 'Error' }
+}
+$ui.ReadyRefresh.Add_Click({ Update-AWReadiness })
+$ui.RecTabReady.Add_Checked({ Show-AWRecoveryTab 'Ready' })
+
 function Show-AWRecoveryTab([string]$Tab) {
     $ui.RecPanelBin.Visibility    = if ($Tab -eq 'Bin')    { 'Visible' } else { 'Collapsed' }
     $ui.RecPanelShadow.Visibility = if ($Tab -eq 'Shadow') { 'Visible' } else { 'Collapsed' }
@@ -11378,6 +11877,9 @@ function Show-AWRecoveryTab([string]$Tab) {
     $ui.RecPanelUndel.Visibility  = if ($Tab -eq 'Undel')  { 'Visible' } else { 'Collapsed' }
     $ui.RecPanelRP.Visibility     = if ($Tab -eq 'RP')     { 'Visible' } else { 'Collapsed' }
     $ui.RecPanelBackup.Visibility = if ($Tab -eq 'Backup') { 'Visible' } else { 'Collapsed' }
+    $ui.RecPanelReady.Visibility  = if ($Tab -eq 'Ready')  { 'Visible' } else { 'Collapsed' }
+    $ui.RecDrives.Visibility      = if ($Tab -eq 'Ready')  { 'Collapsed' } else { 'Visible' }
+    if ($Tab -eq 'Ready') { Update-AWReadiness; return }
     if (-not $script:RecLoadedTabs[$Tab]) {
         $script:RecLoadedTabs[$Tab] = $true
         if ($Tab -eq 'Shadow') { Update-AWShadowList }
@@ -11394,7 +11896,7 @@ function Initialize-AWRecovery {
     Update-AWRecoveryButtons
     Update-AWRecoveryDrives
     Update-AWBinList
-    if ($ui.RecTabShadow.IsChecked) { Show-AWRecoveryTab 'Shadow' } elseif ($ui.RecTabDeep.IsChecked) { Show-AWRecoveryTab 'Deep' } elseif ($ui.RecTabUndel.IsChecked) { Show-AWRecoveryTab 'Undel' } elseif ($ui.RecTabRP.IsChecked) { Show-AWRecoveryTab 'RP' } elseif ($ui.RecTabBackup.IsChecked) { Show-AWRecoveryTab 'Backup' }
+    if ($ui.RecTabShadow.IsChecked) { Show-AWRecoveryTab 'Shadow' } elseif ($ui.RecTabDeep.IsChecked) { Show-AWRecoveryTab 'Deep' } elseif ($ui.RecTabUndel.IsChecked) { Show-AWRecoveryTab 'Undel' } elseif ($ui.RecTabRP.IsChecked) { Show-AWRecoveryTab 'RP' } elseif ($ui.RecTabBackup.IsChecked) { Show-AWRecoveryTab 'Backup' } elseif ($ui.RecTabReady.IsChecked) { Show-AWRecoveryTab 'Ready' }
 }
 
 $ui.RecTabBin.Add_Checked({ Show-AWRecoveryTab 'Bin' })
