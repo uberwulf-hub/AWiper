@@ -6,7 +6,7 @@ System cleanup, health check, debloat, recovery and repair toolkit for Windows, 
 |--------------|--------------|
 | Dashboard    | Drive usage gauges, system summary, quick actions |
 | Health Check | Checks (disks incl. NVMe health, crashes, hardware errors, stability, devices, battery, antivirus...), Events, Startup time, Security, Privacy, Crashes, Sleep |
-| Cleaner      | Analyze / clean temp files, caches, error reports, crash dumps, update and Delivery Optimization caches, GPU and Steam shader caches (every Steam library), Recycle Bin |
+| Cleaner      | Analyze / clean temp files, caches, error reports, crash dumps, update and Delivery Optimization caches, GPU and Steam shader caches (every Steam library), Recycle Bin. Emptying the Recycle Bin (permanent) and deleting blue-screen memory dumps (needed by Crashes) are off by default |
 | Space Map    | SpaceMonger-style nested treemap of any drive or folder (drill down, recycle), with totals by kind (videos, pictures, installers, archives...) and by extension |
 | Large Files  | **Largest** — the 1,000 largest files from the last scan. **Old files** — files in your Downloads, Desktop, Documents, Pictures, Videos, Music or any folder you add, not modified or opened for 30 days to 2 years, filtered by size and kind; only obvious leftovers (installers and disk images in Downloads, archives already extracted) are pre-ticked, and OneDrive files are labelled. **Duplicates** — exact copies (size, then a hash of the first 64 KB, then full SHA-256) or similar photos (perceptual hash). Searchable, recycle or export |
 | Recovery     | Recycle Bin restore, previous versions, native NTFS undelete, restore points, versioned folder backup, deep scan with Windows File Recovery. **Readiness**: BitLocker recovery key, Secure Boot 2023 certificates, Windows RE / Quick Machine Recovery, restore points and backup |
@@ -163,7 +163,23 @@ Click **This PC** in the title bar to target another computer by hostname, FQDN 
 
 The remote PC needs PowerShell remoting enabled (`Enable-PSRemoting -Force`) and your account must be an administrator there.
 
-When a remote computer is targeted, these run on it: Health Check (and its Events, Startup time and Security tabs), the driver list and update check, the BIOS view, Tools (except Explorer, Recycle Bin, Disk Cleanup, Storage Sense, and offline media repair), machine-wide Cleaner rules, Debloat apps and machine-wide tweaks, the Programs list and Recycle Bin restore. Per-user items, Dashboard, Space Map, Large Files and Startup stay on this PC and are labelled as such.
+When a remote computer is targeted, these run on it:
+- Health Check (and its Events, Startup time and Security tabs)
+- the driver list and update check
+- the BIOS view
+- IT Admin
+- Tools (except Explorer, Recycle Bin, Disk Cleanup, Storage Sense, and offline media repair)
+- machine-wide Cleaner rules, Debloat apps and machine-wide tweaks
+- the Programs list, Recycle Bin restore and Recovery > Readiness
+
+**Space Map and Large Files** scan the remote PC's drives:
+- **How:** through its admin share (`\\PC\C$`, using the saved credentials), so the treemap, drill-down and Largest list work as they do locally. If the share isn't reachable (for example, File and Printer Sharing is blocked), AWiper runs the scan on that PC over WinRM and brings back a trimmed tree: everything down to about 0.0025% of the scanned size, plus the 1,000 largest files and totals by type.
+- **Deleting:** files on another PC can't go to a Recycle Bin, so removing them there is permanent and asks first. System locations are refused.
+- **Switching:** a banner shows which PC is being scanned, with a switch back to this PC.
+
+**Startup and the Right-click menu** list and change the remote PC's all-users entries. Each user's own entries are only shown when AWiper runs on that PC, because over WinRM "current user" is the account AWiper connected with.
+
+Dashboard, per-user Cleaner rules, Old files and Duplicates always stay on this PC. Every view's title says which PC it's showing.
 
 ## Safety and audit trail
 

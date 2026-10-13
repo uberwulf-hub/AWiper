@@ -139,7 +139,7 @@
 
 .NOTES
     Name    : AWiper.ps1
-    Version : 1.10.0
+    Version : 1.11.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\AWiper\AWiper.log
@@ -178,7 +178,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.10.0'
+$script:AppVersion = '1.11.0'
 $script:CliMode = [bool]($Config -or $Analyze -or $Clean -or $HealthCheck -or $ApplyTweak -or $RevertTweak -or $RemoveApp -or
                          $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps -or $CheckDrivers -or $Backup -or $Inventory -or $ExportNeeds -or $Fetch)
 
@@ -547,6 +547,75 @@ namespace AWiper
                 node.Children.Add(g);
             }
             node.Children.Sort(CompareNodes);
+        }
+
+        // Compact text form of a finished scan, so a scan run on another PC (over WinRM) can be sent
+        // back and rebuilt. Items smaller than minSize are folded into one "smaller items" group per folder.
+        private static string Clean(string s) { return (s ?? "").Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' '); }
+        public string Export(long minSize)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("H\t").Append(FilesScanned).Append('\t').Append(FoldersScanned).Append('\t').Append(BytesScanned).Append('\t').Append(Errors)
+              .Append('\t').Append(ElapsedSeconds.ToString(CultureInfo.InvariantCulture)).Append('\t').Append(Completed ? 1 : 0).Append('\n');
+            if (Root != null) ExportNode(sb, Root, 0, minSize);
+            foreach (var f in TopFiles) sb.Append("T\t").Append(f.Size).Append('\t').Append(f.Modified.Ticks).Append('\t').Append(Clean(f.FullPath)).Append('\n');
+            foreach (var e in ExtensionList) sb.Append("E\t").Append(Clean(e.Extension)).Append('\t').Append(e.Size).Append('\t').Append(e.Count).Append('\n');
+            return sb.ToString();
+        }
+        private static void ExportNode(System.Text.StringBuilder sb, DiskNode n, int depth, long minSize)
+        {
+            sb.Append("N\t").Append(depth).Append('\t').Append(n.IsDir ? 1 : 0).Append('\t').Append(n.IsGroup ? 1 : 0).Append('\t').Append(n.Size).Append('\t').Append(n.FileCount)
+              .Append('\t').Append(Clean(depth == 0 ? n.FullPath : n.Name)).Append('\n');
+            long restSize = 0, restCount = 0;
+            foreach (var c in n.Children)
+            {
+                if (c.Size >= minSize && !c.IsGroup) ExportNode(sb, c, depth + 1, minSize);
+                else { restSize += c.Size; restCount += c.FileCount; }
+            }
+            if (restCount > 0)
+                sb.Append("N\t").Append(depth + 1).Append("\t0\t1\t").Append(restSize).Append('\t').Append(restCount).Append('\t')
+                  .Append(restCount).Append(restCount == 1 ? " smaller item" : " smaller items").Append('\n');
+        }
+        public static DiskScanner Import(string text)
+        {
+            var s = new DiskScanner();
+            var stack = new List<DiskNode>();
+            foreach (var line in text.Split('\n'))
+            {
+                if (line.Length < 2) continue;
+                var p = line.Split('\t');
+                if (p[0] == "H" && p.Length >= 7)
+                {
+                    s.FilesScanned = long.Parse(p[1]); s.FoldersScanned = long.Parse(p[2]); s.BytesScanned = long.Parse(p[3]); s.Errors = long.Parse(p[4]);
+                    s.ElapsedSeconds = double.Parse(p[5], CultureInfo.InvariantCulture); s.Completed = p[6] == "1";
+                }
+                else if (p[0] == "N" && p.Length >= 7)
+                {
+                    int depth = int.Parse(p[1]);
+                    var n = new DiskNode(); n.IsDir = p[2] == "1"; n.IsGroup = p[3] == "1"; n.Size = long.Parse(p[4]); n.FileCount = long.Parse(p[5]); n.Name = p[6];
+                    if (depth == 0) { n.FullPath = p[6]; s.Root = n; stack.Clear(); stack.Add(n); continue; }
+                    while (stack.Count > depth) stack.RemoveAt(stack.Count - 1);
+                    var parent = stack[stack.Count - 1];
+                    n.Parent = parent; n.FullPath = n.IsGroup ? parent.FullPath : Path.Combine(parent.FullPath, n.Name);
+                    parent.Children.Add(n);
+                    stack.Add(n);
+                }
+                else if (p[0] == "T" && p.Length >= 4)
+                {
+                    var f = new FileEntry(); f.Size = long.Parse(p[1]); f.Modified = new DateTime(long.Parse(p[2])); f.FullPath = p[3];
+                    f.Name = Path.GetFileName(p[3]); try { f.Folder = Path.GetDirectoryName(p[3]); } catch { f.Folder = ""; }
+                    try { f.Extension = Path.GetExtension(p[3]).ToLowerInvariant(); } catch { f.Extension = ""; }
+                    s.TopFiles.Add(f);
+                }
+                else if (p[0] == "E" && p.Length >= 4)
+                {
+                    var e = new ExtStat(); e.Extension = p[1]; e.Size = long.Parse(p[2]); e.Count = long.Parse(p[3]);
+                    s.ExtensionList.Add(e);
+                }
+            }
+            long max = s.ExtensionList.Count > 0 ? s.ExtensionList[0].Size : 0;
+            foreach (var e in s.ExtensionList) { e.Percent = s.Root != null && s.Root.Size > 0 ? e.Size * 100.0 / s.Root.Size : 0; e.RelPercent = max > 0 ? e.Size * 100.0 / max : 0; }
+            return s;
         }
     }
 
@@ -1442,6 +1511,19 @@ namespace AWiper
         [DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList(uint[] list, uint count);
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SHEmptyRecycleBin(IntPtr hwnd, string root, uint flags);
+
+        // Authenticates to a remote share (e.g. \\PC\C$) for this logon session, without a drive letter.
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private class NETRESOURCE { public int dwScope; public int dwType = 1; public int dwDisplayType; public int dwUsage; public string lpLocalName; public string lpRemoteName; public string lpComment; public string lpProvider; }
+        [DllImport("mpr.dll", CharSet = CharSet.Unicode)] private static extern int WNetAddConnection2(NETRESOURCE res, string password, string user, int flags);
+        [DllImport("mpr.dll", CharSet = CharSet.Unicode)] private static extern int WNetCancelConnection2(string name, int flags, bool force);
+        // Returns 0 on success; 1219 means a connection with other credentials already exists (it is still usable).
+        public static int ConnectShare(string unc, string user, string password)
+        {
+            var r = new NETRESOURCE(); r.lpRemoteName = unc;
+            return WNetAddConnection2(r, password, user, 4 /* CONNECT_TEMPORARY */);
+        }
+        public static int DisconnectShare(string unc) { return WNetCancelConnection2(unc, 0, true); }
         // Deletes one System Restore point by sequence number (the API System Properties uses). Returns 0 on success.
         [DllImport("srclient.dll")] public static extern int SRRemoveRestorePoint(int sequenceNumber);
 
@@ -3456,11 +3538,64 @@ function Get-WOldFiles([string[]]$Folders, [int]$Days = 90, [long]$MinBytes = 0)
     }
 }
 
+# ---------------------------------------------------------------- Startup entries (Run keys + Startup folders)
+# Same StartupApproved switches Task Manager uses. $MachineOnly skips the current user's entries
+# (used over WinRM, where "current user" is the connecting admin).
+function Get-WStartupItems([bool]$MachineOnly = $false) {
+    $base = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'
+    $admin = Test-WAdmin
+    $enabled = { param($Key, $Name) try { $v = (Get-ItemProperty -LiteralPath $Key -Name $Name -ErrorAction Stop).$Name; if ($v -is [byte[]] -and $v.Length -gt 0) { return -not ($v[0] -band 1) } } catch { }; $true }
+    $sources = @(
+        @{ Hive = 'HKCU'; Key = 'Software\Microsoft\Windows\CurrentVersion\Run';             Approved = 'Run';   Location = 'Registry Run';   Scope = 'User' }
+        @{ Hive = 'HKLM'; Key = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Run';             Approved = 'Run';   Location = 'Registry Run';   Scope = 'All users' }
+        @{ Hive = 'HKLM'; Key = 'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Approved = 'Run32'; Location = 'Registry Run32'; Scope = 'All users' }
+    )
+    foreach ($s in $sources) {
+        if ($MachineOnly -and $s.Hive -eq 'HKCU') { continue }
+        $path = "$($s.Hive):\$($s.Key)"
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $k = Get-Item -LiteralPath $path
+        $approved = "$($s.Hive):\$base\$($s.Approved)"
+        foreach ($name in $k.GetValueNames()) {
+            if (-not $name) { continue }
+            [pscustomobject]@{ Name = $name; Command = [string]$k.GetValue($name); Location = $s.Location; Scope = $s.Scope
+                Enabled = (& $enabled $approved $name); CanToggle = ($s.Hive -eq 'HKCU' -or $admin); ApprovedKey = $approved; ValueName = $name; FilePath = $null }
+        }
+    }
+    $folders = @(
+        @{ Path = [Environment]::GetFolderPath('Startup');       Hive = 'HKCU'; Scope = 'User' }
+        @{ Path = [Environment]::GetFolderPath('CommonStartup'); Hive = 'HKLM'; Scope = 'All users' }
+    )
+    foreach ($f in $folders) {
+        if ($MachineOnly -and $f.Hive -eq 'HKCU') { continue }
+        if (-not $f.Path -or -not (Test-Path -LiteralPath $f.Path)) { continue }
+        $approved = "$($f.Hive):\$base\StartupFolder"
+        foreach ($file in (Get-ChildItem -LiteralPath $f.Path -File -Force -ErrorAction SilentlyContinue)) {
+            if ($file.Name -eq 'desktop.ini') { continue }
+            $cmd = $file.FullName
+            if ($file.Extension -eq '.lnk') {
+                try { $sh = New-Object -ComObject WScript.Shell; $t = $sh.CreateShortcut($file.FullName); if ($t.TargetPath) { $cmd = ('"{0}" {1}' -f $t.TargetPath, $t.Arguments).Trim() } } catch { }
+            }
+            [pscustomobject]@{ Name = $file.BaseName; Command = $cmd; Location = 'Startup folder'; Scope = $f.Scope
+                Enabled = (& $enabled $approved $file.Name); CanToggle = ($f.Hive -eq 'HKCU' -or $admin); ApprovedKey = $approved; ValueName = $file.Name; FilePath = $file.FullName }
+        }
+    }
+}
+
+function Set-WStartupState($Item, [bool]$Enable) {
+    if (-not (Test-Path -LiteralPath $Item.ApprovedKey)) { New-Item -Path $Item.ApprovedKey -Force -ErrorAction Stop | Out-Null }
+    $bytes = New-Object byte[] 12
+    if ($Enable) { $bytes[0] = 2 }
+    else { $bytes[0] = 3; [Array]::Copy([BitConverter]::GetBytes((Get-Date).ToFileTime()), 0, $bytes, 4, 8) }
+    New-ItemProperty -LiteralPath $Item.ApprovedKey -Name $Item.ValueName -PropertyType Binary -Value $bytes -Force -ErrorAction Stop | Out-Null
+    Write-WLog ("Startup item '{0}' {1}" -f $Item.Name, $(if ($Enable) { 'enabled' } else { 'disabled' }))
+}
+
 # ---------------------------------------------------------------- Right-click menu (context menu) entries
 # Shell extension handlers (shellex\ContextMenuHandlers) and static verbs (shell\<verb>) for files,
 # folders, the desktop / folder background and drives. Handlers are turned off through the system's
 # Shell Extensions\Blocked list; verbs with a LegacyDisable value. Both are undone by removing the value.
-function Get-WContextMenu {
+function Get-WContextMenu([bool]$MachineOnly = $false) {
     $blocked = @{}
     foreach ($bk in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Blocked', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Blocked') {
         try { (Get-Item -LiteralPath $bk -ErrorAction Stop).GetValueNames() | ForEach-Object { if ($_) { $blocked[$_.ToUpperInvariant()] = $true } } } catch { }
@@ -3470,7 +3605,7 @@ function Get-WContextMenu {
     $seen = @{}
     $companies = @{}
     $companyOf = { param($f) if (-not $companies.ContainsKey($f)) { $companies[$f] = try { [string][Diagnostics.FileVersionInfo]::GetVersionInfo($f).CompanyName } catch { '' } }; $companies[$f] }
-    foreach ($hive in 'HKLM', 'HKCU') {
+    foreach ($hive in @('HKLM') + @(if (-not $MachineOnly) { 'HKCU' })) {
         foreach ($cls in $where.Keys) {
             $base = "$($hive):\SOFTWARE\Classes\$cls"
             # Shell extension handlers.
@@ -3897,12 +4032,12 @@ $chromium = { param($base) @( (T "$base\User Data\*\Cache\Cache_Data"), (T "$bas
 $script:CleanerRules = @(
     New-AWRule 'UserTemp'   'Windows' 'User temp files'         'Files in your %TEMP% folder older than 24 hours.' -Targets (T '%TEMP%' -MinAgeHours 24)
     New-AWRule 'WinTemp'    'Windows' 'Windows temp files'      'Files in C:\Windows\Temp older than 24 hours.' -Targets (T '%SystemRoot%\Temp' -MinAgeHours 24) -Admin $true
-    New-AWRule 'Recycle'    'Windows' 'Recycle Bin'             'Empties the Recycle Bin on all fixed drives.' -Kind 'RecycleBin'
+    New-AWRule 'Recycle'    'Windows' 'Recycle Bin (empty permanently)' 'PERMANENTLY empties the Recycle Bin on all fixed drives. Emptied items can no longer be restored from Recovery > Recycle Bin. Off by default.' -Kind 'RecycleBin' -Default $false
     New-AWRule 'Thumbs'     'Windows' 'Thumbnail cache'         'Explorer thumbnail databases (rebuilt automatically; files in use are skipped).' -Targets (T '%LOCALAPPDATA%\Microsoft\Windows\Explorer' 'thumbcache_*.db' $false)
     New-AWRule 'WerUser'    'Windows' 'Error reports (user)'    'Windows Error Reporting archives for your account.' -Targets (T '%LOCALAPPDATA%\Microsoft\Windows\WER')
     New-AWRule 'WerSys'     'Windows' 'Error reports (system)'  'System-wide Windows Error Reporting queue and archives.' -Targets (T '%ProgramData%\Microsoft\Windows\WER') -Admin $true
     New-AWRule 'CrashDumps' 'Windows' 'App crash dumps'         'Application crash dumps in %LOCALAPPDATA%\CrashDumps.' -Targets (T '%LOCALAPPDATA%\CrashDumps')
-    New-AWRule 'MemDumps'   'Windows' 'System memory dumps'     'Minidumps and MEMORY.DMP from blue screens.' -Targets @((T '%SystemRoot%\Minidump'), (T '%SystemRoot%' 'MEMORY.DMP' $false)) -Admin $true
+    New-AWRule 'MemDumps'   'Windows' 'System memory dumps'     'Minidumps and MEMORY.DMP from blue screens. The Crashes tab needs these to explain past crashes - off by default, clean only once you no longer need them.' -Targets @((T '%SystemRoot%\Minidump'), (T '%SystemRoot%' 'MEMORY.DMP' $false)) -Admin $true -Default $false
     New-AWRule 'WinUpdate'  'Windows' 'Windows Update cache'    'Downloaded update packages already installed. Briefly stops the Windows Update service.' -Targets (T '%SystemRoot%\SoftwareDistribution\Download') -Admin $true -Service 'wuauserv'
     New-AWRule 'DeliveryOp' 'Windows' 'Delivery Optimization'   'Peer-to-peer update cache. Briefly stops the Delivery Optimization service.' -Targets (T '%SystemRoot%\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache') -Admin $true -Default $false -Service 'DoSvc'
     New-AWRule 'Prefetch'   'Windows' 'Prefetch data'           'Launch-optimization data. The next few app launches may be slightly slower.' -Targets (T '%SystemRoot%\Prefetch' '*.pf' $false) -Admin $true -Default $false
@@ -4544,41 +4679,42 @@ if ($script:CliMode) {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="AWiper" Width="1320" Height="840" MinWidth="1080" MinHeight="680"
-        WindowStartupLocation="CenterScreen" Background="#121628"
-        FontFamily="Segoe UI" FontSize="13" Foreground="#E9ECF8"
+        WindowStartupLocation="CenterScreen" Background="#0B0D12"
+        FontFamily="Segoe UI" FontSize="13" Foreground="#E6E9F0"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
   <WindowChrome.WindowChrome>
     <WindowChrome CaptionHeight="56" ResizeBorderThickness="6" GlassFrameThickness="0" CornerRadius="0" UseAeroCaptionButtons="False"/>
   </WindowChrome.WindowChrome>
 
   <Window.Resources>
-    <SolidColorBrush x:Key="TextBrush"   Color="#E9ECF8"/>
-    <SolidColorBrush x:Key="MutedBrush"  Color="#8C95BD"/>
-    <SolidColorBrush x:Key="DimBrush"    Color="#5F6890"/>
-    <SolidColorBrush x:Key="TealBrush"   Color="#19C3B1"/>
-    <SolidColorBrush x:Key="PurpleBrush" Color="#8B5CF6"/>
-    <SolidColorBrush x:Key="LineBrush"   Color="#36406A"/>
-    <SolidColorBrush x:Key="FieldBrush"  Color="#1A2039"/>
-    <SolidColorBrush x:Key="HoverBrush"  Color="#2C3556"/>
-    <SolidColorBrush x:Key="SelBrush"    Color="#37436F"/>
-    <SolidColorBrush x:Key="TrackBrush"  Color="#3A4468"/>
-    <SolidColorBrush x:Key="DangerBrush" Color="#F2617A"/>
-    <SolidColorBrush x:Key="AmberBrush"  Color="#F5B94B"/>
+    <SolidColorBrush x:Key="TextBrush"   Color="#E6E9F0"/>
+    <SolidColorBrush x:Key="MutedBrush"  Color="#8C93A5"/>
+    <SolidColorBrush x:Key="DimBrush"    Color="#5C6375"/>
+    <SolidColorBrush x:Key="TealBrush"   Color="#60A5FA"/>
+    <SolidColorBrush x:Key="PurpleBrush" Color="#38BDF8"/>
+    <SolidColorBrush x:Key="LineBrush"   Color="#252A35"/>
+    <SolidColorBrush x:Key="FieldBrush"  Color="#1A1E27"/>
+    <SolidColorBrush x:Key="HoverBrush"  Color="#242A36"/>
+    <SolidColorBrush x:Key="SelBrush"    Color="#1B2D50"/>
+    <SolidColorBrush x:Key="TrackBrush"  Color="#262C38"/>
+    <SolidColorBrush x:Key="DangerBrush" Color="#F87171"/>
+    <SolidColorBrush x:Key="AmberBrush"  Color="#FBBF24"/>
+    <SolidColorBrush x:Key="SuccessBrush" Color="#34D399"/>
 
     <LinearGradientBrush x:Key="TealGrad" StartPoint="0,0" EndPoint="1,0">
-      <GradientStop Color="#12A7C9" Offset="0"/><GradientStop Color="#1ED2AE" Offset="1"/>
+      <GradientStop Color="#2563EB" Offset="0"/><GradientStop Color="#3B82F6" Offset="1"/>
     </LinearGradientBrush>
     <LinearGradientBrush x:Key="PurpleGrad" StartPoint="0,0" EndPoint="1,0">
-      <GradientStop Color="#6C4BEF" Offset="0"/><GradientStop Color="#9D6BFF" Offset="1"/>
+      <GradientStop Color="#0369A1" Offset="0"/><GradientStop Color="#0284C7" Offset="1"/>
     </LinearGradientBrush>
     <LinearGradientBrush x:Key="BrandGrad" StartPoint="0,0" EndPoint="1,0">
-      <GradientStop Color="#1ED2AE" Offset="0"/><GradientStop Color="#9D6BFF" Offset="1"/>
+      <GradientStop Color="#93C5FD" Offset="0"/><GradientStop Color="#38BDF8" Offset="1"/>
     </LinearGradientBrush>
     <LinearGradientBrush x:Key="CardGrad" StartPoint="0,0" EndPoint="0,1">
-      <GradientStop Color="#262D4D" Offset="0"/><GradientStop Color="#1E2442" Offset="1"/>
+      <GradientStop Color="#151922" Offset="0"/><GradientStop Color="#13161D" Offset="1"/>
     </LinearGradientBrush>
     <LinearGradientBrush x:Key="WindowGrad" StartPoint="0,0" EndPoint="1,1">
-      <GradientStop Color="#1C2139" Offset="0"/><GradientStop Color="#111527" Offset="1"/>
+      <GradientStop Color="#0B0D12" Offset="0"/><GradientStop Color="#0B0D12" Offset="1"/>
     </LinearGradientBrush>
 
     <FontFamily x:Key="IconFont">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
@@ -4618,8 +4754,8 @@ if ($script:CliMode) {
     <!-- Buttons -->
     <Style x:Key="BtnBase" TargetType="Button">
       <Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
-      <Setter Property="Background" Value="#262E4D"/>
-      <Setter Property="BorderBrush" Value="#4A5680"/>
+      <Setter Property="Background" Value="#1A1E27"/>
+      <Setter Property="BorderBrush" Value="#353C4B"/>
       <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="Padding" Value="16,8"/>
       <Setter Property="FontWeight" Value="SemiBold"/>
@@ -4632,7 +4768,7 @@ if ($script:CliMode) {
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#19C3B1"/></Trigger>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#3B82F6"/></Trigger>
               <Trigger Property="IsPressed" Value="True"><Setter TargetName="Bd" Property="Opacity" Value="0.8"/></Trigger>
               <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.4"/></Trigger>
             </ControlTemplate.Triggers>
@@ -4645,16 +4781,16 @@ if ($script:CliMode) {
       <Setter Property="Background" Value="{StaticResource TealGrad}"/>
       <Setter Property="BorderBrush" Value="Transparent"/>
       <Setter Property="Foreground" Value="White"/>
-      <Setter Property="Effect"><Setter.Value><DropShadowEffect Color="#19C3B1" BlurRadius="16" ShadowDepth="0" Opacity="0.35"/></Setter.Value></Setter>
+      <Setter Property="Effect"><Setter.Value><DropShadowEffect Color="#3B82F6" BlurRadius="14" ShadowDepth="0" Opacity="0.25"/></Setter.Value></Setter>
     </Style>
     <Style x:Key="BtnPurple" TargetType="Button" BasedOn="{StaticResource BtnBase}">
       <Setter Property="Background" Value="{StaticResource PurpleGrad}"/>
       <Setter Property="BorderBrush" Value="Transparent"/>
       <Setter Property="Foreground" Value="White"/>
-      <Setter Property="Effect"><Setter.Value><DropShadowEffect Color="#8B5CF6" BlurRadius="16" ShadowDepth="0" Opacity="0.35"/></Setter.Value></Setter>
+      <Setter Property="Effect"><Setter.Value><DropShadowEffect Color="#38BDF8" BlurRadius="14" ShadowDepth="0" Opacity="0.2"/></Setter.Value></Setter>
     </Style>
     <Style x:Key="BtnOutline" TargetType="Button" BasedOn="{StaticResource BtnBase}">
-      <Setter Property="BorderBrush" Value="#8B5CF6"/>
+      <Setter Property="BorderBrush" Value="#3B82F6"/>
     </Style>
     <Style x:Key="BtnChip" TargetType="Button" BasedOn="{StaticResource BtnBase}">
       <Setter Property="Padding" Value="12,5"/><Setter Property="Margin" Value="0,0,6,0"/><Setter Property="FontSize" Value="12"/>
@@ -4680,7 +4816,7 @@ if ($script:CliMode) {
       </Setter>
       <Style.Triggers>
         <Trigger Property="IsMouseOver" Value="True">
-          <Setter Property="Background" Value="#2C3556"/><Setter Property="Foreground" Value="White"/>
+          <Setter Property="Background" Value="#242A36"/><Setter Property="Foreground" Value="White"/>
         </Trigger>
       </Style.Triggers>
     </Style>
@@ -4711,7 +4847,7 @@ if ($script:CliMode) {
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#262E4D"/><Setter Property="Foreground" Value="White"/>
+                <Setter TargetName="Bd" Property="Background" Value="#1A1E27"/><Setter Property="Foreground" Value="White"/>
               </Trigger>
               <Trigger Property="IsChecked" Value="True">
                 <Setter TargetName="Bd" Property="Background" Value="{StaticResource TealGrad}"/>
@@ -4732,7 +4868,7 @@ if ($script:CliMode) {
           <ControlTemplate TargetType="CheckBox">
             <Grid Background="Transparent">
               <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-              <Border x:Name="Box" Width="18" Height="18" CornerRadius="5" BorderThickness="2" BorderBrush="#7A5AF8" Background="Transparent" VerticalAlignment="Center">
+              <Border x:Name="Box" Width="18" Height="18" CornerRadius="5" BorderThickness="2" BorderBrush="#353C4B" Background="Transparent" VerticalAlignment="Center">
                 <Path x:Name="Mark" Data="M 2.5,7 L 6,10.5 L 11.5,3.5" Stroke="White" StrokeThickness="2" Visibility="Collapsed"
                       StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
               </Border>
@@ -4740,11 +4876,11 @@ if ($script:CliMode) {
             </Grid>
             <ControlTemplate.Triggers>
               <Trigger Property="IsChecked" Value="True">
-                <Setter TargetName="Box" Property="Background" Value="{StaticResource PurpleGrad}"/>
-                <Setter TargetName="Box" Property="BorderBrush" Value="#9D6BFF"/>
+                <Setter TargetName="Box" Property="Background" Value="{StaticResource TealGrad}"/>
+                <Setter TargetName="Box" Property="BorderBrush" Value="#3B82F6"/>
                 <Setter TargetName="Mark" Property="Visibility" Value="Visible"/>
               </Trigger>
-              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Box" Property="BorderBrush" Value="#19C3B1"/></Trigger>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Box" Property="BorderBrush" Value="#3B82F6"/></Trigger>
               <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.4"/></Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -4759,10 +4895,10 @@ if ($script:CliMode) {
         <Setter.Value>
           <ControlTemplate TargetType="CheckBox">
             <Grid Width="58" Height="24">
-              <Border x:Name="Track" CornerRadius="12" Background="{StaticResource PurpleGrad}"/>
+              <Border x:Name="Track" CornerRadius="12" Background="#353C4B"/>
               <TextBlock x:Name="Lbl" Text="OFF" FontSize="9.5" FontWeight="Bold" Foreground="White"
                          VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,8,0"/>
-              <Border x:Name="Knob" Width="20" Height="20" CornerRadius="10" Background="#ECEFFA" HorizontalAlignment="Left" Margin="2,0,0,0"/>
+              <Border x:Name="Knob" Width="20" Height="20" CornerRadius="10" Background="#E6E9F0" HorizontalAlignment="Left" Margin="2,0,0,0"/>
             </Grid>
             <ControlTemplate.Triggers>
               <Trigger Property="IsChecked" Value="True">
@@ -4819,7 +4955,7 @@ if ($script:CliMode) {
       <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="Padding" Value="10,7"/>
       <Setter Property="CaretBrush" Value="White"/>
-      <Setter Property="SelectionBrush" Value="#8B5CF6"/>
+      <Setter Property="SelectionBrush" Value="#3B82F6"/>
       <Setter Property="VerticalContentAlignment" Value="Center"/>
       <Setter Property="Template">
         <Setter.Value>
@@ -4834,7 +4970,7 @@ if ($script:CliMode) {
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="Text" Value=""><Setter TargetName="Ph" Property="Visibility" Value="Visible"/></Trigger>
-              <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#19C3B1"/></Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#3B82F6"/></Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
@@ -4848,7 +4984,7 @@ if ($script:CliMode) {
       <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="Padding" Value="10,7"/>
       <Setter Property="CaretBrush" Value="White"/>
-      <Setter Property="SelectionBrush" Value="#8B5CF6"/>
+      <Setter Property="SelectionBrush" Value="#3B82F6"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="PasswordBox">
@@ -4857,7 +4993,7 @@ if ($script:CliMode) {
               <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#19C3B1"/></Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#3B82F6"/></Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
@@ -4875,7 +5011,7 @@ if ($script:CliMode) {
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="Background" Value="#2C3556"/></Trigger>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="Background" Value="#242A36"/></Trigger>
               <Trigger Property="IsChecked" Value="True">
                 <Setter TargetName="Bd" Property="Background" Value="{StaticResource TealGrad}"/>
                 <Setter Property="Foreground" Value="White"/><Setter Property="FontWeight" Value="SemiBold"/>
@@ -4912,7 +5048,7 @@ if ($script:CliMode) {
               <Track.Thumb>
                 <Thumb>
                   <Thumb.Template>
-                    <ControlTemplate TargetType="Thumb"><Border Background="#46507A" CornerRadius="4" Margin="2"/></ControlTemplate>
+                    <ControlTemplate TargetType="Thumb"><Border Background="#353C4B" CornerRadius="4" Margin="2"/></ControlTemplate>
                   </Thumb.Template>
                 </Thumb>
               </Track.Thumb>
@@ -4931,7 +5067,7 @@ if ($script:CliMode) {
                   <Track.Thumb>
                     <Thumb>
                       <Thumb.Template>
-                        <ControlTemplate TargetType="Thumb"><Border Background="#46507A" CornerRadius="4" Margin="2"/></ControlTemplate>
+                        <ControlTemplate TargetType="Thumb"><Border Background="#353C4B" CornerRadius="4" Margin="2"/></ControlTemplate>
                       </Thumb.Template>
                     </Thumb>
                   </Track.Thumb>
@@ -4962,8 +5098,8 @@ if ($script:CliMode) {
               <GridViewRowPresenter VerticalAlignment="Center" Columns="{TemplateBinding GridView.ColumnCollection}" Content="{TemplateBinding Content}"/>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="Background" Value="#2A3253"/></Trigger>
-              <Trigger Property="IsSelected" Value="True"><Setter TargetName="Bd" Property="Background" Value="#37436F"/></Trigger>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="Background" Value="#1A1E27"/></Trigger>
+              <Trigger Property="IsSelected" Value="True"><Setter TargetName="Bd" Property="Background" Value="#1B2D50"/></Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
@@ -4979,7 +5115,7 @@ if ($script:CliMode) {
         <Setter.Value>
           <ControlTemplate TargetType="GridViewColumnHeader">
             <Grid>
-              <Border x:Name="Bd" Background="Transparent" BorderBrush="#36406A" BorderThickness="0,0,0,1" Padding="7,8">
+              <Border x:Name="Bd" Background="Transparent" BorderBrush="#252A35" BorderThickness="0,0,0,1" Padding="7,8">
                 <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"/>
               </Border>
               <Thumb x:Name="PART_HeaderGripper" HorizontalAlignment="Right" Width="6" Cursor="SizeWE">
@@ -5009,8 +5145,8 @@ if ($script:CliMode) {
               <ContentPresenter/>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="Background" Value="#2A3253"/></Trigger>
-              <Trigger Property="IsSelected" Value="True"><Setter TargetName="Bd" Property="Background" Value="#37436F"/></Trigger>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="Background" Value="#1A1E27"/></Trigger>
+              <Trigger Property="IsSelected" Value="True"><Setter TargetName="Bd" Property="Background" Value="#1B2D50"/></Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
@@ -5022,7 +5158,7 @@ if ($script:CliMode) {
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ToolTip">
-            <Border Background="#262E4D" BorderBrush="#46507A" BorderThickness="1" CornerRadius="6" Padding="9,6" MaxWidth="420">
+            <Border Background="#1A1E27" BorderBrush="#353C4B" BorderThickness="1" CornerRadius="6" Padding="9,6" MaxWidth="420">
               <ContentPresenter>
                 <ContentPresenter.Resources>
                   <Style TargetType="TextBlock"><Setter Property="TextWrapping" Value="Wrap"/></Style>
@@ -5038,7 +5174,7 @@ if ($script:CliMode) {
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ContextMenu">
-            <Border Background="#232A45" BorderBrush="#46507A" BorderThickness="1" CornerRadius="8" Padding="4">
+            <Border Background="#13161D" BorderBrush="#353C4B" BorderThickness="1" CornerRadius="8" Padding="4">
               <StackPanel IsItemsHost="True"/>
             </Border>
           </ControlTemplate>
@@ -5046,7 +5182,7 @@ if ($script:CliMode) {
       </Setter>
     </Style>
     <Style TargetType="ComboBox">
-      <Setter Property="Foreground" Value="#E9ECF8"/>
+      <Setter Property="Foreground" Value="#E6E9F0"/>
       <Setter Property="FontSize" Value="12"/>
       <Setter Property="Height" Value="32"/>
       <Setter Property="Cursor" Value="Hand"/>
@@ -5057,18 +5193,18 @@ if ($script:CliMode) {
               <ToggleButton Focusable="False" ClickMode="Press" IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
                 <ToggleButton.Template>
                   <ControlTemplate TargetType="ToggleButton">
-                    <Border x:Name="Bd" Background="#1B2139" BorderBrush="#3A4470" BorderThickness="1" CornerRadius="8">
-                      <TextBlock Text="&#x25BE;" Foreground="#8C95BD" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                    <Border x:Name="Bd" Background="#1A1E27" BorderBrush="#353C4B" BorderThickness="1" CornerRadius="8">
+                      <TextBlock Text="&#x25BE;" Foreground="#8C93A5" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0"/>
                     </Border>
                     <ControlTemplate.Triggers>
-                      <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#6A5BEF"/></Trigger>
+                      <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="BorderBrush" Value="#3B82F6"/></Trigger>
                     </ControlTemplate.Triggers>
                   </ControlTemplate>
                 </ToggleButton.Template>
               </ToggleButton>
-              <ContentPresenter IsHitTestVisible="False" Content="{TemplateBinding SelectionBoxItem}" Margin="12,0,26,0" VerticalAlignment="Center" HorizontalAlignment="Left" TextElement.Foreground="#E9ECF8"/>
+              <ContentPresenter IsHitTestVisible="False" Content="{TemplateBinding SelectionBoxItem}" Margin="12,0,26,0" VerticalAlignment="Center" HorizontalAlignment="Left" TextElement.Foreground="#E6E9F0"/>
               <Popup IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True" Focusable="False" PopupAnimation="Fade">
-                <Border Background="#232A45" BorderBrush="#46507A" BorderThickness="1" CornerRadius="8" Padding="4" Margin="0,4,0,0" MinWidth="{TemplateBinding ActualWidth}">
+                <Border Background="#13161D" BorderBrush="#353C4B" BorderThickness="1" CornerRadius="8" Padding="4" Margin="0,4,0,0" MinWidth="{TemplateBinding ActualWidth}">
                   <ScrollViewer MaxHeight="320" VerticalScrollBarVisibility="Auto"><StackPanel IsItemsHost="True"/></ScrollViewer>
                 </Border>
               </Popup>
@@ -5078,7 +5214,7 @@ if ($script:CliMode) {
       </Setter>
     </Style>
     <Style TargetType="ComboBoxItem">
-      <Setter Property="Foreground" Value="#E9ECF8"/>
+      <Setter Property="Foreground" Value="#E6E9F0"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template">
         <Setter.Value>
@@ -5087,24 +5223,24 @@ if ($script:CliMode) {
               <ContentPresenter/>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="Bd" Property="Background" Value="#37436F"/></Trigger>
-              <Trigger Property="IsSelected" Value="True"><Setter Property="Foreground" Value="#19C3B1"/></Trigger>
+              <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="Bd" Property="Background" Value="#1B2D50"/></Trigger>
+              <Trigger Property="IsSelected" Value="True"><Setter Property="Foreground" Value="#60A5FA"/></Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
       </Setter>
     </Style>
     <Style x:Key="CtxItem" TargetType="MenuItem">
-      <Setter Property="Foreground" Value="#E9ECF8"/>
+      <Setter Property="Foreground" Value="#E6E9F0"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="MenuItem">
             <Border x:Name="Bd" Background="Transparent" CornerRadius="6" Padding="12,7" MinWidth="170">
-              <ContentPresenter ContentSource="Header" TextElement.Foreground="#E9ECF8"/>
+              <ContentPresenter ContentSource="Header" TextElement.Foreground="#E6E9F0"/>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="Bd" Property="Background" Value="#37436F"/></Trigger>
+              <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="Bd" Property="Background" Value="#1B2D50"/></Trigger>
               <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.4"/></Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -5154,7 +5290,7 @@ if ($script:CliMode) {
               <TextBlock x:Name="NetText" Text="Checking..." Margin="7,0,0,0"/>
             </StackPanel>
           </Button>
-          <Border x:Name="AdminBadge" CornerRadius="13" Padding="11,5" BorderThickness="1" BorderBrush="#2E8F86" Background="#163A44">
+          <Border x:Name="AdminBadge" CornerRadius="13" Padding="11,5" BorderThickness="1" BorderBrush="#2563EB" Background="#1B2D50">
             <StackPanel Orientation="Horizontal">
               <TextBlock x:Name="AdminIcon" Text="&#xEA18;" Style="{StaticResource Icon}" FontSize="12" Foreground="{StaticResource TealBrush}"/>
               <TextBlock x:Name="AdminText" Text="Administrator" FontSize="12" FontWeight="SemiBold" Margin="7,0,0,0" Foreground="{StaticResource TealBrush}"/>
@@ -5243,7 +5379,7 @@ if ($script:CliMode) {
                   </StackPanel>
                   <StackPanel>
                     <TextBlock Text="LAST CLEAN" Style="{StaticResource Caps}" Margin="0"/>
-                    <TextBlock x:Name="HomeLast" Text="Never" FontSize="28" FontWeight="Bold" Foreground="#B79BFF"/>
+                    <TextBlock x:Name="HomeLast" Text="Never" FontSize="28" FontWeight="Bold" Foreground="#38BDF8"/>
                     <TextBlock x:Name="HomeLastSub" Text="" Foreground="{StaticResource MutedBrush}" FontSize="12"/>
                   </StackPanel>
                 </StackPanel>
@@ -5335,10 +5471,10 @@ if ($script:CliMode) {
                       <GridView>
                         <GridViewColumn Header="Severity" Width="90">
                           <GridViewColumn.CellTemplate><DataTemplate>
-                            <TextBlock x:Name="S" Text="{Binding Severity}" FontWeight="SemiBold" Foreground="#8C95BD"/>
+                            <TextBlock x:Name="S" Text="{Binding Severity}" FontWeight="SemiBold" Foreground="#8C93A5"/>
                             <DataTemplate.Triggers>
-                              <DataTrigger Binding="{Binding Severity}" Value="Problem"><Setter TargetName="S" Property="Foreground" Value="#F2617A"/></DataTrigger>
-                              <DataTrigger Binding="{Binding Severity}" Value="Warning"><Setter TargetName="S" Property="Foreground" Value="#F5B94B"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Severity}" Value="Problem"><Setter TargetName="S" Property="Foreground" Value="#F87171"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Severity}" Value="Warning"><Setter TargetName="S" Property="Foreground" Value="#FBBF24"/></DataTrigger>
                             </DataTemplate.Triggers>
                           </DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
@@ -5350,7 +5486,7 @@ if ($script:CliMode) {
                         </GridViewColumn>
                         <GridViewColumn Header="Last seen" Width="130" DisplayMemberBinding="{Binding LastText}"/>
                         <GridViewColumn Header="Details" Width="520">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Source}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Why}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Source}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Why}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                       </GridView>
                     </ListView.View>
@@ -5385,7 +5521,7 @@ if ($script:CliMode) {
                           </GridViewColumn>
                           <GridViewColumn Header="Times" Width="64" DisplayMemberBinding="{Binding Times}"/>
                           <GridViewColumn Header="Average delay" Width="120">
-                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding DelayText}" Foreground="#F5B94B" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding DelayText}" Foreground="#FBBF24" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
                           </GridViewColumn>
                           <GridViewColumn Header="Last seen" Width="140" DisplayMemberBinding="{Binding LastText}"/>
                         </GridView>
@@ -5418,11 +5554,11 @@ if ($script:CliMode) {
                         </GridViewColumn>
                         <GridViewColumn Header="Status" Width="90">
                           <GridViewColumn.CellTemplate><DataTemplate>
-                            <TextBlock x:Name="S" Text="{Binding StatusText}" FontWeight="SemiBold" Foreground="#8C95BD"/>
+                            <TextBlock x:Name="S" Text="{Binding StatusText}" FontWeight="SemiBold" Foreground="#8C93A5"/>
                             <DataTemplate.Triggers>
-                              <DataTrigger Binding="{Binding Status}" Value="Good"><Setter TargetName="S" Property="Foreground" Value="#19C3B1"/></DataTrigger>
-                              <DataTrigger Binding="{Binding Status}" Value="Warning"><Setter TargetName="S" Property="Foreground" Value="#F5B94B"/></DataTrigger>
-                              <DataTrigger Binding="{Binding Status}" Value="Problem"><Setter TargetName="S" Property="Foreground" Value="#F2617A"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Status}" Value="Good"><Setter TargetName="S" Property="Foreground" Value="#34D399"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Status}" Value="Warning"><Setter TargetName="S" Property="Foreground" Value="#FBBF24"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Status}" Value="Problem"><Setter TargetName="S" Property="Foreground" Value="#F87171"/></DataTrigger>
                             </DataTemplate.Triggers>
                           </DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
@@ -5430,10 +5566,10 @@ if ($script:CliMode) {
                           <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="Details" Width="560">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Detail}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Detail}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Detail}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Detail}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="" Width="70">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding PolicyText}" Foreground="#F5B94B" FontSize="11"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding PolicyText}" Foreground="#FBBF24" FontSize="11"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                       </GridView>
                     </ListView.View>
@@ -5463,13 +5599,13 @@ if ($script:CliMode) {
                           <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Parameters}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="What it usually means" Width="420">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Meaning}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Meaning}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Meaning}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Meaning}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="Suggested" Width="150">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding FixText}" Foreground="#19C3B1"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding FixText}" Foreground="#60A5FA"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="Source" Width="240">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Source}" Foreground="#5F6890" TextTrimming="CharacterEllipsis" ToolTip="{Binding Source}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Source}" Foreground="#5C6375" TextTrimming="CharacterEllipsis" ToolTip="{Binding Source}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                       </GridView>
                     </ListView.View>
@@ -5559,7 +5695,7 @@ if ($script:CliMode) {
                           </GridViewColumn>
                           <GridViewColumn Header="Last used" Width="150" DisplayMemberBinding="{Binding LastText}"/>
                           <GridViewColumn Header="" Width="90">
-                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding NowText}" Foreground="#F2617A" FontWeight="Bold"/></DataTemplate></GridViewColumn.CellTemplate>
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding NowText}" Foreground="#F87171" FontWeight="Bold"/></DataTemplate></GridViewColumn.CellTemplate>
                           </GridViewColumn>
                         </GridView>
                       </ListView.View>
@@ -5583,7 +5719,7 @@ if ($script:CliMode) {
                             <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Item}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Item}"/></DataTemplate></GridViewColumn.CellTemplate>
                           </GridViewColumn>
                           <GridViewColumn Header="Details" Width="560">
-                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Detail}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Detail}"/></DataTemplate></GridViewColumn.CellTemplate>
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Detail}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Detail}"/></DataTemplate></GridViewColumn.CellTemplate>
                           </GridViewColumn>
                         </GridView>
                       </ListView.View>
@@ -5654,10 +5790,10 @@ if ($script:CliMode) {
                           <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Files}" TextAlignment="Right"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="Size" Width="100">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Size}" TextAlignment="Right" Foreground="#19C3B1" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Size}" TextAlignment="Right" Foreground="#60A5FA" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="Details" Width="380">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                       </GridView>
                     </ListView.View>
@@ -5671,6 +5807,17 @@ if ($script:CliMode) {
           <Grid x:Name="ViewMap" Visibility="Collapsed">
             <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
             <Border Style="{StaticResource Card}" Padding="12">
+              <StackPanel>
+              <Border x:Name="MapScope" Visibility="Collapsed" Background="#1B2D50" BorderBrush="#3B82F6" BorderThickness="1" CornerRadius="8" Padding="12,6" Margin="0,0,0,10">
+                <Grid>
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                  <TextBlock x:Name="MapScopeText" Text="" VerticalAlignment="Center" TextWrapping="Wrap" FontWeight="SemiBold"/>
+                  <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="12,0,0,0">
+                    <RadioButton x:Name="MapOnRemote" Style="{StaticResource SegBtn}" GroupName="MapOn" IsChecked="True" Content="Remote PC"/>
+                    <RadioButton x:Name="MapOnLocal"  Style="{StaticResource SegBtn}" GroupName="MapOn" Content="This PC"/>
+                  </StackPanel>
+                </Grid>
+              </Border>
               <Grid>
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="Auto"/>
@@ -5688,6 +5835,7 @@ if ($script:CliMode) {
                   <Button x:Name="MapStop" Content="Stop" IsEnabled="False"/>
                 </StackPanel>
               </Grid>
+              </StackPanel>
             </Border>
             <Grid Grid.Row="1" Margin="0,16,0,16">
               <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="310"/></Grid.ColumnDefinitions>
@@ -5698,11 +5846,11 @@ if ($script:CliMode) {
                     <TextBlock x:Name="MapCrumb" Text="No scan yet" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Margin="0,0,140,0"/>
                     <TextBlock x:Name="MapCurSize" Text="" HorizontalAlignment="Right" Foreground="{StaticResource TealBrush}" FontWeight="Bold"/>
                   </Grid>
-                  <Border Grid.Row="1" CornerRadius="10" Background="#151A2F" ClipToBounds="True">
+                  <Border Grid.Row="1" CornerRadius="10" Background="#0F1218" ClipToBounds="True">
                     <Grid>
                       <Canvas x:Name="MapCanvas" Background="Transparent" ClipToBounds="True"/>
                       <StackPanel x:Name="MapHint" HorizontalAlignment="Center" VerticalAlignment="Center">
-                        <TextBlock Text="&#xEB05;" Style="{StaticResource Icon}" FontSize="46" Foreground="#3A4468" HorizontalAlignment="Center"/>
+                        <TextBlock Text="&#xEB05;" Style="{StaticResource Icon}" FontSize="46" Foreground="#2C3341" HorizontalAlignment="Center"/>
                         <TextBlock Text="Pick a drive or folder and press Scan" Foreground="{StaticResource MutedBrush}" Margin="0,12,0,0" HorizontalAlignment="Center"/>
                         <TextBlock Text="Double-click a folder to zoom in, right-click for actions" Foreground="{StaticResource DimBrush}" FontSize="12" Margin="0,4,0,0" HorizontalAlignment="Center"/>
                       </StackPanel>
@@ -5713,7 +5861,7 @@ if ($script:CliMode) {
                     <TextBlock Text="Folders" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,16,0"/>
                     <Border Width="12" Height="12" CornerRadius="3" Background="{StaticResource TealGrad}"/>
                     <TextBlock Text="Files (1 MB+)" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,16,0"/>
-                    <Border Width="12" Height="12" CornerRadius="3" Background="#3A4468"/>
+                    <Border Width="12" Height="12" CornerRadius="3" Background="#2C3341"/>
                     <TextBlock Text="Small files, grouped" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,0,0"/>
                   </StackPanel>
                 </Grid>
@@ -5730,7 +5878,7 @@ if ($script:CliMode) {
                       <WrapPanel Margin="0,12,0,0">
                         <Button x:Name="MapOpen" Content="Open" Style="{StaticResource BtnChip}" IsEnabled="False"/>
                         <Button x:Name="MapZoom" Content="Zoom in" Style="{StaticResource BtnChip}" IsEnabled="False"/>
-                        <Button x:Name="MapRecycle" Content="Recycle" Style="{StaticResource BtnChip}" IsEnabled="False" BorderBrush="#F2617A"/>
+                        <Button x:Name="MapRecycle" Content="Recycle" Style="{StaticResource BtnChip}" IsEnabled="False" BorderBrush="#F87171"/>
                       </WrapPanel>
                     </StackPanel>
                   </Border>
@@ -5744,7 +5892,7 @@ if ($script:CliMode) {
                               <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                               <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                               <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis"/>
-                              <TextBlock Grid.Column="1" Text="{Binding SizeText}" Foreground="#8C95BD" Margin="8,0,0,0"/>
+                              <TextBlock Grid.Column="1" Text="{Binding SizeText}" Foreground="#8C93A5" Margin="8,0,0,0"/>
                               <ProgressBar Grid.Row="1" Grid.ColumnSpan="2" Height="4" Margin="0,5,0,2" Maximum="100" Value="{Binding PercentOfParent, Mode=OneWay}"/>
                             </Grid>
                           </DataTemplate>
@@ -5762,7 +5910,7 @@ if ($script:CliMode) {
                               <Grid.ColumnDefinitions><ColumnDefinition Width="86"/><ColumnDefinition Width="*"/><ColumnDefinition Width="72"/></Grid.ColumnDefinitions>
                               <TextBlock Text="{Binding Extension}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
                               <ProgressBar Grid.Column="1" Height="6" Maximum="100" Value="{Binding RelPercent, Mode=OneWay}" Foreground="{StaticResource TealGrad}" Margin="4,0,8,0"/>
-                              <TextBlock Grid.Column="2" Text="{Binding SizeText}" Foreground="#8C95BD" TextAlignment="Right"/>
+                              <TextBlock Grid.Column="2" Text="{Binding SizeText}" Foreground="#8C93A5" TextAlignment="Right"/>
                             </Grid>
                           </DataTemplate>
                         </ItemsControl.ItemTemplate>
@@ -5779,7 +5927,7 @@ if ($script:CliMode) {
                               <Grid.ColumnDefinitions><ColumnDefinition Width="62"/><ColumnDefinition Width="*"/><ColumnDefinition Width="72"/></Grid.ColumnDefinitions>
                               <TextBlock Text="{Binding Extension}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
                               <ProgressBar Grid.Column="1" Height="6" Maximum="100" Value="{Binding RelPercent, Mode=OneWay}" Foreground="{StaticResource PurpleGrad}" Margin="4,0,8,0"/>
-                              <TextBlock Grid.Column="2" Text="{Binding SizeText}" Foreground="#8C95BD" TextAlignment="Right"/>
+                              <TextBlock Grid.Column="2" Text="{Binding SizeText}" Foreground="#8C93A5" TextAlignment="Right"/>
                             </Grid>
                           </DataTemplate>
                         </ItemsControl.ItemTemplate>
@@ -5861,15 +6009,15 @@ if ($script:CliMode) {
                       <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
                     <GridViewColumn Header="Size" Width="100">
-                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#19C3B1" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
+                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#60A5FA" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
                     <GridViewColumn Header="Type" Width="70" DisplayMemberBinding="{Binding Extension}"/>
                     <GridViewColumn Header="Modified" Width="130" DisplayMemberBinding="{Binding ModifiedText}"/>
                     <GridViewColumn x:Name="LargeStatusCol" Header="Group" Width="0">
-                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Status}" Foreground="#B58CFF" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
+                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Status}" Foreground="#7DD3FC" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
                     <GridViewColumn Header="Folder" Width="460">
-                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
+                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
                   </GridView>
                 </ListView.View>
@@ -5951,14 +6099,14 @@ if ($script:CliMode) {
                         </GridViewColumn>
                         <GridViewColumn Header="Type" Width="64" DisplayMemberBinding="{Binding Kind}"/>
                         <GridViewColumn Header="Size" Width="90">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#19C3B1" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#60A5FA" FontWeight="SemiBold"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="Deleted" Width="130" DisplayMemberBinding="{Binding DeletedText}"/>
                         <GridViewColumn Header="Deleted by" Width="150">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Owner}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Owner}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="Original location" Width="420">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Folder}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Folder}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                       </GridView>
                     </ListView.View>
@@ -5987,10 +6135,10 @@ if ($script:CliMode) {
                         <DataTemplate>
                           <StackPanel Margin="2,3">
                             <StackPanel Orientation="Horizontal">
-                              <TextBlock Text="{Binding Drive}" FontWeight="Bold" Foreground="#19C3B1" Width="30"/>
+                              <TextBlock Text="{Binding Drive}" FontWeight="Bold" Foreground="#60A5FA" Width="30"/>
                               <TextBlock Text="{Binding CreatedText}" FontWeight="SemiBold"/>
                             </StackPanel>
-                            <TextBlock Text="{Binding Age}" Foreground="#8C95BD" FontSize="11.5" Margin="30,2,0,0"/>
+                            <TextBlock Text="{Binding Age}" Foreground="#8C93A5" FontSize="11.5" Margin="30,2,0,0"/>
                           </StackPanel>
                         </DataTemplate>
                       </ListBox.ItemTemplate>
@@ -6024,11 +6172,11 @@ if ($script:CliMode) {
                           </GridViewColumn>
                           <GridViewColumn Header="Status" Width="80" DisplayMemberBinding="{Binding Status}"/>
                           <GridViewColumn Header="Size" Width="90">
-                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#19C3B1"/></DataTemplate></GridViewColumn.CellTemplate>
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#60A5FA"/></DataTemplate></GridViewColumn.CellTemplate>
                           </GridViewColumn>
                           <GridViewColumn Header="Modified" Width="130" DisplayMemberBinding="{Binding ModifiedText}"/>
                           <GridViewColumn Header="Folder" Width="380">
-                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Folder}"/></DataTemplate></GridViewColumn.CellTemplate>
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Folder}"/></DataTemplate></GridViewColumn.CellTemplate>
                           </GridViewColumn>
                         </GridView>
                       </ListView.View>
@@ -6078,13 +6226,13 @@ if ($script:CliMode) {
                         </GridViewColumn>
                         <GridViewColumn Header="Chance" Width="100">
                           <GridViewColumn.CellTemplate><DataTemplate>
-                            <TextBlock x:Name="Ch" Text="{Binding Chance}" FontWeight="SemiBold" Foreground="#F5B94B"/>
+                            <TextBlock x:Name="Ch" Text="{Binding Chance}" FontWeight="SemiBold" Foreground="#FBBF24"/>
                             <DataTemplate.Triggers>
-                              <DataTrigger Binding="{Binding Chance}" Value="Excellent"><Setter TargetName="Ch" Property="Foreground" Value="#19C3B1"/></DataTrigger>
-                              <DataTrigger Binding="{Binding Chance}" Value="Good"><Setter TargetName="Ch" Property="Foreground" Value="#19C3B1"/></DataTrigger>
-                              <DataTrigger Binding="{Binding Chance}" Value="Overwritten"><Setter TargetName="Ch" Property="Foreground" Value="#F2617A"/></DataTrigger>
-                              <DataTrigger Binding="{Binding Chance}" Value="Empty"><Setter TargetName="Ch" Property="Foreground" Value="#5F6890"/></DataTrigger>
-                              <DataTrigger Binding="{Binding Chance}" Value="Not supported"><Setter TargetName="Ch" Property="Foreground" Value="#5F6890"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Chance}" Value="Excellent"><Setter TargetName="Ch" Property="Foreground" Value="#34D399"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Chance}" Value="Good"><Setter TargetName="Ch" Property="Foreground" Value="#34D399"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Chance}" Value="Overwritten"><Setter TargetName="Ch" Property="Foreground" Value="#F87171"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Chance}" Value="Empty"><Setter TargetName="Ch" Property="Foreground" Value="#5C6375"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Chance}" Value="Not supported"><Setter TargetName="Ch" Property="Foreground" Value="#5C6375"/></DataTrigger>
                             </DataTemplate.Triggers>
                           </DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
@@ -6093,10 +6241,10 @@ if ($script:CliMode) {
                         </GridViewColumn>
                         <GridViewColumn Header="Modified" Width="130" DisplayMemberBinding="{Binding ModifiedText}"/>
                         <GridViewColumn Header="Original folder" Width="330">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Folder}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Folder}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Folder}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="Notes" Width="220">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                       </GridView>
                     </ListView.View>
@@ -6129,7 +6277,7 @@ if ($script:CliMode) {
                             <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Description}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Description}"/></DataTemplate></GridViewColumn.CellTemplate>
                           </GridViewColumn>
                           <GridViewColumn Header="Type" Width="150">
-                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding TypeText}" Foreground="#8C95BD"/></DataTemplate></GridViewColumn.CellTemplate>
+                            <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding TypeText}" Foreground="#8C93A5"/></DataTemplate></GridViewColumn.CellTemplate>
                           </GridViewColumn>
                           <GridViewColumn Header="#" Width="60" DisplayMemberBinding="{Binding Sequence}"/>
                         </GridView>
@@ -6227,7 +6375,7 @@ if ($script:CliMode) {
                 <Border Style="{StaticResource Card}" Padding="18,14">
                   <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel Margin="0,0,8,0">
-                      <Border x:Name="WinfrBox" CornerRadius="8" Padding="12,9" Background="#163A44" BorderBrush="#2E8F86" BorderThickness="1">
+                      <Border x:Name="WinfrBox" CornerRadius="8" Padding="12,9" Background="#0F2E25" BorderBrush="#1F7A5C" BorderThickness="1">
                         <Grid>
                           <TextBlock x:Name="WinfrStatus" Text="Checking for Windows File Recovery..." TextWrapping="Wrap" FontSize="12.5" VerticalAlignment="Center" Margin="0,0,200,0"/>
                           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
@@ -6341,7 +6489,7 @@ if ($script:CliMode) {
                     <GridViewColumn Header="Type" Width="90" DisplayMemberBinding="{Binding Kind}"/>
                     <GridViewColumn Header="Company" Width="170" DisplayMemberBinding="{Binding Company}"/>
                     <GridViewColumn Header="Runs" Width="420">
-                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Command}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Command}"/></DataTemplate></GridViewColumn.CellTemplate>
+                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Command}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Command}"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
                   </GridView>
                 </ListView.View>
@@ -6360,7 +6508,7 @@ if ($script:CliMode) {
                     <GridViewColumn Header="Scope" Width="90" DisplayMemberBinding="{Binding Scope}"/>
                     <GridViewColumn Header="Source" Width="140" DisplayMemberBinding="{Binding Location}"/>
                     <GridViewColumn Header="Command" Width="520">
-                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Command}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Command}"/></DataTemplate></GridViewColumn.CellTemplate>
+                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Command}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Command}"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
                   </GridView>
                 </ListView.View>
@@ -6397,12 +6545,12 @@ if ($script:CliMode) {
                       <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
                     <GridViewColumn Header="Publisher" Width="220">
-                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Publisher}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
+                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Publisher}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
                     <GridViewColumn Header="Version" Width="130" DisplayMemberBinding="{Binding Version}"/>
                     <GridViewColumn Header="Installed" Width="100" DisplayMemberBinding="{Binding Installed}"/>
                     <GridViewColumn Header="Size" Width="90">
-                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#19C3B1"/></DataTemplate></GridViewColumn.CellTemplate>
+                      <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#60A5FA"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
                     <GridViewColumn Header="Scope" Width="90" DisplayMemberBinding="{Binding Scope}"/>
                   </GridView>
@@ -6469,10 +6617,10 @@ if ($script:CliMode) {
                       </GridViewColumn>
                       <GridViewColumn Header="Status" Width="130">
                         <GridViewColumn.CellTemplate><DataTemplate>
-                          <TextBlock x:Name="St" Text="{Binding Status}" FontWeight="SemiBold" Foreground="#8C95BD"/>
+                          <TextBlock x:Name="St" Text="{Binding Status}" FontWeight="SemiBold" Foreground="#8C93A5"/>
                           <DataTemplate.Triggers>
-                            <DataTrigger Binding="{Binding Status}" Value="Update available"><Setter TargetName="St" Property="Foreground" Value="#19C3B1"/></DataTrigger>
-                            <DataTrigger Binding="{Binding Status}" Value="Problem"><Setter TargetName="St" Property="Foreground" Value="#F2617A"/></DataTrigger>
+                            <DataTrigger Binding="{Binding Status}" Value="Update available"><Setter TargetName="St" Property="Foreground" Value="#60A5FA"/></DataTrigger>
+                            <DataTrigger Binding="{Binding Status}" Value="Problem"><Setter TargetName="St" Property="Foreground" Value="#F87171"/></DataTrigger>
                           </DataTemplate.Triggers>
                         </DataTemplate></GridViewColumn.CellTemplate>
                       </GridViewColumn>
@@ -6480,7 +6628,7 @@ if ($script:CliMode) {
                       <GridViewColumn Header="Version" Width="130" DisplayMemberBinding="{Binding Version}"/>
                       <GridViewColumn Header="Date" Width="90" DisplayMemberBinding="{Binding DateText}"/>
                       <GridViewColumn Header="Update / notes" Width="260">
-                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding UpdateText}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding UpdateText}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
                       </GridViewColumn>
                       <GridViewColumn Header="Class" Width="110" DisplayMemberBinding="{Binding Class}"/>
                     </GridView>
@@ -6521,7 +6669,7 @@ if ($script:CliMode) {
                       <GridViewColumn Header="Severity" Width="100" DisplayMemberBinding="{Binding Kind}"/>
                       <GridViewColumn Header="Size" Width="90" DisplayMemberBinding="{Binding SizeText}"/>
                       <GridViewColumn Header="In Resources" Width="160">
-                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Status}" Foreground="#19C3B1"/></DataTemplate></GridViewColumn.CellTemplate>
+                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Status}" Foreground="#60A5FA"/></DataTemplate></GridViewColumn.CellTemplate>
                       </GridViewColumn>
                     </GridView>
                   </ListView.View>
@@ -6581,7 +6729,7 @@ if ($script:CliMode) {
                   <ListView.View>
                     <GridView>
                       <GridViewColumn Header="Section" Width="150">
-                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Section}" Foreground="#8C95BD"/></DataTemplate></GridViewColumn.CellTemplate>
+                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Section}" Foreground="#8C93A5"/></DataTemplate></GridViewColumn.CellTemplate>
                       </GridViewColumn>
                       <GridViewColumn Header="Setting" Width="240">
                         <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}"/></DataTemplate></GridViewColumn.CellTemplate>
@@ -6590,13 +6738,13 @@ if ($script:CliMode) {
                         <GridViewColumn.CellTemplate><DataTemplate>
                           <TextBlock x:Name="V" Text="{Binding Value}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Value}"/>
                           <DataTemplate.Triggers>
-                            <DataTrigger Binding="{Binding Flag}" Value="Good"><Setter TargetName="V" Property="Foreground" Value="#19C3B1"/></DataTrigger>
-                            <DataTrigger Binding="{Binding Flag}" Value="Warn"><Setter TargetName="V" Property="Foreground" Value="#F5B94B"/></DataTrigger>
+                            <DataTrigger Binding="{Binding Flag}" Value="Good"><Setter TargetName="V" Property="Foreground" Value="#34D399"/></DataTrigger>
+                            <DataTrigger Binding="{Binding Flag}" Value="Warn"><Setter TargetName="V" Property="Foreground" Value="#FBBF24"/></DataTrigger>
                           </DataTemplate.Triggers>
                         </DataTemplate></GridViewColumn.CellTemplate>
                       </GridViewColumn>
                       <GridViewColumn Header="Notes" Width="420">
-                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
+                        <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
                       </GridViewColumn>
                     </GridView>
                   </ListView.View>
@@ -6650,11 +6798,11 @@ if ($script:CliMode) {
                         </GridViewColumn>
                         <GridViewColumn Header="Last used" Width="140" DisplayMemberBinding="{Binding WhenText}"/>
                         <GridViewColumn Header="Size" Width="90">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#19C3B1"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#60A5FA"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="Status" Width="150" DisplayMemberBinding="{Binding Status}"/>
                         <GridViewColumn Header="Folder" Width="320">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Path}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Path}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                       </GridView>
                     </ListView.View>
@@ -6690,7 +6838,7 @@ if ($script:CliMode) {
                         </GridViewColumn>
                         <GridViewColumn Header="Status" Width="170" DisplayMemberBinding="{Binding Status}"/>
                         <GridViewColumn Header="Details" Width="440">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Detail}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Detail}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Detail}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Detail}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                       </GridView>
                     </ListView.View>
@@ -6810,10 +6958,10 @@ if ($script:CliMode) {
                       <GridView>
                         <GridViewColumn Header="Result" Width="100">
                           <GridViewColumn.CellTemplate><DataTemplate>
-                            <TextBlock x:Name="R" Text="{Binding Result}" FontWeight="SemiBold" Foreground="#8C95BD"/>
+                            <TextBlock x:Name="R" Text="{Binding Result}" FontWeight="SemiBold" Foreground="#8C93A5"/>
                             <DataTemplate.Triggers>
-                              <DataTrigger Binding="{Binding Result}" Value="Passed"><Setter TargetName="R" Property="Foreground" Value="#19C3B1"/></DataTrigger>
-                              <DataTrigger Binding="{Binding Result}" Value="Failed"><Setter TargetName="R" Property="Foreground" Value="#F2617A"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Result}" Value="Passed"><Setter TargetName="R" Property="Foreground" Value="#34D399"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Result}" Value="Failed"><Setter TargetName="R" Property="Foreground" Value="#F87171"/></DataTrigger>
                             </DataTemplate.Triggers>
                           </DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
@@ -6920,7 +7068,7 @@ if ($script:CliMode) {
                         </GridViewColumn>
                         <GridViewColumn Header="Category" Width="100" DisplayMemberBinding="{Binding Category}"/>
                         <GridViewColumn Header="Notes" Width="260">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                       </GridView>
                     </ListView.View>
@@ -6993,10 +7141,10 @@ if ($script:CliMode) {
                         </GridViewColumn>
                         <GridViewColumn Header="Category" Width="100" DisplayMemberBinding="{Binding Category}"/>
                         <GridViewColumn Header="Comes back from" Width="140">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Source}" Foreground="#19C3B1"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Source}" Foreground="#60A5FA"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                         <GridViewColumn Header="Notes" Width="240">
-                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C95BD" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
+                          <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Note}" Foreground="#8C93A5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Note}"/></DataTemplate></GridViewColumn.CellTemplate>
                         </GridViewColumn>
                       </GridView>
                     </ListView.View>
@@ -7017,7 +7165,7 @@ if ($script:CliMode) {
                       <DataTemplate>
                         <StackPanel Margin="2,2">
                           <TextBlock Text="{Binding Label}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-                          <TextBlock Text="{Binding Sub}" Foreground="#8C95BD" FontSize="11.5"/>
+                          <TextBlock Text="{Binding Sub}" Foreground="#8C93A5" FontSize="11.5"/>
                         </StackPanel>
                       </DataTemplate>
                     </ListBox.ItemTemplate>
@@ -7056,7 +7204,7 @@ if ($script:CliMode) {
                     <Button x:Name="LogOpen" Content="Open log folder" Style="{StaticResource BtnChip}" Margin="0"/>
                   </StackPanel>
                 </Grid>
-                <TextBox x:Name="LogBox" IsReadOnly="True" FontFamily="Cascadia Mono, Consolas" FontSize="12" Background="#141930"
+                <TextBox x:Name="LogBox" IsReadOnly="True" FontFamily="Cascadia Mono, Consolas" FontSize="12" Background="#0F1218"
                          VerticalContentAlignment="Top" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" TextWrapping="NoWrap"/>
               </DockPanel>
             </Border>
@@ -7072,7 +7220,7 @@ if ($script:CliMode) {
       </Grid>
 
       <!-- ================= Connect dialog (overlay) ================= -->
-      <Grid x:Name="ConnectOverlay" Grid.RowSpan="3" Visibility="Collapsed" Background="#B30B0E1C">
+      <Grid x:Name="ConnectOverlay" Grid.RowSpan="3" Visibility="Collapsed" Background="#B30B0D12">
         <Border Style="{StaticResource Card}" Width="500" VerticalAlignment="Center" HorizontalAlignment="Center" Padding="26,22">
           <Border.Effect><DropShadowEffect Color="Black" BlurRadius="40" ShadowDepth="0" Opacity="0.6"/></Border.Effect>
           <StackPanel>
@@ -7122,9 +7270,9 @@ if ($script:CliMode) {
               <TextBlock x:Name="ConnSavedNote" Text="" Foreground="{StaticResource TealBrush}" FontSize="11.5" Margin="0,6,0,0" Visibility="Collapsed"/>
             </StackPanel>
 
-            <Border x:Name="ConnMsgBox" CornerRadius="8" Padding="12,9" Margin="0,16,0,0" Background="#3A2F1E" BorderBrush="#8C6A2E" BorderThickness="1" Visibility="Collapsed">
+            <Border x:Name="ConnMsgBox" CornerRadius="8" Padding="12,9" Margin="0,16,0,0" Background="#33280E" BorderBrush="#7A5E14" BorderThickness="1" Visibility="Collapsed">
               <StackPanel>
-                <TextBlock x:Name="ConnMsg" Text="" TextWrapping="Wrap" FontSize="12" Foreground="#F5D9A8"/>
+                <TextBlock x:Name="ConnMsg" Text="" TextWrapping="Wrap" FontSize="12" Foreground="#FDE68A"/>
                 <Button x:Name="ConnTrust" Style="{StaticResource LinkBtn}" Content="Add this computer to TrustedHosts" Margin="0,8,0,0" HorizontalAlignment="Left" Visibility="Collapsed"/>
               </StackPanel>
             </Border>
@@ -7162,7 +7310,7 @@ $script:BrushConv = New-Object System.Windows.Media.BrushConverter
 function New-Brush([string]$Hex) { $b = $script:BrushConv.ConvertFromString($Hex); $b.Freeze(); $b }
 $script:Res = @{
     Teal = $window.FindResource('TealBrush'); Purple = $window.FindResource('PurpleBrush')
-    Muted = $window.FindResource('MutedBrush'); Dim = $window.FindResource('DimBrush')
+    Muted = $window.FindResource('MutedBrush'); Dim = $window.FindResource('DimBrush'); Success = $window.FindResource('SuccessBrush')
     Danger = $window.FindResource('DangerBrush'); Amber = $window.FindResource('AmberBrush')
     TealGrad = $window.FindResource('TealGrad'); PurpleGrad = $window.FindResource('PurpleGrad')
     Track = $window.FindResource('TrackBrush')
@@ -7250,7 +7398,7 @@ $script:Timer.Add_Tick({
             }
         }
 
-        if ($Sync.Scanning -and $script:Scanner) {
+        if ($Sync.Scanning -and $script:Scanner -and $Sync.ScanVia -notin 'WinRM', 'Connecting') {
             $s = $script:Scanner
             $msg = 'Scanning {0:N0} files in {1:N0} folders - {2} - {3}' -f $s.FilesScanned, $s.FoldersScanned, (Format-AWSize $s.BytesScanned), $s.CurrentPath
             Set-AWStatus $msg
@@ -7326,12 +7474,18 @@ foreach ($v in $script:ViewTitles.Keys) {
 function Select-AWView([string]$Name) { $ui["Nav$Name"].IsChecked = $true }
 
 # Views that always work on this PC, even when a remote computer is targeted.
-$script:LocalOnlyViews = @('Home', 'Map', 'Large', 'Startup')
+$script:LocalOnlyViews = @('Home')
 function Get-AWCurrentView { foreach ($k in $script:ViewTitles.Keys) { if ($ui["Nav$k"].IsChecked) { return $k } } }
 function Update-AWViewTitle([string]$Name) {
     $title = $script:ViewTitles[$Name]
     if (Test-AWRemote) {
-        $title += if ($script:LocalOnlyViews -contains $Name) { '   -   this PC only' } else { "   -   $($script:Target.ComputerName)" }
+        $local = "   -   this PC ($env:COMPUTERNAME)"
+        $title += switch ($Name) {
+            { $script:LocalOnlyViews -contains $_ } { $local; break }
+            'Map'   { if ($ui.MapOnRemote.IsChecked) { "   -   $($script:Target.ComputerName)" } else { $local }; break }
+            'Large' { if ($script:LargeTab -eq 'Largest' -and $script:ScanRemote) { "   -   $($script:ScanRemote.ComputerName)" } else { $local }; break }
+            default { "   -   $($script:Target.ComputerName)" }
+        }
     }
     $ui.ViewTitle.Text = $title
 }
@@ -7349,8 +7503,8 @@ $ui.VersionText.Text = "v$script:AppVersion"
 if ($script:IsAdmin) {
     $ui.AdminText.Text = 'Administrator'
 } else {
-    $ui.AdminBadge.Background  = New-Brush '#3A2F1E'
-    $ui.AdminBadge.BorderBrush = New-Brush '#8C6A2E'
+    $ui.AdminBadge.Background  = New-Brush '#33280E'
+    $ui.AdminBadge.BorderBrush = New-Brush '#7A5E14'
     $ui.AdminText.Foreground   = $script:Res.Amber
     $ui.AdminIcon.Foreground   = $script:Res.Amber
     $ui.AdminText.Text = 'Standard user'
@@ -7375,11 +7529,11 @@ function New-AWPill([string]$Text, [bool]$Ok = $true, [string]$Tone = '') {
     $pill = New-Object System.Windows.Controls.Border
     $pill.Style = $window.FindResource('Pill')
     if ($Tone -eq 'Teal') {
-        $pill.BorderBrush = New-Brush '#2E8F86'; $fg = $script:Res.Teal
+        $pill.BorderBrush = New-Brush '#2563EB'; $fg = $script:Res.Teal
     } elseif ($Ok) {
-        $pill.BorderBrush = New-Brush '#4A5680'; $fg = $script:Res.Muted
+        $pill.BorderBrush = New-Brush '#353C4B'; $fg = $script:Res.Muted
     } else {
-        $pill.BorderBrush = New-Brush '#8C6A2E'; $fg = $script:Res.Amber
+        $pill.BorderBrush = New-Brush '#7A5E14'; $fg = $script:Res.Amber
     }
     $pill.Child = New-AWText $Text 9 $fg 'Bold'
     $pill
@@ -7650,7 +7804,11 @@ function Start-AWClean {
     if ($rules.Count -eq 0) { Show-AWMessage 'Select at least one cleaning rule first.'; return }
     $names = ($rules | ForEach-Object { "  - $($_.Name)" }) -join "`n"
     $where = if (Test-AWRemote) { " on $($script:Target.ComputerName)" } else { '' }
-    if (-not (Confirm-AW "AWiper will permanently delete the files matched by these rules$($where):`n`n$names`n`nFiles that are in use are skipped. Continue?")) { return }
+    $warn = @()
+    if (@($rules | Where-Object { $_.Kind -eq 'RecycleBin' }).Count) { $warn += 'WARNING: the Recycle Bin will be emptied PERMANENTLY. Its items can no longer be restored (not even from Recovery > Recycle Bin).' }
+    if (@($rules | Where-Object { $_.Id -eq 'MemDumps' }).Count) { $warn += 'WARNING: system memory dumps will be deleted. The Crashes tab can no longer analyze those past blue screens.' }
+    $warnText = if ($warn.Count) { "`n`n" + ($warn -join "`n`n") } else { '' }
+    if (-not (Confirm-AW "AWiper will permanently delete the files matched by these rules$($where) (nothing goes to the Recycle Bin):`n`n$names$warnText`n`nFiles that are in use are skipped. Continue?")) { return }
     Set-AWCleanerBusy $true
     $ui.CleanSummary.Text = 'Cleaning...'
     $ui.CleanSubtext.Text = 'Removing files. Locked files are skipped automatically.'
@@ -7692,11 +7850,11 @@ $script:MapMaxDepth = 2
 $script:ScanExpected = 0
 $script:BrushCache = @{}
 $script:MapPalette = @{
-    Dir   = @('#4B33B5', '#6447DD', '#7E62F3', '#9A84F8')
-    File  = @('#0C86A0', '#109EB2', '#16B6B1', '#3FCDBE')
-    Group = @('#2A3254', '#343D62', '#3F4970', '#4A557E')
+    Dir   = @('#075985', '#0369A1', '#0284C7', '#0EA5E9')
+    File  = @('#1E40AF', '#2563EB', '#3B82F6', '#60A5FA')
+    Group = @('#242A36', '#2C3341', '#353C4B', '#3F4757')
 }
-$script:MapEdge = New-Brush '#111527'
+$script:MapEdge = New-Brush '#0B0D12'
 $script:MapSelEdge = New-Brush '#FFFFFF'
 
 function Get-AWMapBrush($Node, [int]$Depth) {
@@ -7784,7 +7942,7 @@ function Add-AWTreeMapLevel($Node, [double]$X, [double]$Y, [double]$W, [double]$
             [void]$sp.Children.Add($t1)
             if ($canNest) { $t1.Text = '{0}   {1}' -f $n.Name, $n.SizeText }
             elseif ($r.H -gt 36) {
-                $t2 = New-AWText $n.SizeText 10.5; $t2.Foreground = New-Brush '#D8DCF0'; $t2.Opacity = 0.85
+                $t2 = New-AWText $n.SizeText 10.5; $t2.Foreground = New-Brush '#DCE0EA'; $t2.Opacity = 0.85
                 [void]$sp.Children.Add($t2)
             }
             $b.Child = $sp
@@ -7854,13 +8012,56 @@ function Get-AWKindStats($ExtensionList) {
     }
 }
 
+# ---- Scanning a remote PC: through its admin share (\\PC\C$) when reachable, otherwise by running the
+# scanner on that PC over WinRM and rebuilding a trimmed tree here. $script:ScanRemote describes the
+# PC the current scan came from ($null = this PC); paths are kept in that PC's own form (C:\...).
+$script:SelfPath = $PSCommandPath
+$script:ScanRemote = $null
+$script:RemoteDrives = @()
+function Test-AWMapRemote { (Test-AWRemote) -and $ui.MapOnRemote.IsChecked }
+function Get-AWCsSource {
+    if (-not $script:CsSource) { $script:CsSource = [regex]::Match([IO.File]::ReadAllText($script:SelfPath), "Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@", 'Singleline').Groups[1].Value }
+    $script:CsSource
+}
+function ConvertTo-AWShareUnc([string]$HostName, [string]$Path) {
+    if ($Path -match '^([A-Za-z]):\\?(.*)$') { "\\$HostName\$($Matches[1].ToUpper())`$" + $(if ($Matches[2]) { '\' + $Matches[2] } else { '\' }) } else { $Path }
+}
+function ConvertFrom-AWShareUnc([string]$Path) {
+    if ($Path -match '^\\\\[^\\]+\\([A-Za-z])\$(\\.*)?$') { "$($Matches[1].ToUpper()):" + $(if ($Matches[2]) { $Matches[2] } else { '\' }) } else { $Path }
+}
+# Protected locations on another PC (its own environment isn't known here, so the standard layout is used).
+function Test-AWProtectedRemotePath([string]$Path) {
+    $p = (ConvertFrom-AWShareUnc $Path).TrimEnd('\')
+    if ($p -match '^[A-Za-z]:$') { return $true }
+    $rest = $p.Substring(2)
+    if ($rest -match '^\\(Windows|Program Files|Program Files \(x86\)|ProgramData|Users|Recovery|System Volume Information|\$Recycle\.Bin|Boot|EFI)(\\.*)?$' -and
+        ($Matches[1] -eq 'Windows' -or -not $Matches[2] -or ($Matches[1] -eq 'Users' -and $Matches[2] -match '^\\[^\\]+$'))) { return $true }
+    $false
+}
+
+function Update-AWMapScope {
+    $remote = Test-AWRemote
+    $ui.MapScope.Visibility = if ($remote) { 'Visible' } else { 'Collapsed' }
+    if ($remote) {
+        $ui.MapOnRemote.Content = $script:Target.ComputerName
+        $ui.MapScopeText.Text = if ($ui.MapOnRemote.IsChecked) { "Scanning $($script:Target.ComputerName). Drives are read through its \\$($script:Target.ComputerName)\C`$ share, or on that PC over WinRM if the share isn't reachable. Removing files there is permanent (no Recycle Bin over the network)." }
+                                else { "Scanning THIS PC ($env:COMPUTERNAME), not $($script:Target.ComputerName)." }
+    }
+    $ui.MapBrowse.IsEnabled = -not (Test-AWMapRemote)
+    $ui.MapBrowse.ToolTip = if (Test-AWMapRemote) { 'Type a folder on the remote PC, e.g. C:\Users' } else { 'Browse for a folder' }
+    Initialize-AWMapDrives
+    Update-AWViewTitle (Get-AWCurrentView)
+}
+
 function Start-AWMapScan([string]$Path) {
     if ($Sync.Scanning) { return }
     if (-not $Path) { $Path = $ui.MapPath.Text }
     $Path = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
     if ($Path -match '^[A-Za-z]:$') { $Path += '\' }
+    if (Test-AWMapRemote) { Start-AWRemoteMapScan (ConvertFrom-AWShareUnc $Path); return }
     if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Container)) { Show-AWMessage "Folder not found:`n$Path" 'Warning'; return }
     $ui.MapPath.Text = $Path
+    $script:ScanRemote = $null
 
     $script:ScanExpected = 0
     $ui.MapKindList.ItemsSource = $null
@@ -7880,23 +8081,109 @@ function Start-AWMapScan([string]$Path) {
 
     Start-AWTask -Name "Scan $Path" -Arguments @{ Scanner = $script:Scanner; ScanPath = $Path } -Work {
         [void]$Scanner.Scan($ScanPath)
+    } -OnComplete { param($Result) Complete-AWMapScan }
+}
+
+function Complete-AWMapScan {
+    $Sync.Scanning = $false; $Sync.ScanVia = $null
+    $s = $script:Scanner
+    $ui.MapScan.IsEnabled = $true; $ui.MapStop.IsEnabled = $false; $ui.LargeScan.IsEnabled = $true
+    if (-not $s -or -not $s.Root) { $ui.MapCrumb.Text = 'Scan failed - see the Activity log'; return }
+    $script:MapRoot = $s.Root
+    Set-AWMapCurrent $s.Root
+    $ui.MapExtList.ItemsSource = @($s.ExtensionList | Select-Object -First 12)
+    $ui.MapKindList.ItemsSource = @(Get-AWKindStats $s.ExtensionList)
+    Update-AWLargeList
+    $state = if ($s.Completed) { 'Scan complete' } else { 'Scan stopped (partial results)' }
+    $where = if ($script:ScanRemote) { " on $($script:ScanRemote.ComputerName) (via $($script:ScanRemote.Via))" } else { '' }
+    $script:IdleStatus = '{0}{5}: {1:N0} files, {2} in {3:0.0}s - {4:N0} folders unreadable' -f $state, $s.FilesScanned, (Format-AWSize $s.BytesScanned), $s.ElapsedSeconds, $s.Errors, $where
+    Write-AWLog $script:IdleStatus
+    if ($s.Errors -gt 0 -and -not $script:IsAdmin -and -not $script:ScanRemote) { $script:IdleStatus += ' (run as admin to read protected folders)' }
+}
+
+function Start-AWRemoteMapScan([string]$Path) {
+    if ($Path -notmatch '^[A-Za-z]:\\') { Show-AWMessage "Type a folder on $($script:Target.ComputerName) like C:\ or D:\Data." 'Warning'; return }
+    $ui.MapPath.Text = $Path
+    $t = $script:Target
+    $drive = $Path.Substring(0, 1).ToUpper()
+    $script:ScanExpected = 0
+    if ($Path.Length -le 3) { $d = $script:RemoteDrives | Where-Object { $_.Letter -eq $drive } | Select-Object -First 1; if ($d) { $script:ScanExpected = $d.Used } }
+    $ui.MapKindList.ItemsSource = $null
+    $script:Scanner = New-Object AWiper.DiskScanner
+    $script:ScanRemote = [pscustomobject]@{ Host = $t.Host; ComputerName = $t.ComputerName; Via = 'share' }
+    $Sync.Scanning = $true; $Sync.ScanVia = 'Connecting'
+    $ui.MapScan.IsEnabled = $false; $ui.MapStop.IsEnabled = $true; $ui.LargeScan.IsEnabled = $false
+    $ui.MapCanvas.Children.Clear(); $ui.MapHint.Visibility = 'Collapsed'
+    $ui.MapCrumb.Text = "Scanning $Path on $($t.ComputerName)..."; $ui.MapCurSize.Text = ''
+    Select-AWMapNode $null $null
+    Start-AWTask -Name "Scan $Path on $($t.ComputerName)" -Arguments @{ Scanner = $script:Scanner; LocalPath = $Path; Drive = $drive; CsSrc = (Get-AWCsSource) } -Work {
+        $share = "\\$($Target.Host)\$Drive`$"
+        $unc = $share + $LocalPath.Substring(2)
+        $Sync.Status = "Connecting to $share..."
+        $ok = $false
+        try {
+            if ($Target.Credential) {
+                $c = $Target.Credential.GetNetworkCredential()
+                $u = if ($c.Domain) { "$($c.Domain)\$($c.UserName)" } else { $c.UserName }
+                $rc = [AWiper.Native]::ConnectShare($share, $u, $c.Password)
+                if ($rc -and $rc -ne 1219) { Write-WLog "Could not connect to $share (error $rc) - scanning over WinRM instead" 'WARN' }
+            }
+            $ok = [IO.Directory]::Exists($unc)
+        } catch { }
+        if ($ok) { $Sync.ScanVia = 'Share'; [void]$Scanner.Scan($unc); return [pscustomobject]@{ Via = 'share' } }
+        if (-not $Target.Credential) { Write-WLog "$share isn't reachable (File and Printer Sharing may be blocked) - scanning on $($Target.ComputerName) over WinRM instead" 'WARN' }
+        $Sync.ScanVia = 'WinRM'; $Sync.Status = "Scanning $LocalPath on $($Target.ComputerName) over WinRM (no live progress; large drives take a few minutes)..."
+        $text = Invoke-WTarget {
+            param($Src, $P)
+            if (-not ('AWiper.DiskScanner' -as [type])) { Add-Type -TypeDefinition $Src }
+            $s = New-Object AWiper.DiskScanner
+            [void]$s.Scan($P)
+            $s.Export([Math]::Max(1MB, [long]($s.Root.Size / 40000)))
+        } -ArgumentList $CsSrc, $LocalPath
+        [pscustomobject]@{ Via = 'WinRM'; Text = (@($text) | Where-Object { $_ -is [string] -and $_.StartsWith('H') } | Select-Object -First 1) }
     } -OnComplete {
         param($Result)
-        $Sync.Scanning = $false
-        $s = $script:Scanner
-        $ui.MapScan.IsEnabled = $true; $ui.MapStop.IsEnabled = $false; $ui.LargeScan.IsEnabled = $true
-        $script:MapRoot = $s.Root
-        Set-AWMapCurrent $s.Root
-        $ui.MapExtList.ItemsSource = @($s.ExtensionList | Select-Object -First 12)
-        $ui.MapKindList.ItemsSource = @(Get-AWKindStats $s.ExtensionList)
-        Update-AWLargeList
-        $state = if ($s.Completed) { 'Scan complete' } else { 'Scan stopped (partial results)' }
-        $script:IdleStatus = '{0}: {1:N0} files, {2} in {3:0.0}s - {4:N0} folders unreadable' -f $state, $s.FilesScanned, (Format-AWSize $s.BytesScanned), $s.ElapsedSeconds, $s.Errors
-        Write-AWLog $script:IdleStatus
-        if ($s.Errors -gt 0 -and -not $script:IsAdmin) { $script:IdleStatus += ' (run as admin to read protected folders)' }
+        $r = @($Result | Where-Object { $_ -and $_.Via }) | Select-Object -Last 1
+        if ($r.Via -eq 'WinRM') {
+            if ($r.Text) {
+                $script:Scanner = [AWiper.DiskScanner]::Import($r.Text)
+                # Paths come back in the remote PC's own form (C:\...).
+                $script:ScanRemote.Via = 'WinRM'
+            } else { $script:Scanner = $null }
+        } elseif ($r) {
+            # Convert \\PC\C$\... back to C:\... so open / delete work the same for both routes.
+            $s = $script:Scanner
+            $stack = New-Object System.Collections.Generic.Stack[object]; $stack.Push($s.Root)
+            while ($stack.Count) { $n = $stack.Pop(); $n.FullPath = ConvertFrom-AWShareUnc $n.FullPath; foreach ($c in $n.Children) { $stack.Push($c) } }
+            foreach ($f in $s.TopFiles) { $f.FullPath = ConvertFrom-AWShareUnc $f.FullPath; $f.Folder = ConvertFrom-AWShareUnc $f.Folder }
+            $s.Root.Name = $s.Root.FullPath
+        }
+        if (-not $script:Scanner) { $script:ScanRemote = $null }
+        Complete-AWMapScan
     }
 }
 
+# Open a scanned item: local path, or the remote PC's admin share.
+function Open-AWScanPath([string]$Path) {
+    if (-not $script:ScanRemote) { Open-AWExplorer $Path; return }
+    $unc = ConvertTo-AWShareUnc $script:ScanRemote.Host $Path
+    if (Test-Path -LiteralPath $unc) { Open-AWExplorer $unc } else { Show-AWMessage "Can't open $Path on $($script:ScanRemote.ComputerName) from here - its \\$($script:ScanRemote.ComputerName)\C`$ share isn't reachable." 'Warning' }
+}
+
+# Delete items from a remote scan: permanently, on that PC, over WinRM. Returns the paths removed.
+function Remove-AWRemoteScanItems([string[]]$Paths, [scriptblock]$OnDone) {
+    if (-not (Test-AWRemote) -or $script:Target.Host -ne $script:ScanRemote.Host) { Show-AWMessage "This scan came from $($script:ScanRemote.ComputerName). Connect to it again (title bar) to remove files there." 'Warning'; return }
+    $script:PendingRemoteDelete = $OnDone
+    Write-AWAction 'DeleteRemoteFiles' @($Paths | Select-Object -First 50) @{ Count = $Paths.Count } 'Started'
+    Start-AWTask -Name "Delete $($Paths.Count) item(s) on $($script:ScanRemote.ComputerName)" -Arguments @{ P = $Paths } -Work {
+        Invoke-WTarget {
+            param($List)
+            foreach ($x in $List) {
+                try { Remove-Item -LiteralPath $x -Recurse -Force -ErrorAction Stop; Write-WLog "Deleted $x"; $x } catch { Write-WLog "Could not delete $($x): $($_.Exception.Message)" 'WARN' }
+            }
+        } -ArgumentList (, $P)
+    } -OnComplete { param($r) & $script:PendingRemoteDelete @($r | Where-Object { $_ -is [string] }) }
+}
 function Remove-AWMapNode($Node) {
     $p = $Node.Parent
     if (-not $p) { return }
@@ -7927,6 +8214,17 @@ function Send-AWToRecycle([string]$Path) {
 
 function Remove-AWMapNodeToRecycle($Node) {
     if (-not $Node -or $Node.IsGroup -or -not $Node.Parent) { return }
+    if ($script:ScanRemote) {
+        if (Test-AWProtectedRemotePath $Node.FullPath) { Show-AWMessage "AWiper won't remove protected system locations:`n$($Node.FullPath)" 'Warning'; return }
+        if (-not (Confirm-AW ("PERMANENTLY delete this {0} on {1}?`n`n{2}`n{3}`n`nFiles on another PC don't go to a Recycle Bin - this can't be undone." -f $Node.Kind.ToLower(), $script:ScanRemote.ComputerName, $Node.FullPath, $Node.SizeText))) { return }
+        $script:PendingMapNode = $Node
+        Remove-AWRemoteScanItems @($Node.FullPath) {
+            param($done)
+            if (@($done).Count) { Remove-AWMapNode $script:PendingMapNode; Set-AWMapCurrent $script:MapCurrent }
+            else { Show-AWMessage 'Nothing was deleted - see the Activity log.' 'Warning' }
+        }
+        return
+    }
     if (Test-AWProtectedPath $Node.FullPath) { Show-AWMessage "AWiper won't remove protected system locations:`n$($Node.FullPath)" 'Warning'; return }
     if (-not (Confirm-AW ("Send this {0} to the Recycle Bin?`n`n{1}`n{2}" -f $Node.Kind.ToLower(), $Node.FullPath, $Node.SizeText))) { return }
     try {
@@ -7949,7 +8247,9 @@ $ui.MapBrowse.Add_Click({
     if ($ui.MapPath.Text -and (Test-Path -LiteralPath $ui.MapPath.Text)) { $dlg.SelectedPath = $ui.MapPath.Text }
     if ($dlg.ShowDialog() -eq 'OK') { $ui.MapPath.Text = $dlg.SelectedPath; Start-AWMapScan $dlg.SelectedPath }
 })
-$ui.MapOpen.Add_Click({ if ($script:MapSelected) { Open-AWExplorer $script:MapSelected.FullPath } })
+$ui.MapOpen.Add_Click({ if ($script:MapSelected) { Open-AWScanPath $script:MapSelected.FullPath } })
+$ui.MapOnRemote.Add_Checked({ Update-AWMapScope })
+$ui.MapOnLocal.Add_Checked({ Update-AWMapScope })
 $ui.MapZoom.Add_Click({ if ($script:MapSelected) { Set-AWMapCurrent $script:MapSelected } })
 $ui.MapRecycle.Add_Click({ if ($script:MapSelected) { Remove-AWMapNodeToRecycle $script:MapSelected } })
 $ui.MapTopList.Add_SelectionChanged({ if ($ui.MapTopList.SelectedItem) { Select-AWMapNode $ui.MapTopList.SelectedItem $null } })
@@ -7964,6 +8264,26 @@ $window.Add_PreviewMouseDown({
 
 function Initialize-AWMapDrives {
     $ui.MapDrives.Children.Clear()
+    if (Test-AWMapRemote) {
+        $ui.MapPath.Text = 'C:\'
+        Start-AWTask -Name "List drives on $($script:Target.ComputerName)" -Work {
+            Invoke-WTarget { Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { [pscustomobject]@{ Letter = $_.DeviceID.Substring(0, 1); Size = [long]$_.Size; Free = [long]$_.FreeSpace } } }
+        } -OnComplete {
+            param($r)
+            if (-not (Test-AWMapRemote)) { return }
+            $script:RemoteDrives = @($r | Where-Object { $_ -and $_.Letter } | ForEach-Object { [pscustomobject]@{ Letter = $_.Letter; Size = $_.Size; Free = $_.Free; Used = $_.Size - $_.Free } })
+            $ui.MapDrives.Children.Clear()
+            foreach ($d in $script:RemoteDrives) {
+                $b = New-Object System.Windows.Controls.Button
+                $b.Content = "$($d.Letter):"; $b.Tag = "$($d.Letter):\"
+                $b.Style = $window.FindResource('BtnChip')
+                $b.ToolTip = '{0} on {1}: {2} free of {3}' -f "$($d.Letter):", $script:Target.ComputerName, (Format-AWSize $d.Free), (Format-AWSize $d.Size)
+                $b.Add_Click({ param($s, $e) Start-AWMapScan $s.Tag })
+                [void]$ui.MapDrives.Children.Add($b)
+            }
+        }
+        return
+    }
     foreach ($d in (Get-AWFixedDrives)) {
         $b = New-Object System.Windows.Controls.Button
         $b.Content = $d.Name.TrimEnd('\'); $b.Tag = $d.RootDirectory.FullName
@@ -8000,6 +8320,7 @@ function Update-AWLargeList {
             'Dupes' { if ($script:DupeNote) { $script:DupeNote } else { 'Pick a folder and find exact copies (byte-for-byte) or similar photos.' } }
             default { 'Run a scan in Space Map to list the largest files.' }
         }
+        Add-AWLargeScope
         return
     }
     $q = $ui.LargeSearch.Text.Trim()
@@ -8015,6 +8336,14 @@ function Update-AWLargeList {
         'Dupes' { $script:DupeNote }
         default { '{0:N0} files - {1} total - from scan of {2}' -f $items.Count, (Format-AWSize $sum), $script:Scanner.Root.FullPath }
     }
+    Add-AWLargeScope
+}
+
+# When a remote PC is targeted, say which PC each list is about.
+function Add-AWLargeScope {
+    if (-not (Test-AWRemote)) { return }
+    $who = if ($script:LargeTab -eq 'Largest' -and $script:ScanRemote) { $script:ScanRemote.ComputerName } else { "this PC ($env:COMPUTERNAME)" }
+    $ui.LargeInfo.Text = "On $who" + $(if ($script:LargeTab -ne 'Largest') { ' - Old files and Duplicates always look at this PC' } else { '' }) + ": " + $ui.LargeInfo.Text
 }
 
 function Get-AWCheckedLarge { @(foreach ($f in (Get-AWLargeSource)) { if ($f.IsChecked) { $f } }) }
@@ -8029,6 +8358,7 @@ function Set-AWLargeTab([string]$Tab) {
     $ui.LargeStatusCol.Width = if ($Tab -eq 'Largest') { 0 } elseif ($Tab -eq 'Old') { 230 } else { 170 }
     if ($Tab -eq 'Dupes' -and -not $ui.DupePath.Text) { $ui.DupePath.Text = $env:USERPROFILE }
     Update-AWLargeList
+    Update-AWViewTitle 'Large'
 }
 $ui.LTabLargest.Add_Checked({ Set-AWLargeTab 'Largest' })
 $ui.LTabOld.Add_Checked({ Set-AWLargeTab 'Old' })
@@ -8203,7 +8533,8 @@ $ui.LargeScan.Add_Click({ Select-AWView 'Map' })
 $ui.LargeOpen.Add_Click({
     $f = $ui.LargeList.SelectedItem
     if (-not $f) { $f = Get-AWCheckedLarge | Select-Object -First 1 }
-    if ($f) { Open-AWExplorer $f.FullPath } else { Show-AWMessage 'Select a file first.' }
+    if (-not $f) { Show-AWMessage 'Select a file first.'; return }
+    if ($script:LargeTab -eq 'Largest') { Open-AWScanPath $f.FullPath } else { Open-AWExplorer $f.FullPath }
 })
 $ui.LargeRecycle.Add_Click({
     $src = Get-AWLargeSource
@@ -8215,6 +8546,20 @@ $ui.LargeRecycle.Add_Click({
         if ($all.Count) { Show-AWMessage ("Every copy is ticked in {0} - leave at least one unticked:`n{1}" -f $(if ($all.Count -eq 1) { 'this group' } else { "$($all.Count) groups" }), (($all | Select-Object -First 5) -join "`n")) 'Warning'; return }
     }
     [long]$sum = 0; foreach ($f in $sel) { $sum += $f.Size }
+    if ($script:LargeTab -eq 'Largest' -and $script:ScanRemote) {
+        $blocked = @($sel | Where-Object { Test-AWProtectedRemotePath $_.FullPath })
+        $go = @($sel | Where-Object { -not (Test-AWProtectedRemotePath $_.FullPath) })
+        if (-not $go.Count) { Show-AWMessage 'Those are protected system locations.' 'Warning'; return }
+        if (-not (Confirm-AW ("PERMANENTLY delete {0} file(s) ({1}) on {2}?`n`nFiles on another PC don't go to a Recycle Bin - this can't be undone.{3}" -f $go.Count, (Format-AWSize $sum), $script:ScanRemote.ComputerName, $(if ($blocked.Count) { "`n$($blocked.Count) protected item(s) will be skipped." } else { '' })))) { return }
+        Remove-AWRemoteScanItems @($go | ForEach-Object FullPath) {
+            param($done)
+            $gone = @{}; foreach ($p in $done) { $gone[$p] = $true }
+            foreach ($f in @($script:Scanner.TopFiles | Where-Object { $gone[$_.FullPath] })) { [void]$script:Scanner.TopFiles.Remove($f) }
+            Update-AWLargeList
+            $script:IdleStatus = "Deleted $(@($done).Count) file(s) on $($script:ScanRemote.ComputerName) - rescan to refresh the Space Map"; Set-AWStatus $script:IdleStatus
+        }
+        return
+    }
     $inCloud = @($sel | Where-Object { $_.Status -like '*(OneDrive)*' }).Count
     $cloudNote = if ($inCloud) { "`n`n$inCloud of them are in OneDrive: they'll also disappear from OneDrive and your other devices (OneDrive keeps them in its own recycle bin for about 30 days)." } else { '' }
     if (-not (Confirm-AW ("Send {0} file(s) ({1}) to the Recycle Bin?{2}" -f $sel.Count, (Format-AWSize $sum), $cloudNote))) { return }
@@ -8248,81 +8593,22 @@ $ui.LargeExport.Add_Click({
 #endregion
 
 #region ---------------------------------------------------------------- Startup manager
-$script:ApprovedBase = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'
-
-function Get-AWApprovedEnabled([string]$Key, [string]$Name) {
-    try {
-        $v = (Get-ItemProperty -LiteralPath $Key -Name $Name -ErrorAction Stop).$Name
-        if ($v -is [byte[]] -and $v.Length -gt 0) { return -not ($v[0] -band 1) }
-    } catch { }
-    $true
-}
-
-function Get-AWStartupItems {
-    $list = New-Object System.Collections.Generic.List[object]
-    $sources = @(
-        @{ Hive = 'HKCU'; Key = 'Software\Microsoft\Windows\CurrentVersion\Run';             Approved = 'Run';   Location = 'Registry Run';   Scope = 'User' }
-        @{ Hive = 'HKLM'; Key = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Run';             Approved = 'Run';   Location = 'Registry Run';   Scope = 'All users' }
-        @{ Hive = 'HKLM'; Key = 'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Approved = 'Run32'; Location = 'Registry Run32'; Scope = 'All users' }
-    )
-    foreach ($s in $sources) {
-        $path = "$($s.Hive):\$($s.Key)"
-        if (-not (Test-Path -LiteralPath $path)) { continue }
-        $k = Get-Item -LiteralPath $path
-        $approved = "$($s.Hive):\$script:ApprovedBase\$($s.Approved)"
-        foreach ($name in $k.GetValueNames()) {
-            if (-not $name) { continue }
-            $list.Add([pscustomobject]@{
-                Name = $name; Command = [string]$k.GetValue($name); Location = $s.Location; Scope = $s.Scope
-                Enabled = (Get-AWApprovedEnabled $approved $name)
-                CanToggle = ($s.Hive -eq 'HKCU' -or $script:IsAdmin)
-                ApprovedKey = $approved; ValueName = $name; FilePath = $null
-            })
-        }
-    }
-    $folders = @(
-        @{ Path = [Environment]::GetFolderPath('Startup');       Hive = 'HKCU'; Scope = 'User' }
-        @{ Path = [Environment]::GetFolderPath('CommonStartup'); Hive = 'HKLM'; Scope = 'All users' }
-    )
-    foreach ($f in $folders) {
-        if (-not $f.Path -or -not (Test-Path -LiteralPath $f.Path)) { continue }
-        $approved = "$($f.Hive):\$script:ApprovedBase\StartupFolder"
-        foreach ($file in (Get-ChildItem -LiteralPath $f.Path -File -Force -ErrorAction SilentlyContinue)) {
-            if ($file.Name -eq 'desktop.ini') { continue }
-            $cmd = $file.FullName
-            if ($file.Extension -eq '.lnk') {
-                try { $sh = New-Object -ComObject WScript.Shell; $t = $sh.CreateShortcut($file.FullName); if ($t.TargetPath) { $cmd = ('"{0}" {1}' -f $t.TargetPath, $t.Arguments).Trim() } } catch { }
-            }
-            $list.Add([pscustomobject]@{
-                Name = $file.BaseName; Command = $cmd; Location = 'Startup folder'; Scope = $f.Scope
-                Enabled = (Get-AWApprovedEnabled $approved $file.Name)
-                CanToggle = ($f.Hive -eq 'HKCU' -or $script:IsAdmin)
-                ApprovedKey = $approved; ValueName = $file.Name; FilePath = $file.FullName
-            })
-        }
-    }
-    $list | Sort-Object Name
-}
-
-function Set-AWStartupState($Item, [bool]$Enable) {
-    if (-not (Test-Path -LiteralPath $Item.ApprovedKey)) { New-Item -Path $Item.ApprovedKey -Force -ErrorAction Stop | Out-Null }
-    $bytes = New-Object byte[] 12
-    if ($Enable) { $bytes[0] = 2 }
-    else {
-        $bytes[0] = 3
-        [Array]::Copy([BitConverter]::GetBytes((Get-Date).ToFileTime()), 0, $bytes, 4, 8)
-    }
-    New-ItemProperty -LiteralPath $Item.ApprovedKey -Name $Item.ValueName -PropertyType Binary -Value $bytes -Force -ErrorAction Stop | Out-Null
-}
-
+# The list is read and changed by Get-WStartupItems / Set-WStartupState in the worker library, so it
+# works on a remote PC too. There, only all-users entries are shown: "current user" over WinRM would
+# be the admin account AWiper connected with, not the person who uses that PC.
 function Update-AWStartupList {
-    try {
-        $items = @(Get-AWStartupItems)
+    $remote = Test-AWRemote
+    $ui.StartupInfo.Text = 'Reading startup entries...'
+    $ui.StartupRefresh.IsEnabled = $false
+    Start-AWTask -Name 'Read startup entries' -Arguments @{ MachineOnly = $remote } -Work { Invoke-WTarget { param($M) @(Get-WStartupItems $M) } -ArgumentList $MachineOnly } -OnComplete {
+        param($r)
+        $ui.StartupRefresh.IsEnabled = $true
+        $items = @($r | Where-Object { $_ -and $_.ValueName } | Sort-Object Name)
         $ui.StartupList.ItemsSource = $items
         $on = @($items | Where-Object { $_.Enabled }).Count
         $ui.StartupInfo.Text = "$($items.Count) startup entries, $on enabled. Disabled items stay installed, they just won't launch at sign-in." +
-            $(if (-not $script:IsAdmin) { ' All-users entries need admin rights to change.' } else { '' })
-    } catch { Write-AWLog "Startup list: $($_.Exception.Message)" 'ERROR' }
+            $(if (Test-AWRemote) { " Showing entries for all users on $($script:Target.ComputerName); each user's own entries are only listed when AWiper runs on that PC." } elseif (-not $script:IsAdmin) { ' All-users entries need admin rights to change.' } else { '' })
+    }
 }
 
 function Get-AWExeFromCommand([string]$Command) {
@@ -8339,20 +8625,26 @@ $ui.StartupList.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::Clic
     if ($cb -isnot [System.Windows.Controls.CheckBox]) { return }
     $item = $cb.DataContext
     $want = [bool]$cb.IsChecked
-    try {
-        Set-AWStartupState $item $want
-        $item.Enabled = $want
-        Write-AWLog ("Startup item '{0}' {1}" -f $item.Name, $(if ($want) { 'enabled' } else { 'disabled' }))
-        Set-AWStatus ("{0} will {1}launch at sign-in" -f $item.Name, $(if ($want) { '' } else { 'no longer ' }))
-    } catch {
-        $cb.IsChecked = $item.Enabled
-        Show-AWMessage "Could not change '$($item.Name)':`n$($_.Exception.Message)" 'Error'
+    $script:PendingStartup = @{ Item = $item; Box = $cb; Want = $want }
+    Start-AWTask -Name "Startup: $($item.Name)" -Arguments @{ Item = $item; Want = $want } -Work {
+        try { Invoke-WTarget { param($I, $W) Set-WStartupState $I $W; 'ok' } -ArgumentList $Item, $Want } catch { [pscustomobject]@{ Error = $_.Exception.Message } }
+    } -OnComplete {
+        param($r)
+        $p = $script:PendingStartup; $x = @($r) | Select-Object -Last 1
+        if ($x -ne 'ok') {
+            $p.Box.IsChecked = $p.Item.Enabled
+            Show-AWMessage "Could not change '$($p.Item.Name)':`n$(if ($x.Error) { $x.Error } else { 'see the Activity log' })" 'Error'; return
+        }
+        $p.Item.Enabled = $p.Want
+        Write-AWAction 'StartupItem' @("$($p.Item.Name) -> $(if ($p.Want) { 'enabled' } else { 'disabled' })") @{} 'Done'
+        Set-AWStatus ("{0} will {1}launch at sign-in" -f $p.Item.Name, $(if ($p.Want) { '' } else { 'no longer ' }))
     }
 })
 $ui.StartupRefresh.Add_Click({ Update-AWStartupList })
 $ui.StartupOpen.Add_Click({
     $it = $ui.StartupList.SelectedItem
     if (-not $it) { Show-AWMessage 'Select a startup entry first.'; return }
+    if (Test-AWRemote) { Show-AWMessage "This entry is on $($script:Target.ComputerName):`n$($it.Command)"; return }
     $target = if ($it.FilePath) { $it.FilePath } else { Get-AWExeFromCommand $it.Command }
     if ($target -and (Test-Path -LiteralPath $target)) { Open-AWExplorer $target }
     else { Show-AWMessage "Couldn't find the file for this entry:`n$($it.Command)" 'Warning' }
@@ -8375,15 +8667,19 @@ function Update-AWMenuView {
     $ui.MenuList.ItemsSource = $items
     $off = @($script:MenuItems | Where-Object { -not $_.Enabled }).Count
     $ui.StartupInfo.Text = "$($items.Count) entries added by programs$(if ($off) { ", $off turned off" }). Turning one off hides it from the menu without uninstalling anything - a slow or crashing entry is a common cause of a sluggish right-click. Windows 11's new top-level menu entries from Store apps aren't listed; most of these show under 'Show more options'." +
-        $(if (-not $script:IsAdmin) { ' All-users commands need admin rights to change.' } else { '' })
+        $(if (Test-AWRemote) { " Showing all-users entries on $($script:Target.ComputerName); changes apply after its users sign out and back in." } elseif (-not $script:IsAdmin) { ' All-users commands need admin rights to change.' } else { '' })
 }
 function Update-AWMenuList {
     $ui.StartupInfo.Text = 'Reading right-click menu entries...'
     $ui.MenuRefresh.IsEnabled = $false
-    Start-AWTask -Name 'Read right-click menu entries' -Work { @(Get-WContextMenu) } -OnComplete {
+    $remote = Test-AWRemote
+    $ui.MenuRestart.IsEnabled = -not $remote
+    $ui.MenuRestart.ToolTip = if ($remote) { "On $($script:Target.ComputerName), changes show up after its users sign out and back in" } else { 'Changes show up after Explorer restarts' }
+    [System.Windows.Controls.ToolTipService]::SetShowOnDisabled($ui.MenuRestart, $true)
+    Start-AWTask -Name 'Read right-click menu entries' -Arguments @{ MachineOnly = $remote } -Work { Invoke-WTarget { param($M) @(Get-WContextMenu $M) } -ArgumentList $MachineOnly } -OnComplete {
         param($r)
         $ui.MenuRefresh.IsEnabled = $true
-        $script:MenuItems = @($r | Sort-Object @{ e = 'Microsoft' }, Name)
+        $script:MenuItems = @($r | Where-Object { $_ -and $_.Id } | Sort-Object @{ e = 'Microsoft' }, Name)
         Update-AWMenuView
     }
 }
@@ -8395,6 +8691,7 @@ $ui.MenuRestart.Add_Click({ Restart-AWExplorer })
 $ui.MenuOpen.Add_Click({
     $it = $ui.MenuList.SelectedItem
     if (-not $it) { Show-AWMessage 'Select an entry first.'; return }
+    if (Test-AWRemote) { Show-AWMessage "This entry is on $($script:Target.ComputerName):`n$($it.Command)"; return }
     $target = if ($it.Kind -eq 'Handler') { $it.Command } else { Get-AWExeFromCommand $it.Command }
     if ($target -and (Test-Path -LiteralPath $target)) { Open-AWExplorer $target }
     else { Show-AWMessage "Couldn't find the file for this entry:`n$($it.Command)" 'Warning' }
@@ -8404,14 +8701,13 @@ $ui.MenuList.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEv
     $cb = $e.OriginalSource
     if ($cb -isnot [System.Windows.Controls.CheckBox]) { return }
     $item = $cb.DataContext
-    if (Test-AWRemote) { $cb.IsChecked = $item.Enabled; Show-AWMessage 'The right-click menu list is for this PC. Switch the target back to this PC to change it.'; return }
     $want = [bool]$cb.IsChecked
     $script:PendingMenu = @{ Item = $item; Box = $cb; Want = $want }
     Start-AWTask -Name "Right-click menu: $($item.Name)" -Arguments @{ Item = $item; Want = $want } -Work {
-        try { Set-WContextMenuItem $Item $Want } catch { [pscustomobject]@{ Error = $_.Exception.Message } }
+        try { Invoke-WTarget { param($I, $W) Set-WContextMenuItem $I $W } -ArgumentList $Item, $Want } catch { [pscustomobject]@{ Error = $_.Exception.Message } }
     } -OnComplete {
         param($r)
-        $p = $script:PendingMenu; $r = @($r)[0]
+        $p = $script:PendingMenu; $r = @($r | Where-Object { $_ -and ($_.Error -or $_.UndoKind) })[0]
         if (-not $r -or $r.Error) {
             $p.Box.IsChecked = $p.Item.Enabled
             Show-AWMessage "Could not change '$($p.Item.Name)':`n$(if ($r) { $r.Error } else { 'see the log' })" 'Error'; return
@@ -9078,8 +9374,13 @@ function Set-AWTarget($NewTarget) {
     $script:AllApps = @(); $ui.AppList.ItemsSource = $null; $script:Programs = @(); $ui.ProgList.ItemsSource = $null
     $script:HTabLoaded = @{}; $script:ATabLoaded = @{}
     [void]$script:Loaded.Remove('Programs'); [void]$script:Loaded.Remove('Debloat'); [void]$script:Loaded.Remove('Recovery'); [void]$script:Loaded.Remove('Rebloat'); [void]$script:Loaded.Remove('Health'); [void]$script:Loaded.Remove('Drivers'); [void]$script:Loaded.Remove('Bios'); [void]$script:Loaded.Remove('Admin')
+    $ui.MapOnRemote.IsChecked = $true
+    Update-AWMapScope
+    $script:MenuItems = @(); [void]$script:Loaded.Remove('Startup')
     $cur = Get-AWCurrentView
     Update-AWViewTitle $cur
+    if ($cur -eq 'Startup')  { $script:Loaded['Startup'] = $true; if ($ui.STabMenu.IsChecked) { Update-AWMenuList } else { Update-AWStartupList } }
+    if ($cur -eq 'Large')    { Update-AWLargeList }
     if ($cur -eq 'Programs') { $script:Loaded['Programs'] = $true; Update-AWProgramList }
     if ($cur -eq 'Debloat')  { $script:Loaded['Debloat'] = $true; Update-AWAppList; Update-AWTweakStatus }
     if ($cur -eq 'Recovery') { $script:Loaded['Recovery'] = $true; Initialize-AWRecovery }
@@ -9903,11 +10204,11 @@ $script:HealthChecked = $null
 
 function Get-AWStatusStyle([string]$Status) {
     switch ($Status) {
-        'Good'    { @{ Label = 'GOOD';    Bg = '#163A44'; Border = '#2E8F86'; Fg = $script:Res.Teal } }
-        'Warning' { @{ Label = 'WARNING'; Bg = '#3A2F1E'; Border = '#8C6A2E'; Fg = $script:Res.Amber } }
-        'Problem' { @{ Label = 'PROBLEM'; Bg = '#3A1E28'; Border = '#8C3A4A'; Fg = $script:Res.Danger } }
-        'Info'    { @{ Label = 'INFO';    Bg = '#232A45'; Border = '#4A5680'; Fg = $script:Res.Muted } }
-        default   { @{ Label = 'N/A';     Bg = '#1E2440'; Border = '#36406A'; Fg = $script:Res.Dim } }
+        'Good'    { @{ Label = 'GOOD';    Bg = '#0F2E25'; Border = '#1F7A5C'; Fg = $script:Res.Success } }
+        'Warning' { @{ Label = 'WARNING'; Bg = '#33280E'; Border = '#7A5E14'; Fg = $script:Res.Amber } }
+        'Problem' { @{ Label = 'PROBLEM'; Bg = '#3A1619'; Border = '#8C3A3A'; Fg = $script:Res.Danger } }
+        'Info'    { @{ Label = 'INFO';    Bg = '#1A1E27'; Border = '#353C4B'; Fg = $script:Res.Muted } }
+        default   { @{ Label = 'N/A';     Bg = '#1A1E27'; Border = '#252A35'; Fg = $script:Res.Dim } }
     }
 }
 
@@ -9944,7 +10245,7 @@ function Show-AWHealth($Rows) {
         $st = Get-AWStatusStyle $r.Status
         $row = New-Object System.Windows.Controls.Border
         $row.CornerRadius = 10; $row.Padding = '14,10'; $row.Margin = '0,4'
-        $row.Background = New-Brush '#1C2240'; $row.BorderBrush = $window.FindResource('LineBrush'); $row.BorderThickness = 1
+        $row.Background = New-Brush '#1A1E27'; $row.BorderBrush = $window.FindResource('LineBrush'); $row.BorderThickness = 1
         $g = New-Object System.Windows.Controls.Grid
         foreach ($w in 'Auto', '*', 'Auto') { $c = New-Object System.Windows.Controls.ColumnDefinition; $c.Width = $w; $g.ColumnDefinitions.Add($c) }
         $pill = New-Object System.Windows.Controls.Border
@@ -10738,7 +11039,7 @@ $ui.LanRun.Add_Click({
 function Update-AWNetUI {
     if ($script:ForceOffline) { $ui.NetText.Text = 'Offline mode'; $ui.NetIcon.Text = [string][char]0xE709; $ui.NetIcon.Foreground = $script:Res.Amber
         $ui.NetBtn.ToolTip = 'Offline mode is on: AWiper never uses the internet and uses your Resources folder instead. Click to turn it off.' }
-    elseif ($script:Online -eq $true) { $ui.NetText.Text = 'Online'; $ui.NetIcon.Text = [string][char]0xE774; $ui.NetIcon.Foreground = $script:Res.Teal
+    elseif ($script:Online -eq $true) { $ui.NetText.Text = 'Online'; $ui.NetIcon.Text = [string][char]0xE774; $ui.NetIcon.Foreground = $script:Res.Success
         $ui.NetBtn.ToolTip = 'Internet is available. Click to switch to offline mode.' }
     elseif ($script:Online -eq $false) { $ui.NetText.Text = 'No internet'; $ui.NetIcon.Text = [string][char]0xE7BA; $ui.NetIcon.Foreground = $script:Res.Amber
         $ui.NetBtn.ToolTip = 'No internet connection detected. Internet-only actions are disabled and offline alternatives are offered. Click to force offline mode.' }
@@ -10841,9 +11142,9 @@ function Get-AWDriveVerdict($d) {
 
 function Get-AWVerdictColors([string]$Level) {
     switch ($Level) {
-        'Good'  { @{ Bg = '#163A44'; Border = '#2E8F86'; Fg = $script:Res.Teal } }
-        'Bad'   { @{ Bg = '#3A1E28'; Border = '#8C3A4A'; Fg = $script:Res.Danger } }
-        default { @{ Bg = '#3A2F1E'; Border = '#8C6A2E'; Fg = $script:Res.Amber } }
+        'Good'  { @{ Bg = '#0F2E25'; Border = '#1F7A5C'; Fg = $script:Res.Success } }
+        'Bad'   { @{ Bg = '#3A1619'; Border = '#8C3A3A'; Fg = $script:Res.Danger } }
+        default { @{ Bg = '#33280E'; Border = '#7A5E14'; Fg = $script:Res.Amber } }
     }
 }
 
@@ -11271,15 +11572,15 @@ function Update-AWWinfrStatus {
     $script:WinfrPath = if ($cmd) { $cmd.Source } else { $null }
     if ($script:WinfrPath) {
         $ui.WinfrStatus.Text = 'Windows File Recovery is installed and ready.'
-        $ui.WinfrBox.Background = New-Brush '#163A44'; $ui.WinfrBox.BorderBrush = New-Brush '#2E8F86'
+        $ui.WinfrBox.Background = New-Brush '#0F2E25'; $ui.WinfrBox.BorderBrush = New-Brush '#1F7A5C'
         $ui.WinfrInstall.Visibility = 'Collapsed'; $ui.WinfrStore.Visibility = 'Collapsed'
     } elseif (Test-AWOffline) {
         $ui.WinfrStatus.Text = "Windows File Recovery isn't installed, and it can only be installed from the Microsoft Store. Without internet, use the Undelete tab instead - it reads the drive directly and needs no download."
-        $ui.WinfrBox.Background = New-Brush '#3A2F1E'; $ui.WinfrBox.BorderBrush = New-Brush '#8C6A2E'
+        $ui.WinfrBox.Background = New-Brush '#33280E'; $ui.WinfrBox.BorderBrush = New-Brush '#7A5E14'
         $ui.WinfrInstall.Visibility = 'Collapsed'; $ui.WinfrStore.Visibility = 'Collapsed'
     } else {
         $ui.WinfrStatus.Text = "Deep scan uses Windows File Recovery, Microsoft's free recovery tool. It isn't installed yet. Install it to a drive other than the one you want to recover from if you can."
-        $ui.WinfrBox.Background = New-Brush '#3A2F1E'; $ui.WinfrBox.BorderBrush = New-Brush '#8C6A2E'
+        $ui.WinfrBox.Background = New-Brush '#33280E'; $ui.WinfrBox.BorderBrush = New-Brush '#7A5E14'
         $ui.WinfrInstall.Visibility = 'Visible'; $ui.WinfrStore.Visibility = 'Visible'
     }
     Update-AWDeep
@@ -11442,7 +11743,7 @@ function Update-AWRestorePoints {
         $sys = @($res.Storage | Where-Object { $_.Drive -eq $env:SystemDrive }) | Select-Object -First 1
         $on = $res.Enabled -and $sys
         $ui.RPProtect.Text = if ($on) { "System Protection is on for $($env:SystemDrive)." } else { "System Protection is off for $($env:SystemDrive), so Windows can't create restore points or previous versions." }
-        $ui.RPProtect.Foreground = if ($on) { $script:Res.Teal } else { $script:Res.Amber }
+        $ui.RPProtect.Foreground = if ($on) { $script:Res.Success } else { $script:Res.Amber }
         $ui.RPEnable.Visibility = if ($on) { 'Collapsed' } else { 'Visible' }
         $ui.RPStorage.Text = if ($sys) {
             $max = if ($sys.Max -ge [decimal]::MaxValue / 2 -or $sys.Max -ge 1e18) { 'no limit' } else { '{0} ({1:0}% of the drive)' -f (Format-AWSize ([long]$sys.Max)), ($sys.Max * 100 / [Math]::Max(1, $sys.Capacity)) }
@@ -11520,7 +11821,7 @@ function Update-AWBackupDestInfo {
             $free = if ($drv -and $drv.IsReady) { "$(Format-AWSize $drv.AvailableFreeSpace) free" + $(if ($drv.VolumeLabel) { " on $($drv.VolumeLabel)" } else { '' }) } else { '' }
             if ($b.DestVolumeId -and $vid -ne $b.DestVolumeId) { $msg = 'A different drive is using this letter now - choose the backup drive again.'; $color = $script:Res.Danger }
             elseif (@($b.Sources | Where-Object { [AWiper.Native]::VolumeId($_) -eq $vid }).Count) { $msg = "$free. Warning: some folders are on this same drive - a backup there won't survive the drive failing."; $color = $script:Res.Amber }
-            else { $msg = "$free. Backups go to AWiper-Backup\$env:COMPUTERNAME there."; $color = $script:Res.Teal }
+            else { $msg = "$free. Backups go to AWiper-Backup\$env:COMPUTERNAME there."; $color = $script:Res.Success }
         }
     }
     $ui.BkDestInfo.Text = $msg; $ui.BkDestInfo.Foreground = $color
@@ -11640,7 +11941,7 @@ function New-AWReadyRow([string]$Status, [string]$Title, [string[]]$Lines, $Butt
     $st = Get-AWStatusStyle $Status
     $row = New-Object System.Windows.Controls.Border
     $row.CornerRadius = 10; $row.Padding = '14,12'; $row.Margin = '0,5'
-    $row.Background = New-Brush '#1C2240'; $row.BorderBrush = $window.FindResource('LineBrush'); $row.BorderThickness = 1
+    $row.Background = New-Brush '#1A1E27'; $row.BorderBrush = $window.FindResource('LineBrush'); $row.BorderThickness = 1
     $g = New-Object System.Windows.Controls.Grid
     foreach ($w in 'Auto', '*') { $c = New-Object System.Windows.Controls.ColumnDefinition; $c.Width = $w; $g.ColumnDefinitions.Add($c) }
     $pill = New-Object System.Windows.Controls.Border
