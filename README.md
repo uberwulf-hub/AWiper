@@ -250,6 +250,10 @@ Computer Doctor used to be called AWiper. The first time it starts, it brings ev
 - A Resources folder at `<drive>:\AWiper\Resources` is still found.
 - The old `AWiper` event log source is left in place so earlier entries stay readable.
 
+## Roadmap
+
+What's planned next is in [ROADMAP.md](ROADMAP.md), with one [GitHub issue](https://github.com/uberwulf-hub/ComputerDoctor/issues) per item.
+
 ## Credits
 
 The Debloat view was inspired by [Win11Debloat](https://github.com/Raphire/Win11Debloat).
