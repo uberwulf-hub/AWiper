@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    Exercises AWiper's headless mode without making changes (no admin needed).
+    Exercises Computer Doctor's headless mode without making changes (no admin needed).
     Checks listings, argument validation, the health check (text and JSON), analyze and preview.
 #>
-param([string]$Path = (Join-Path $PSScriptRoot '..\AWiper.ps1'))
+param([string]$Path = (Join-Path $PSScriptRoot '..\ComputerDoctor.ps1'))
 $ErrorActionPreference = 'Stop'
 $exe = (Get-Process -Id $PID).Path
 $fail = 0
@@ -20,7 +20,7 @@ $r = Invoke-AW @('-ListTweaks'); Check 'ListTweaks shows tweak IDs' ($r.Code -eq
 $r = Invoke-AW @('-Clean', 'NoSuchRule'); Check 'Unknown rule is rejected with exit 2' ($r.Code -eq 2)
 $r = Invoke-AW @('-ApplyTweak', 'NoSuchTweak'); Check 'Unknown tweak is rejected with exit 2' ($r.Code -eq 2)
 
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ('awiper-cli-{0}.json' -f [guid]::NewGuid().ToString('N'))
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ('computerdoctor-cli-{0}.json' -f [guid]::NewGuid().ToString('N'))
 $r = Invoke-AW @('-HealthCheck', '-Format', 'Json', '-OutFile', $tmp)
 $doc = Get-Content -LiteralPath $tmp -Raw | ConvertFrom-Json
 $rows = @($doc.Steps | Where-Object { $_.Step -eq 'HealthCheck' } | ForEach-Object { $_.Items })

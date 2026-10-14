@@ -5,8 +5,8 @@
     lists, then build and verify the manifest. Skips the large scan-file and Defender downloads.
 #>
 param(
-    [string]$Path = (Join-Path $PSScriptRoot '..\AWiper.ps1'),
-    [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) 'AWiperAirGapTest')
+    [string]$Path = (Join-Path $PSScriptRoot '..\ComputerDoctor.ps1'),
+    [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) 'ComputerDoctorAirGapTest')
 )
 $ErrorActionPreference = 'Stop'
 $fail = 0

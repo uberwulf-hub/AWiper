@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    Checks AWiper's old-files finder on a throwaway folder (no admin needed): age and size limits,
+    Checks Computer Doctor's old-files finder on a throwaway folder (no admin needed): age and size limits,
     skipped developer folders, and archives flagged as already extracted.
 #>
 param(
-    [string]$Path = (Join-Path $PSScriptRoot '..\AWiper.ps1'),
-    [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) 'AWiperOldFilesTest')
+    [string]$Path = (Join-Path $PSScriptRoot '..\ComputerDoctor.ps1'),
+    [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) 'ComputerDoctorOldFilesTest')
 )
 $ErrorActionPreference = 'Stop'
 $src = [IO.File]::ReadAllText($Path)

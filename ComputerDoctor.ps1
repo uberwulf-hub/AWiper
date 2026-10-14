@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    AWiper - system cleanup and disk space analyzer with a WPF interface.
+    Computer Doctor - system cleanup and disk space analyzer with a WPF interface.
 
 .DESCRIPTION
-    AWiper bundles the most useful parts of tools like CCleaner and SpaceMonger:
+    Computer Doctor bundles the most useful parts of tools like CCleaner and SpaceMonger:
 
       * Dashboard    - drive usage gauges, system summary, quick actions
       * Health Check - disks (incl. the NVMe health log), crashes, hardware errors, stability, devices, battery,
@@ -31,20 +31,20 @@
       * Tools        - quick fixes (DNS, Group Policy, Explorer), repair (SFC, DISM, Windows Update reset,
                        ConfigMgr client), maintenance (component store, restore point, hibernation), activity log
 
-    AWiper can also work on another computer over PowerShell remoting (WinRM). Pick the target from
+    Computer Doctor can also work on another computer over PowerShell remoting (WinRM). Pick the target from
     the button in the title bar; credentials can be saved to Windows Credential Manager.
 
-    Offline: AWiper detects whether the internet is reachable (or use offline mode / -Offline) and then
-    uses a Resources folder (next to the script, or <drive>:\AWiper\Resources on a USB stick) for
+    Offline: Computer Doctor detects whether the internet is reachable (or use offline mode / -Offline) and then
+    uses a Resources folder (next to the script, or <drive>:\ComputerDoctor\Resources on a USB stick) for
     Windows repair media, Defender definitions and more. Every change is written to an action log
-    (%ProgramData%\AWiper\Logs, plus the Application event log when elevated) and tweaks can be undone.
+    (%ProgramData%\ComputerDoctor\Logs, plus the Application event log when elevated) and tweaks can be undone.
 
     Headless: pass any of the command-line parameters below to run without a window, e.g. from a
     scheduled task or across a fleet with -ComputerName. Changes are only previewed unless -Yes is given.
     Exit codes: 0 OK, 1 a step failed, 2 bad arguments, 3 health warnings, 4 health problems,
     5 PowerShell is in ConstrainedLanguage mode (App Control / AppLocker; sign the script).
 
-    On launch AWiper asks for administrator rights (UAC). If the prompt is declined or
+    On launch Computer Doctor asks for administrator rights (UAC). If the prompt is declined or
     elevation is not possible, it keeps running with standard permissions and simply
     disables the items that need admin rights.
 
@@ -59,7 +59,7 @@
     Keep the PowerShell console window visible (useful for troubleshooting).
 
 .PARAMETER Elevated
-    Internal - set when AWiper relaunches itself elevated, prevents a prompt loop.
+    Internal - set when Computer Doctor relaunches itself elevated, prevents a prompt loop.
 
 .PARAMETER Config
     Headless: a JSON profile, e.g. {"Clean":["Default"],"ApplyTweaks":["AdId","FileExt"],"RemoveApps":["Recommended"],
@@ -94,7 +94,7 @@
 
 .PARAMETER Inventory
     Headless: fleet inventory of these PCs over WinRM (saved credentials are used). Writes an HTML / CSV / JSON report
-    to %LOCALAPPDATA%\AWiper\Inventory and lists changes since the previous run.
+    to %LOCALAPPDATA%\ComputerDoctor\Inventory and lists changes since the previous run.
 
 .PARAMETER ExportNeeds
     Headless, offline PC: scan for missing updates (offline scan file if present) and save a needs list to <Resources>\needs.
@@ -119,30 +119,30 @@
     Headless: actually make the changes. Without it they're only listed.
 
 .EXAMPLE
-    .\AWiper.ps1
-    Prompts for admin rights, then opens the AWiper window.
+    .\ComputerDoctor.ps1
+    Prompts for admin rights, then opens the Computer Doctor window.
 
 .EXAMPLE
-    powershell.exe -ExecutionPolicy Bypass -File .\AWiper.ps1 -NoElevate
+    powershell.exe -ExecutionPolicy Bypass -File .\ComputerDoctor.ps1 -NoElevate
 
 .EXAMPLE
-    .\AWiper.ps1 -HealthCheck -Format Json -OutFile C:\Reports\health.json
+    .\ComputerDoctor.ps1 -HealthCheck -Format Json -OutFile C:\Reports\health.json
     Runs the health check without a window and saves the result.
 
 .EXAMPLE
-    .\AWiper.ps1 -Clean Default -ApplyTweak AdId,Suggestions -Yes
+    .\ComputerDoctor.ps1 -Clean Default -ApplyTweak AdId,Suggestions -Yes
     Cleans with the default rules and applies two tweaks (from an elevated prompt for the admin-only items).
 
 .EXAMPLE
-    .\AWiper.ps1 -ComputerName PC042 -UseSavedCredential -Clean WinTemp,WerSys -Yes
+    .\ComputerDoctor.ps1 -ComputerName PC042 -UseSavedCredential -Clean WinTemp,WerSys -Yes
     Cleans machine-wide junk on another PC over WinRM.
 
 .NOTES
-    Name    : AWiper.ps1
+    Name    : ComputerDoctor.ps1
     Version : 1.11.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
-    Log     : %LOCALAPPDATA%\AWiper\AWiper.log
+    Log     : %LOCALAPPDATA%\ComputerDoctor\ComputerDoctor.log
 #>
 [CmdletBinding()]
 param(
@@ -150,7 +150,7 @@ param(
     [switch]$ShowConsole,
     [switch]$Elevated,
 
-    # ---- Headless (command-line) mode. Any of these runs AWiper without a window.
+    # ---- Headless (command-line) mode. Any of these runs Computer Doctor without a window.
     [string]$Config,                 # JSON profile: Clean, ApplyTweaks, RevertTweaks, RemoveApps, RestorePoint, HealthCheck
     [switch]$Analyze,                # measure cleaning rules (nothing is deleted)
     [string[]]$Clean,                # rule IDs to clean, or 'Default' / 'All'
@@ -171,7 +171,7 @@ param(
     [pscredential]$Credential,
     [switch]$UseSavedCredential,     # use credentials saved for -ComputerName in Credential Manager
     [switch]$Offline,                # never use the internet
-    [string]$Resources,              # path to an AWiper Resources folder
+    [string]$Resources,              # path to a Computer Doctor Resources folder
     [ValidateSet('Text', 'Json')][string]$Format = 'Text',
     [string]$OutFile,                # also write the results (JSON) to this file
     [switch]$Yes                     # actually make changes (without it, changes are only listed)
@@ -186,9 +186,9 @@ $script:CliMode = [bool]($Config -or $Analyze -or $Clean -or $HealthCheck -or $A
 # embedded C# and most .NET/COM use. Explain instead of failing with a wall of red text.
 if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
     Write-Host ''
-    Write-Host "AWiper can't run here: PowerShell is in $($ExecutionContext.SessionState.LanguageMode) mode." -ForegroundColor Yellow
+    Write-Host "Computer Doctor can't run here: PowerShell is in $($ExecutionContext.SessionState.LanguageMode) mode." -ForegroundColor Yellow
     Write-Host 'This PC enforces App Control (WDAC) or AppLocker, which only allows trusted, signed scripts to use'
-    Write-Host 'the features AWiper needs. Ask your administrator to sign AWiper.ps1 with a certificate the policy'
+    Write-Host 'the features Computer Doctor needs. Ask your administrator to sign ComputerDoctor.ps1 with a certificate the policy'
     Write-Host 'trusts (keep settings in separate JSON profiles - editing a signed script breaks its signature).'
     if (-not $script:CliMode -and [Environment]::UserInteractive) { try { [void](Read-Host 'Press Enter to close') } catch { } }
     exit 5
@@ -248,14 +248,14 @@ if (-not $script:CliMode -and [System.Threading.Thread]::CurrentThread.GetApartm
         Start-Process -FilePath $exe -ArgumentList (Get-AWRelaunchArgs -AddNoElevate) | Out-Null
         exit
     }
-    throw 'AWiper must run in an STA thread. Start PowerShell with -STA.'
+    throw 'Computer Doctor must run in an STA thread. Start PowerShell with -STA.'
 }
 #endregion
 
 #region ---------------------------------------------------------------- Assemblies + native helpers
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, Microsoft.VisualBasic
 
-if (-not ('AWiper.DiskScanner' -as [type])) {
+if (-not ('ComputerDoctor.DiskScanner' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -263,7 +263,7 @@ using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 
-namespace AWiper
+namespace ComputerDoctor
 {
     public static class Fmt
     {
@@ -1386,7 +1386,7 @@ namespace AWiper
         // or a short warning. Never overwrites: the destination must not exist.
         public string Recover(DeletedFile f, string destPath)
         {
-            if (f.Unsupported) throw new InvalidOperationException(f.Note ?? "This file can't be recovered by AWiper.");
+            if (f.Unsupported) throw new InvalidOperationException(f.Note ?? "This file can't be recovered by Computer Doctor.");
             bool anyData = false;
             using (var fs = new FileStream(destPath, FileMode.CreateNew, FileAccess.Write))
             {
@@ -1459,7 +1459,7 @@ namespace AWiper
             byte[] blob = System.Text.Encoding.Unicode.GetBytes(password ?? "");
             var c = new CREDENTIAL();
             c.Type = Generic; c.TargetName = target; c.UserName = user; c.Persist = PersistLocalMachine;
-            c.Comment = "Saved by AWiper for remote connections";
+            c.Comment = "Saved by Computer Doctor for remote connections";
             c.CredentialBlobSize = (uint)blob.Length;
             c.CredentialBlob = Marshal.AllocHGlobal(Math.Max(1, blob.Length));
             try
@@ -1485,6 +1485,35 @@ namespace AWiper
         }
 
         public static bool Delete(string target) { return CredDelete(target, Generic, 0); }
+
+        // Saved connections are stored as "<Prefix><host>". Before the rename to Computer Doctor the
+        // prefix was "AWiper:", so those are still read and moved over by MoveOld().
+        public const string Prefix = "ComputerDoctor:";
+        public const string OldPrefix = "AWiper:";
+
+        public static string[] ReadHost(string host)
+        {
+            string h = (host ?? "").ToLowerInvariant();
+            return Read(Prefix + h) ?? Read(OldPrefix + h);
+        }
+
+        // Copies credentials saved under the old prefix to the new one and removes the old entries.
+        // Returns how many were moved.
+        public static int MoveOld()
+        {
+            int moved = 0;
+            foreach (string oldTarget in List(OldPrefix + "*"))
+            {
+                if (!oldTarget.StartsWith(OldPrefix, StringComparison.OrdinalIgnoreCase)) continue;
+                string h = oldTarget.Substring(OldPrefix.Length);
+                string[] c = Read(oldTarget);
+                if (c == null) continue;
+                if (Read(Prefix + h) == null) Write(Prefix + h, c[0], c[1]);
+                Delete(oldTarget);
+                moved++;
+            }
+            return moved;
+        }
 
         public static string[] List(string filter)
         {
@@ -1552,16 +1581,44 @@ namespace AWiper
 '@
 }
 
-# Hide the console only when AWiper owns it (double-click / elevated relaunch), never a shared terminal.
-if (-not $script:CliMode -and -not $ShowConsole -and [AWiper.Native]::OwnsConsole()) {
-    $hwnd = [AWiper.Native]::GetConsoleWindow()
-    if ($hwnd -ne [IntPtr]::Zero) { [void][AWiper.Native]::ShowWindow($hwnd, 0) }
+# Hide the console only when Computer Doctor owns it (double-click / elevated relaunch), never a shared terminal.
+if (-not $script:CliMode -and -not $ShowConsole -and [ComputerDoctor.Native]::OwnsConsole()) {
+    $hwnd = [ComputerDoctor.Native]::GetConsoleWindow()
+    if ($hwnd -ne [IntPtr]::Zero) { [void][ComputerDoctor.Native]::ShowWindow($hwnd, 0) }
 }
 #endregion
 
 #region ---------------------------------------------------------------- Paths, state, logging
-$script:DataDir   = Join-Path $env:LOCALAPPDATA 'AWiper'
-$script:LogFile   = Join-Path $script:DataDir 'AWiper.log'
+# Computer Doctor used to be called AWiper. On the first start after the rename, copy the old data
+# folders across (the old folders are left in place). Snapshot links are never copied: they point
+# into shadow copies of whole drives.
+function Copy-AWOldData {
+    $new = Join-Path $env:LOCALAPPDATA 'ComputerDoctor'
+    $old = Join-Path $env:LOCALAPPDATA 'AWiper'
+    if (-not (Test-Path -LiteralPath $new) -and (Test-Path -LiteralPath $old -PathType Container)) {
+        try {
+            New-Item -ItemType Directory -Path $new -Force | Out-Null
+            foreach ($item in @(Get-ChildItem -LiteralPath $old -Force -ErrorAction Stop)) {
+                if ($item.Name -eq 'Snapshots' -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+                $name = if ($item.Name -eq 'AWiper.log') { 'ComputerDoctor.log' } else { $item.Name }
+                Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $new $name) -Recurse -Force -ErrorAction Stop
+            }
+        } catch { }
+    }
+    # The action log. %ProgramData% may need admin rights; if the copy fails, the old log stays where it is.
+    $new = Join-Path $env:ProgramData 'ComputerDoctor\Logs'
+    $old = Join-Path $env:ProgramData 'AWiper\Logs'
+    if (-not (Test-Path -LiteralPath $new) -and (Test-Path -LiteralPath $old -PathType Container)) {
+        try {
+            New-Item -ItemType Directory -Path $new -Force | Out-Null
+            Copy-Item -Path (Join-Path $old '*') -Destination $new -Recurse -Force -ErrorAction Stop
+        } catch { }
+    }
+}
+Copy-AWOldData
+
+$script:DataDir   = Join-Path $env:LOCALAPPDATA 'ComputerDoctor'
+$script:LogFile   = Join-Path $script:DataDir 'ComputerDoctor.log'
 $script:StateFile = Join-Path $script:DataDir 'state.json'
 if (-not (Test-Path -LiteralPath $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
 
@@ -1603,13 +1660,13 @@ function Write-AWLog {
     $Sync.Log.Enqueue(('{0:HH:mm:ss}  {1,-5}  {2}' -f (Get-Date), $Level, $Message))
 }
 
-function Format-AWSize([long]$Bytes) { [AWiper.Fmt]::Size($Bytes) }
+function Format-AWSize([long]$Bytes) { [ComputerDoctor.Fmt]::Size($Bytes) }
 
 # ---------------- Action log (append-only JSON lines) and undo journal
-# Every change AWiper makes is recorded: who, when, which computer, what, and the result.
-# Lines go to %ProgramData%\AWiper\Logs\actions-<yyyy-MM>.jsonl and, when running as admin,
-# to the Application event log (source "AWiper") so event forwarding / SIEM can pick them up.
-$script:ActionLogDir = Join-Path $env:ProgramData 'AWiper\Logs'
+# Every change Computer Doctor makes is recorded: who, when, which computer, what, and the result.
+# Lines go to %ProgramData%\ComputerDoctor\Logs\actions-<yyyy-MM>.jsonl and, when running as admin,
+# to the Application event log (source "ComputerDoctor") so event forwarding / SIEM can pick them up.
+$script:ActionLogDir = Join-Path $env:ProgramData 'ComputerDoctor\Logs'
 $script:UndoFile = Join-Path $script:DataDir 'undo.json'
 
 function Write-AWAction([string]$Action, $Items = @(), [hashtable]$Details = @{}, [string]$Result = 'Started', [string]$UndoId = '') {
@@ -1629,9 +1686,9 @@ function Write-AWAction([string]$Action, $Items = @(), [hashtable]$Details = @{}
     }
     if ($script:IsAdmin) {
         try {
-            if (-not [Diagnostics.EventLog]::SourceExists('AWiper')) { [Diagnostics.EventLog]::CreateEventSource('AWiper', 'Application') }
-            $msg = "AWiper $Action on $target by $($entry.User): $Result`n" + (($entry.Items | Select-Object -First 50) -join "`n")
-            [Diagnostics.EventLog]::WriteEntry('AWiper', $msg, $(if ($Result -match 'fail|error') { 'Warning' } else { 'Information' }), 1000)
+            if (-not [Diagnostics.EventLog]::SourceExists('ComputerDoctor')) { [Diagnostics.EventLog]::CreateEventSource('ComputerDoctor', 'Application') }
+            $msg = "Computer Doctor $Action on $target by $($entry.User): $Result`n" + (($entry.Items | Select-Object -First 50) -join "`n")
+            [Diagnostics.EventLog]::WriteEntry('ComputerDoctor', $msg, $(if ($Result -match 'fail|error') { 'Warning' } else { 'Information' }), 1000)
         } catch { }
     }
 }
@@ -1664,7 +1721,58 @@ function Add-AWUndoEntry($Capture) {
 
 # Description for an automatic restore point before a risky batch, or $null when the option is off.
 function Get-AWAutoRP([string]$Reason) {
-    if ($script:State.AutoRestorePoint -and ($script:IsAdmin -or $script:Target)) { "AWiper - before $Reason" } else { $null }
+    if ($script:State.AutoRestorePoint -and ($script:IsAdmin -or $script:Target)) { "Computer Doctor - before $Reason" } else { $null }
+}
+
+# Things registered under the old name (AWiper) move to the new one: saved remote-connection
+# credentials and the two scheduled tasks. Runs once the window is open. The old "AWiper" event log
+# source is left alone so earlier entries in the Application log stay readable.
+function Move-AWOldRegistrations {
+    try {
+        $n = [ComputerDoctor.CredMan]::MoveOld()
+        if ($n) { Write-AWLog "Moved $n saved connection(s) from AWiper to Computer Doctor" }
+    } catch { Write-AWLog "Could not move saved connections from AWiper: $($_.Exception.Message)" 'WARN' }
+    if (-not $PSCommandPath -or -not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) { return }
+
+    # Daily folder backup (runs as the signed-in user): point it at this script.
+    try {
+        $old = Get-ScheduledTask -TaskName 'AWiper Backup' -ErrorAction SilentlyContinue
+        if ($old) {
+            if (-not (Get-ScheduledTask -TaskName 'ComputerDoctor Backup' -ErrorAction SilentlyContinue)) {
+                $exe = (Get-Process -Id $PID).Path
+                $action = New-ScheduledTaskAction -Execute $exe -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Backup -Yes"
+                Register-ScheduledTask -TaskName 'ComputerDoctor Backup' -Action $action -Trigger $old.Triggers -Settings $old.Settings `
+                    -Description 'Folder backup set up in Computer Doctor (Recovery > Backup).' -Force | Out-Null
+            }
+            Unregister-ScheduledTask -TaskName 'AWiper Backup' -Confirm:$false
+            Write-AWLog 'Moved the daily backup schedule from AWiper to Computer Doctor'
+        }
+    } catch { Write-AWLog "Could not move the AWiper backup schedule: $($_.Exception.Message)" 'WARN' }
+
+    # Scheduled maintenance runs as SYSTEM from an admin-only folder, so moving it needs admin rights.
+    if (-not $script:IsAdmin) { return }
+    try {
+        $old = Get-ScheduledTask -TaskName 'AWiper Maintenance' -ErrorAction SilentlyContinue
+        if ($old) {
+            if (-not (Get-ScheduledTask -TaskName 'ComputerDoctor Maintenance' -ErrorAction SilentlyContinue)) {
+                $oldRoot = Join-Path $env:ProgramData 'AWiper'; $newRoot = Join-Path $env:ProgramData 'ComputerDoctor'
+                $dir = Join-Path $newRoot 'Scheduled'
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+                # Admins and SYSTEM full control, users read-only, no inherited write access (as in New-AWScheduledMaintenance).
+                & icacls.exe $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' 2>&1 | Out-Null
+                $oldProfile = Join-Path $oldRoot 'Scheduled\maintenance.json'
+                if (Test-Path -LiteralPath $oldProfile) { Copy-Item -LiteralPath $oldProfile -Destination (Join-Path $dir 'maintenance.json') -Force }
+                Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $dir 'ComputerDoctor.ps1') -Force
+                $a = @($old.Actions)[0]
+                $arg = ([string]$a.Arguments) -ireplace [regex]::Escape("$oldRoot\"), "$newRoot\" -ireplace 'AWiper\.ps1', 'ComputerDoctor.ps1'
+                if ($arg -like "*$newRoot\Results*") { New-Item -ItemType Directory -Path (Join-Path $newRoot 'Results') -Force | Out-Null }
+                Register-ScheduledTask -TaskName 'ComputerDoctor Maintenance' -Action (New-ScheduledTaskAction -Execute $a.Execute -Argument $arg) -Trigger $old.Triggers `
+                    -Principal $old.Principal -Settings $old.Settings -Description 'Computer Doctor scheduled maintenance' -Force | Out-Null
+            }
+            Unregister-ScheduledTask -TaskName 'AWiper Maintenance' -Confirm:$false
+            Write-AWLog 'Moved scheduled maintenance from AWiper to Computer Doctor'
+        }
+    } catch { Write-AWLog "Could not move the AWiper maintenance schedule: $($_.Exception.Message)" 'WARN' }
 }
 #endregion
 
@@ -2046,7 +2154,7 @@ function Get-WDriverInventory {
 # directly first, then whatever update service the PC is configured for (e.g. WSUS).
 function Open-WDriverSearch {
     $s = New-Object -ComObject Microsoft.Update.Session
-    $s.ClientApplicationID = 'AWiper'
+    $s.ClientApplicationID = 'ComputerDoctor'
     $q = $s.CreateUpdateSearcher(); $q.Online = $true
     $err = ''
     foreach ($sel in 2, 0) {
@@ -2515,13 +2623,13 @@ function Get-WPupSweep {
 # never touches the network; without one, asks Windows Update. Needs admin for the offline scan.
 function Get-WMissingUpdates([string]$Cab) {
     $s = New-Object -ComObject Microsoft.Update.Session
-    $s.ClientApplicationID = 'AWiper'
+    $s.ClientApplicationID = 'ComputerDoctor'
     $q = $s.CreateUpdateSearcher()
     $svc = $null; $sm = $null
     if ($Cab) {
         $Sync.Status = 'Loading the offline scan file (this can take a few minutes and a lot of memory)...'
         $sm = New-Object -ComObject Microsoft.Update.ServiceManager
-        $svc = $sm.AddScanPackageService('AWiper offline scan', $Cab, 1)
+        $svc = $sm.AddScanPackageService('Computer Doctor offline scan', $Cab, 1)
         $q.ServerSelection = 3; $q.ServiceID = $svc.ServiceID
     } else { $q.ServerSelection = 2; $q.Online = $true }
     try {
@@ -2659,7 +2767,7 @@ function Invoke-WFetch([string]$Root, [bool]$IncludeScanCab = $true) {
     if (-not @(Get-ChildItem -LiteralPath $bdir -Filter '*.csv' -ErrorAction SilentlyContinue).Count) {
         $Sync.Status = 'Downloading security baseline lists...'
         try {
-            $files = (Invoke-WebRequest -Uri 'https://api.github.com/repos/scipag/HardeningKitty/contents/lists' -UseBasicParsing -TimeoutSec 60 -Headers @{ 'User-Agent' = 'AWiper' }).Content | ConvertFrom-Json
+            $files = (Invoke-WebRequest -Uri 'https://api.github.com/repos/scipag/HardeningKitty/contents/lists' -UseBasicParsing -TimeoutSec 60 -Headers @{ 'User-Agent' = 'ComputerDoctor' }).Content | ConvertFrom-Json
             $pick = @()
             foreach ($pat in 'msft_security_baseline_windows_11.*machine', 'cis_microsoft_windows_11_enterprise.*machine', '0x6d69636b_machine') {
                 $pick += @($files | Where-Object { $_.name -match $pat } | Sort-Object name -Descending | Select-Object -First 1)
@@ -2672,7 +2780,7 @@ function Invoke-WFetch([string]$Root, [bool]$IncludeScanCab = $true) {
 }
 
 # ---------------------------------------------------------------- Crash dumps (blue screens)
-# Plain-English meaning of the common bug check codes, and which AWiper action helps.
+# Plain-English meaning of the common bug check codes, and which Computer Doctor action helps.
 function Get-WBugCheckInfo([uint32]$Code) {
     $t = @{
         0x0A = @('IRQL_NOT_LESS_OR_EQUAL', 'A driver touched memory it should not have.', 'Drivers')
@@ -2778,7 +2886,7 @@ function Get-WUserProfiles([bool]$Sizes = $true) {
         if (-not $last -and $p.LastUseTime) { $last = [datetime]$p.LastUseTime }
         $size = 0
         if ($Sizes -and (Test-Path -LiteralPath $p.LocalPath)) {
-            $sum = & robocopy.exe $p.LocalPath 'C:\AWiperNonexistentTarget' /L /S /NJH /BYTES /NFL /NDL /XJ /R:0 /W:0 2>$null | Where-Object { $_ -match '^\s*Bytes\s*:' } | Select-Object -First 1
+            $sum = & robocopy.exe $p.LocalPath 'C:\ComputerDoctorNonexistentTarget' /L /S /NJH /BYTES /NFL /NDL /XJ /R:0 /W:0 2>$null | Where-Object { $_ -match '^\s*Bytes\s*:' } | Select-Object -First 1
             if ($sum -match 'Bytes\s*:\s*(\d+)') { $size = [long]$Matches[1] }
         }
         $flags = @(); if ($p.Status -band 1) { $flags += 'Temporary' }; if ($p.Status -band 8) { $flags += 'Corrupted' }; if ($p.Status -band 4) { $flags += 'Mandatory' }; if ($p.Status -band 2) { $flags += 'Roaming' }
@@ -2893,7 +3001,7 @@ function Set-WTimeSource([string]$Peers) {
 # Copies a 256 MB test file to and from the other PC: over its ADMIN$ share (closest to real file copies),
 # or over WinRM when SMB is blocked (slower; shows the minimum).
 function Test-WLanSpeed([string]$Computer, $Credential) {
-    $local = Join-Path ([IO.Path]::GetTempPath()) 'awiper-lan-test.bin'
+    $local = Join-Path ([IO.Path]::GetTempPath()) 'computerdoctor-lan-test.bin'
     $buf = New-Object byte[] (16MB); (New-Object Random).NextBytes($buf)
     $fs = [IO.File]::Create($local); for ($i = 0; $i -lt 16; $i++) { $fs.Write($buf, 0, $buf.Length) }; $fs.Dispose()
     $mb = 256; $res = [ordered]@{ Computer = $Computer; Method = ''; UploadMBps = 0; DownloadMBps = 0 }
@@ -2906,7 +3014,7 @@ function Test-WLanSpeed([string]$Computer, $Credential) {
         } catch { }
         if ($drive) {
             $res.Method = 'File share (SMB)'
-            $remote = 'AWLanTest:\Temp\awiper-lan-test.bin'; $back = "$local.back"
+            $remote = 'AWLanTest:\Temp\computerdoctor-lan-test.bin'; $back = "$local.back"
             $sw = [Diagnostics.Stopwatch]::StartNew(); Copy-Item -LiteralPath $local -Destination $remote -Force; $res.UploadMBps = [Math]::Round($mb / $sw.Elapsed.TotalSeconds, 1)
             $sw.Restart(); Copy-Item -LiteralPath $remote -Destination $back -Force; $res.DownloadMBps = [Math]::Round($mb / $sw.Elapsed.TotalSeconds, 1)
             Remove-Item -LiteralPath $remote, $back -Force -ErrorAction SilentlyContinue
@@ -2916,9 +3024,9 @@ function Test-WLanSpeed([string]$Computer, $Credential) {
             $sp = @{ ComputerName = $Computer; ErrorAction = 'Stop' }; if ($Credential) { $sp.Credential = $Credential }
             $s = New-PSSession @sp
             try {
-                $sw = [Diagnostics.Stopwatch]::StartNew(); Copy-Item -LiteralPath $local -Destination 'C:\Windows\Temp\awiper-lan-test.bin' -ToSession $s -Force; $res.UploadMBps = [Math]::Round($mb / $sw.Elapsed.TotalSeconds, 1)
-                $sw.Restart(); Copy-Item -Path 'C:\Windows\Temp\awiper-lan-test.bin' -Destination "$local.back" -FromSession $s -Force; $res.DownloadMBps = [Math]::Round($mb / $sw.Elapsed.TotalSeconds, 1)
-                Invoke-Command -Session $s { Remove-Item 'C:\Windows\Temp\awiper-lan-test.bin' -Force -ErrorAction SilentlyContinue }
+                $sw = [Diagnostics.Stopwatch]::StartNew(); Copy-Item -LiteralPath $local -Destination 'C:\Windows\Temp\computerdoctor-lan-test.bin' -ToSession $s -Force; $res.UploadMBps = [Math]::Round($mb / $sw.Elapsed.TotalSeconds, 1)
+                $sw.Restart(); Copy-Item -Path 'C:\Windows\Temp\computerdoctor-lan-test.bin' -Destination "$local.back" -FromSession $s -Force; $res.DownloadMBps = [Math]::Round($mb / $sw.Elapsed.TotalSeconds, 1)
+                Invoke-Command -Session $s { Remove-Item 'C:\Windows\Temp\computerdoctor-lan-test.bin' -Force -ErrorAction SilentlyContinue }
                 Remove-Item -LiteralPath "$local.back" -Force -ErrorAction SilentlyContinue
             } finally { Remove-PSSession $s }
         }
@@ -2954,16 +3062,16 @@ function Invoke-WSoftwarePush([string[]]$Hosts, [string]$Installer, [string]$Arg
         $i++; $Sync.Status = "Installing on $h ($i of $($Hosts.Count))..."; $Sync.Progress = [int]($i * 100 / $Hosts.Count)
         try {
             if ($h -in 'localhost', '.', $env:COMPUTERNAME) {
-                $dst = Join-Path $env:SystemRoot "Temp\AWiperPush\$leaf"; New-Item -ItemType Directory -Path (Split-Path $dst) -Force | Out-Null
+                $dst = Join-Path $env:SystemRoot "Temp\ComputerDoctorPush\$leaf"; New-Item -ItemType Directory -Path (Split-Path $dst) -Force | Out-Null
                 Copy-Item -LiteralPath $Installer -Destination $dst -Force
                 $r = & $run $dst $isMsi $Arguments $hash
             } else {
                 $sp = @{ ComputerName = $h; ErrorAction = 'Stop' }
-                $saved = try { [AWiper.CredMan]::Read('AWiper:' + $h.ToLowerInvariant()) } catch { $null }
+                $saved = try { [ComputerDoctor.CredMan]::ReadHost($h) } catch { $null }
                 if ($saved) { $sp.Credential = New-Object System.Management.Automation.PSCredential($saved[0], (ConvertTo-SecureString $saved[1] -AsPlainText -Force)) }
                 $s = New-PSSession @sp
                 try {
-                    $dst = Invoke-Command -Session $s { param($l) $d = Join-Path $env:SystemRoot 'Temp\AWiperPush'; New-Item -ItemType Directory -Path $d -Force | Out-Null; Join-Path $d $l } -ArgumentList $leaf
+                    $dst = Invoke-Command -Session $s { param($l) $d = Join-Path $env:SystemRoot 'Temp\ComputerDoctorPush'; New-Item -ItemType Directory -Path $d -Force | Out-Null; Join-Path $d $l } -ArgumentList $leaf
                     Copy-Item -LiteralPath $Installer -Destination $dst -ToSession $s -Force
                     $r = Invoke-Command -Session $s -ScriptBlock $run -ArgumentList $dst, $isMsi, $Arguments, $hash
                 } finally { Remove-PSSession $s }
@@ -3013,7 +3121,7 @@ function Invoke-WBaselineAudit([string]$CsvPath) {
                 }
                 'secedit' {
                     if (-not $secedit) {
-                        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('awiper-secedit-{0}.inf' -f [guid]::NewGuid().ToString('N'))
+                        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('computerdoctor-secedit-{0}.inf' -f [guid]::NewGuid().ToString('N'))
                         & secedit.exe /export /cfg $tmp /areas SECURITYPOLICY USER_RIGHTS 2>&1 | Out-Null
                         $secedit = @{}; $sec = ''
                         foreach ($l in (Get-Content -LiteralPath $tmp -ErrorAction SilentlyContinue)) {
@@ -3102,7 +3210,7 @@ function Invoke-WFleetInventory([string[]]$Hosts, [string]$OutRoot) {
         try {
             if ($h -in 'localhost', '.', $env:COMPUTERNAME) { $results.Add((Get-WInventory)); continue }
             $p = @{ ComputerName = $h; ScriptBlock = $wrapper; ArgumentList = @($Sync.WorkerLib); ErrorAction = 'Stop' }
-            $saved = try { [AWiper.CredMan]::Read('AWiper:' + $h.ToLowerInvariant()) } catch { $null }
+            $saved = try { [ComputerDoctor.CredMan]::ReadHost($h) } catch { $null }
             if ($saved) { $p.Credential = New-Object System.Management.Automation.PSCredential($saved[0], (ConvertTo-SecureString $saved[1] -AsPlainText -Force)) }
             $r = Invoke-Command @p 6>$null | Select-Object -Property * -ExcludeProperty PSComputerName, RunspaceId, PSShowComputerName
             $results.Add($r)
@@ -3133,7 +3241,7 @@ function Invoke-WFleetInventory([string[]]$Hosts, [string]$OutRoot) {
     $html = @"
 <!doctype html><html><head><meta charset="utf-8"><title>Fleet inventory $stamp</title>
 <style>body{font-family:Segoe UI,sans-serif;margin:28px;color:#1c2140}table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:7px 9px;border-bottom:1px solid #dde;text-align:left;vertical-align:top}th{color:#667}small{color:#778}</style></head>
-<body><h1>Fleet inventory</h1><p>$($results.Count) PC(s) collected $((Get-Date).ToString('f')) by AWiper. $(if ($prevDir) { "Compared with $($prevDir.Name)." } else { 'First run - nothing to compare with yet.' })</p>
+<body><h1>Fleet inventory</h1><p>$($results.Count) PC(s) collected $((Get-Date).ToString('f')) by Computer Doctor. $(if ($prevDir) { "Compared with $($prevDir.Name)." } else { 'First run - nothing to compare with yet.' })</p>
 <table><tr><th>Computer</th><th>Model</th><th>Windows</th><th>BIOS</th><th>CPU / RAM</th><th>Free on C:</th><th>Security</th><th>Programs</th></tr>
 $($rows -join "`n")</table>
 <h2>Changes since last run</h2>$(if (@($changes).Count) { $chg -join "`n" } else { '<p>None.</p>' })
@@ -3144,16 +3252,36 @@ $fl</body></html>
 }
 
 # ---------------------------------------------------------------- Folder backup (robocopy mirror + versions)
-# Mirrors each source into <Dest>\AWiper-Backup\<COMPUTER>\current\<name>. Before mirroring, files the
+# Backups made before the rename to Computer Doctor are in <Dest>\AWiper-Backup\<COMPUTER>. The first
+# backup after the rename moves that folder to ComputerDoctor-Backup (same drive, so it is instant and
+# keeps the older versions). If it can't be moved, the old folder keeps being used.
+function Get-WBackupRoot([string]$Dest, [switch]$Move) {
+    $root = Join-Path $Dest "ComputerDoctor-Backup\$env:COMPUTERNAME"
+    $old = Join-Path $Dest "AWiper-Backup\$env:COMPUTERNAME"
+    if ((Test-Path -LiteralPath $root) -or -not (Test-Path -LiteralPath $old)) { return $root }
+    if (-not $Move) { return $old }
+    try {
+        New-Item -ItemType Directory -Path (Split-Path $root) -Force | Out-Null
+        [IO.Directory]::Move($old, $root)
+        Write-WLog "Backup: moved the earlier backup from $old to $root"
+        try { [IO.Directory]::Delete((Split-Path $old)) } catch { }   # removes AWiper-Backup only if nothing else is in it
+        $root
+    } catch {
+        Write-WLog "Backup: could not move $old to $root ($($_.Exception.Message)) - using the old folder" 'WARN'
+        $old
+    }
+}
+
+# Mirrors each source into <Dest>\ComputerDoctor-Backup\<COMPUTER>\current\<name>. Before mirroring, files the
 # mirror would overwrite or delete are moved to versions\<timestamp>\ so older copies are kept.
 # Refuses to run if the destination isn't the exact volume chosen when the job was set up.
 function Invoke-WBackup($Job) {
     $res = [ordered]@{ Ok = $false; New = 0; Versioned = 0; Errors = 0; Message = '' }
     if (-not $Job.Dest -or -not (Test-Path -LiteralPath $Job.Dest)) { $res.Message = "The backup drive isn't connected ($($Job.Dest))."; return [pscustomobject]$res }
-    if ($Job.DestVolumeId -and [AWiper.Native]::VolumeId($Job.Dest) -ne $Job.DestVolumeId) {
+    if ($Job.DestVolumeId -and [ComputerDoctor.Native]::VolumeId($Job.Dest) -ne $Job.DestVolumeId) {
         $res.Message = "A different drive is using $($Job.Dest) now - backup skipped to protect it. Reconnect the backup drive or choose it again."; return [pscustomobject]$res
     }
-    $root = Join-Path $Job.Dest "AWiper-Backup\$env:COMPUTERNAME"
+    $root = Get-WBackupRoot $Job.Dest -Move
     $stamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
     $verRoot = Join-Path $root "versions\$stamp"
     foreach ($src in @($Job.Sources)) {
@@ -3231,7 +3359,7 @@ function Get-WWin11Readiness([bool]$Quick = $true) {
         & $add 'TPM' $(if ($isAdmin) { $false } else { $null }) $(if ($isAdmin) { 'No TPM found - it may be switched off in the BIOS (PTT / fTPM)' } else { 'Needs administrator rights to check' })
     }
     if (-not $Quick) {
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('awiper-dx-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('computerdoctor-dx-{0}.txt' -f [guid]::NewGuid().ToString('N'))
         try {
             $p = Start-Process dxdiag.exe -ArgumentList "/whql:off /t `"$tmp`"" -PassThru -WindowStyle Hidden; [void]$p.WaitForExit(60000)
             $txt = Get-Content -LiteralPath $tmp -Raw -ErrorAction Stop
@@ -3297,7 +3425,7 @@ function Get-WSecureBootCerts {
     } elseif ($r.State -eq 'InProgress' -or $r.Capable -eq 1 -or ($latestKey -and $latestKey.Id -in 1801, 1800, 1032)) {
         $r.Status = 'InProgress'; $r.Health = $(if ($r.BitLockerRisk) { 'Warning' } else { 'Info' })
         $r.Summary = 'The Secure Boot certificate update has started' + $(if ($latestKey) { " - last step: $($meaning[$latestKey.Id])" } else { '' })
-        $r.Advice = if ($r.BitLockerRisk) { 'Make sure the BitLocker recovery key is saved, then let AWiper suspend BitLocker for two restarts and finish the update.' } else { 'Restart the PC (twice if asked) to let it finish.' }
+        $r.Advice = if ($r.BitLockerRisk) { 'Make sure the BitLocker recovery key is saved, then let Computer Doctor suspend BitLocker for two restarts and finish the update.' } else { 'Restart the PC (twice if asked) to let it finish.' }
     } else {
         $r.Status = 'NotStarted'; $r.Health = 'Warning'
         $r.Summary = 'This PC still uses the 2011 Secure Boot certificates. They expire in 2026 (the last on Oct 19), after which boot security fixes stop'
@@ -3660,11 +3788,11 @@ function Set-WContextMenuItem($Item, [bool]$Enabled) {
         $keys = if ($Enabled) { @("HKCU:\$sub") + @(if ($isAdmin) { "HKLM:\$sub" }) } else { @(if ($isAdmin) { "HKLM:\$sub" } else { "HKCU:\$sub" }) }
         $vals = @($keys | ForEach-Object { @{ Path = $_; Name = $Item.Clsid } })
     } else {
-        if ($Item.Hive -eq 'HKLM' -and -not $isAdmin) { throw 'This entry is for all users - run AWiper as administrator to change it.' }
+        if ($Item.Hive -eq 'HKLM' -and -not $isAdmin) { throw 'This entry is for all users - run Computer Doctor as administrator to change it.' }
         $vals = @(@{ Path = $Item.Key; Name = 'LegacyDisable' })
     }
     if ($Enabled -and $Item.Kind -eq 'Handler' -and -not $isAdmin -and $null -ne (Get-WRegValue "HKLM:\$sub" $Item.Clsid)) {
-        throw 'This entry is blocked for all users - run AWiper as administrator to turn it back on.'
+        throw 'This entry is blocked for all users - run Computer Doctor as administrator to turn it back on.'
     }
     $snap = @(Get-WRegSnapshot $vals)
     foreach ($v in $vals) {
@@ -3705,9 +3833,9 @@ function Get-WHealth {
                 if ($rc.ReadErrorsUncorrected -gt 0 -or $rc.WriteErrorsUncorrected -gt 0) { $status = 'Problem'; $why += 'uncorrected read/write errors' }
             }
             # NVMe drives: the drive's own SMART / health log (CrystalDiskInfo-level detail, no extra driver).
-            if ("$($d.BusType)" -eq 'NVMe' -and ('AWiper.StorageHealth' -as [type])) {
+            if ("$($d.BusType)" -eq 'NVMe' -and ('ComputerDoctor.StorageHealth' -as [type])) {
                 try {
-                    $nv = [AWiper.StorageHealth]::ReadNvme([int]$d.DeviceId)
+                    $nv = [ComputerDoctor.StorageHealth]::ReadNvme([int]$d.DeviceId)
                     $facts.Clear()
                     $facts.Add("$($nv.PercentUsed)% of rated life used"); $facts.Add("$($nv.TemperatureC) C"); $facts.Add("$($nv.AvailableSpare)% spare")
                     $facts.Add(('{0:N1} TB written' -f $nv.WrittenTB)); $facts.Add(('{0:N0} power-on hours' -f $nv.PowerOnHours))
@@ -3798,7 +3926,7 @@ function Get-WHealth {
     # Battery wear (laptops only).
     try {
         if (@(Get-CimInstance Win32_Battery -ErrorAction Stop).Count) {
-            $xmlPath = Join-Path ([IO.Path]::GetTempPath()) ('awiper-battery-{0}.xml' -f [guid]::NewGuid().ToString('N'))
+            $xmlPath = Join-Path ([IO.Path]::GetTempPath()) ('computerdoctor-battery-{0}.xml' -f [guid]::NewGuid().ToString('N'))
             & powercfg.exe /batteryreport /xml /output $xmlPath 2>&1 | Out-Null
             [xml]$x = Get-Content -LiteralPath $xmlPath -Raw
             Remove-Item -LiteralPath $xmlPath -Force -ErrorAction SilentlyContinue
@@ -3991,7 +4119,7 @@ function Invoke-WClean($Item) {
             }
             'RecycleBin' {
                 $m = Measure-WItem $Item
-                [void][AWiper.Native]::SHEmptyRecycleBin([IntPtr]::Zero, $null, 7)
+                [void][ComputerDoctor.Native]::SHEmptyRecycleBin([IntPtr]::Zero, $null, 7)
                 $res.Files = $m.Files; $res.Bytes = $m.Bytes
             }
             'Action' {
@@ -4084,7 +4212,7 @@ if ($steamLibs.Count) {
 #endregion
 
 #region ---------------------------------------------------------------- Debloat catalog
-# Store apps AWiper knows about. Pattern is matched against the package Name with -like.
+# Store apps Computer Doctor knows about. Pattern is matched against the package Name with -like.
 # Recommended = pre-checked. Anything not listed only appears with "Show all apps".
 function A([string]$Pattern, [string]$Name, [string]$Category, [bool]$Recommended = $true, [string]$Note = '') {
     @{ Pattern = $Pattern; Name = $Name; Category = $Category; Recommended = $Recommended; Note = $Note }
@@ -4276,16 +4404,20 @@ function Test-AWInternet {
     } catch { return $false }
 }
 
-# A Resources folder holds everything AWiper needs offline: ISO\ (Windows media), updates\, defs\,
-# drivers\, apps\, appx\, LOF\, tools\. It can live next to AWiper.ps1, on any drive as
-# <drive>:\AWiper\Resources (handy on a USB stick), or anywhere chosen in Tools.
+# A Resources folder holds everything Computer Doctor needs offline: ISO\ (Windows media), updates\, defs\,
+# drivers\, apps\, appx\, LOF\, tools\. It can live next to ComputerDoctor.ps1, on any drive as
+# <drive>:\ComputerDoctor\Resources (handy on a USB stick; <drive>:\AWiper\Resources from before the
+# rename is still found), or anywhere chosen in Tools.
 function Find-AWResources {
     $cands = New-Object System.Collections.Generic.List[string]
     if ($Resources) { $cands.Add($Resources) }
     if ($script:State.ResourcesPath) { $cands.Add($script:State.ResourcesPath) }
     if ($PSCommandPath) { $cands.Add((Join-Path (Split-Path $PSCommandPath) 'Resources')) }
     foreach ($d in [IO.DriveInfo]::GetDrives()) {
-        if (("$($d.DriveType)" -eq 'Fixed' -or "$($d.DriveType)" -eq 'Removable') -and $d.IsReady) { $cands.Add((Join-Path $d.RootDirectory.FullName 'AWiper\Resources')) }
+        if (("$($d.DriveType)" -eq 'Fixed' -or "$($d.DriveType)" -eq 'Removable') -and $d.IsReady) {
+            $cands.Add((Join-Path $d.RootDirectory.FullName 'ComputerDoctor\Resources'))
+            $cands.Add((Join-Path $d.RootDirectory.FullName 'AWiper\Resources'))   # USB sticks set up before the rename to Computer Doctor
+        }
     }
     foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c -PathType Container)) { return (Resolve-Path -LiteralPath $c).ProviderPath } }
     $null
@@ -4307,7 +4439,7 @@ function Get-AWRepairMedia([string]$Root) {
 function New-AWResourceLayout([string]$Root) {
     foreach ($d in $script:ResourceDirs) { New-Item -ItemType Directory -Path (Join-Path $Root $d) -Force | Out-Null }
     @'
-AWiper Resources folder - everything AWiper needs to work without internet.
+Computer Doctor Resources folder - everything Computer Doctor needs to work without internet.
 
   ISO\       Windows install media matching your PCs (an .iso, or its extracted files).
              Used for "Repair Windows image" and ".NET Framework 3.5" with no internet.
@@ -4318,8 +4450,8 @@ AWiper Resources folder - everything AWiper needs to work without internet.
   apps\      Installers; appx\  Store app packages (.msixbundle / .appx) with dependencies.
   tools\     Your own utilities (e.g. Sysinternals - they can't be redistributed, so bring your own copy).
 
-Put this folder next to AWiper.ps1, or at <drive>:\AWiper\Resources on a USB stick, and AWiper finds it.
-Use "Build manifest" in AWiper's Tools on a trusted copy, then "Verify" on other machines to detect
+Put this folder next to ComputerDoctor.ps1, or at <drive>:\ComputerDoctor\Resources on a USB stick, and Computer Doctor finds it.
+Use "Build manifest" in Computer Doctor's Tools on a trusted copy, then "Verify" on other machines to detect
 missing or tampered files (SHA-256).
 '@ | Set-Content -LiteralPath (Join-Path $Root 'README.txt') -Encoding UTF8
 }
@@ -4429,7 +4561,7 @@ function Invoke-AWCli {
     if ($ComputerName) {
         $cred = $Credential
         if (-not $cred -and $UseSavedCredential) {
-            $saved = try { [AWiper.CredMan]::Read('AWiper:' + $ComputerName.ToLowerInvariant()) } catch { $null }
+            $saved = try { [ComputerDoctor.CredMan]::ReadHost($ComputerName) } catch { $null }
             if (-not $saved) { Write-Host "No saved credentials for $ComputerName in Credential Manager." -ForegroundColor Red; return 2 }
             $cred = New-Object System.Management.Automation.PSCredential($saved[0], (ConvertTo-SecureString $saved[1] -AsPlainText -Force))
         }
@@ -4445,7 +4577,7 @@ function Invoke-AWCli {
     $remote = [bool]$Target
     $canAdmin = $script:IsAdmin -or $remote
     $wantsChanges = [bool]$Backup -or [bool]$Fetch -or ($want.Clean.Count -and -not $want.Analyze) -or $want.ApplyTweaks.Count -or $want.RevertTweaks.Count -or $want.RemoveApps.Count -or $want.RestorePoint
-    Write-AWCli ("AWiper {0} - {1}{2}{3}" -f $script:AppVersion, $result.Target, $(if ($remote) { ' (remote)' } else { '' }), $(if ($wantsChanges -and -not $Yes) { ' - preview only, add -Yes to make changes' } else { '' })) Cyan
+    Write-AWCli ("Computer Doctor {0} - {1}{2}{3}" -f $script:AppVersion, $result.Target, $(if ($remote) { ' (remote)' } else { '' }), $(if ($wantsChanges -and -not $Yes) { ' - preview only, add -Yes to make changes' } else { '' })) Cyan
     if ($script:ElevationNote -and -not $remote) { Write-AWCli $script:ElevationNote Yellow }
 
     # ---- listings
@@ -4678,7 +4810,7 @@ if ($script:CliMode) {
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="AWiper" Width="1320" Height="840" MinWidth="1080" MinHeight="680"
+        Title="Computer Doctor" Width="1320" Height="840" MinWidth="1080" MinHeight="680"
         WindowStartupLocation="CenterScreen" Background="#0B0D12"
         FontFamily="Segoe UI" FontSize="13" Foreground="#E6E9F0"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
@@ -5269,14 +5401,14 @@ if ($script:CliMode) {
           <Border Width="32" Height="32" CornerRadius="10" Background="{StaticResource TealGrad}">
             <TextBlock Text="&#xE945;" Style="{StaticResource Icon}" FontSize="16" Foreground="White" HorizontalAlignment="Center"/>
           </Border>
-          <TextBlock Text="AWiper" FontSize="21" FontWeight="Bold" Margin="11,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource BrandGrad}"/>
+          <TextBlock Text="Computer Doctor" FontSize="17" FontWeight="Bold" Margin="9,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource BrandGrad}"/>
           <TextBlock x:Name="VersionText" Text="v1.0" Foreground="{StaticResource DimBrush}" FontSize="11" Margin="7,6,0,0" VerticalAlignment="Center"/>
         </StackPanel>
         <TextBlock x:Name="ViewTitle" Grid.Column="1" Text="Dashboard" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"
                    VerticalAlignment="Center" Margin="14,0,0,0"/>
         <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,0">
           <Button x:Name="TargetBtn" Margin="0,0,10,0" Padding="11,5" FontSize="12" WindowChrome.IsHitTestVisibleInChrome="True"
-                  ToolTip="Choose which computer AWiper works on">
+                  ToolTip="Choose which computer Computer Doctor works on">
             <StackPanel Orientation="Horizontal">
               <TextBlock x:Name="TargetIcon" Text="&#xE7F4;" Style="{StaticResource Icon}" FontSize="12" Foreground="{StaticResource TealBrush}"/>
               <TextBlock x:Name="TargetText" Text="This PC" Margin="7,0,0,0"/>
@@ -6154,7 +6286,7 @@ if ($script:CliMode) {
                       <Button x:Name="ShadowFind" Grid.Column="2" Content="Find deleted files" Style="{StaticResource BtnAccent}" Padding="14,6" FontSize="12"/>
                     </Grid>
                     <Grid DockPanel.Dock="Bottom" Margin="0,10,0,0">
-                      <TextBlock x:Name="ShadowInfo" Text="Pick a snapshot, enter a folder, and AWiper lists files that existed then but are gone now."
+                      <TextBlock x:Name="ShadowInfo" Text="Pick a snapshot, enter a folder, and Computer Doctor lists files that existed then but are gone now."
                                  Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="4,0,280,0"/>
                       <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                         <Button x:Name="ShadowCopyTo" Content="Copy checked to..." Style="{StaticResource BtnChip}"/>
@@ -6291,7 +6423,7 @@ if ($script:CliMode) {
                       <TextBlock Text="New restore point" Style="{StaticResource H2}"/>
                       <TextBox x:Name="RPDesc" Tag="Description, e.g. Before installing drivers" Margin="0,10,0,8"/>
                       <Button x:Name="RPCreate" Content="Create restore point" Style="{StaticResource BtnAccent}" Padding="14,6" FontSize="12" HorizontalAlignment="Left"/>
-                      <TextBlock Text="AWiper works around Windows' one-per-24-hours limit for restore points you create here."
+                      <TextBlock Text="Computer Doctor works around Windows' one-per-24-hours limit for restore points you create here."
                                  Style="{StaticResource Muted}" FontSize="11.5" Margin="0,8,0,0"/>
 
                       <TextBlock Text="PROTECTION" Style="{StaticResource Caps}" Margin="0,18,0,6"/>
@@ -6431,7 +6563,7 @@ if ($script:CliMode) {
                     </Border>
                     <TextBlock Style="{StaticResource Muted}" FontSize="12.5" Margin="0,10,0,0" LineHeight="20">
                       <Run Text="1.  Stop using the drive. Every file written can overwrite what you want back."/><LineBreak/>
-                      <Run Text="2.  Save recovered files to a different drive - AWiper will not let you pick the same one."/><LineBreak/>
+                      <Run Text="2.  Save recovered files to a different drive - Computer Doctor will not let you pick the same one."/><LineBreak/>
                       <Run Text="3.  Try Regular mode first for files deleted recently from an NTFS drive. Use Extensive for USB sticks, SD cards, formatted drives or older deletions."/><LineBreak/>
                       <Run Text="4.  Internal SSDs usually erase deleted data within minutes (TRIM), so deep scans there rarely find anything. Check the Recycle Bin and previous versions first."/><LineBreak/>
                       <Run Text="5.  If the drive clicks, disconnects or shows read errors, stop and have it imaged before trying again."/>
@@ -6706,7 +6838,7 @@ if ($script:CliMode) {
                 <StackPanel>
                   <TextBlock Text="BIOS and firmware" Style="{StaticResource H2}"/>
                   <TextBlock x:Name="BiosSummary" Text="Reading firmware settings..." Style="{StaticResource Muted}" Margin="0,4,0,0"/>
-                  <TextBlock Text="View only - AWiper never changes BIOS settings." Style="{StaticResource Muted}" FontSize="11.5" Margin="0,4,0,0"/>
+                  <TextBlock Text="View only - Computer Doctor never changes BIOS settings." Style="{StaticResource Muted}" FontSize="11.5" Margin="0,4,0,0"/>
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                   <Button x:Name="BiosRefresh" Content="Refresh" Style="{StaticResource BtnChip}"/>
@@ -6904,7 +7036,7 @@ if ($script:CliMode) {
                 <DockPanel>
                   <StackPanel DockPanel.Dock="Top">
                     <TextBlock Text="Install software on several PCs" Style="{StaticResource H2}"/>
-                    <TextBlock Text="AWiper copies the installer to each PC first, checks its hash, runs it silently there and reports the result - no file share or extra credentials hop needed. Works offline on your network."
+                    <TextBlock Text="Computer Doctor copies the installer to each PC first, checks its hash, runs it silently there and reports the result - no file share or extra credentials hop needed. Works offline on your network."
                                Style="{StaticResource Muted}" Margin="0,4,0,8" TextWrapping="Wrap"/>
                     <Grid Margin="0,4,0,0">
                       <Grid.ColumnDefinitions><ColumnDefinition Width="110"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
@@ -7320,10 +7452,10 @@ $script:Res = @{
 $ErrorActionPreference = 'Continue'
 
 function Show-AWMessage([string]$Text, [string]$Icon = 'Information') {
-    [void][System.Windows.MessageBox]::Show($window, $Text, 'AWiper', 'OK', $Icon)
+    [void][System.Windows.MessageBox]::Show($window, $Text, 'Computer Doctor', 'OK', $Icon)
 }
 function Confirm-AW([string]$Text) {
-    ([System.Windows.MessageBox]::Show($window, $Text, 'AWiper', 'YesNo', 'Warning')) -eq 'Yes'
+    ([System.Windows.MessageBox]::Show($window, $Text, 'Computer Doctor', 'YesNo', 'Warning')) -eq 'Yes'
 }
 function Open-AWExplorer([string]$Path) {
     if (Test-Path -LiteralPath $Path -PathType Leaf) { Start-Process explorer.exe -ArgumentList "/select,`"$Path`"" }
@@ -7513,7 +7645,7 @@ if ($script:IsAdmin) {
 }
 $ui.BtnElevate.Add_Click({
     if (Invoke-AWElevation) { $window.Close() }
-    else { Show-AWMessage 'Elevation was cancelled. AWiper will keep running with standard permissions.' }
+    else { Show-AWMessage 'Elevation was cancelled. Computer Doctor will keep running with standard permissions.' }
 })
 #endregion
 
@@ -7640,7 +7772,7 @@ function Update-AWDashboard {
     }
 
     $ui.HomeFreed.Text  = Format-AWSize $script:State.TotalFreed
-    $ui.HomeCleans.Text = '{0} clean{1} with AWiper' -f $script:State.Cleans, $(if ($script:State.Cleans -eq 1) { '' } else { 's' })
+    $ui.HomeCleans.Text = '{0} clean{1} with Computer Doctor' -f $script:State.Cleans, $(if ($script:State.Cleans -eq 1) { '' } else { 's' })
     if ($script:State.LastClean) {
         try {
             $dt = [datetime]::Parse($script:State.LastClean, [Globalization.CultureInfo]::InvariantCulture)
@@ -7808,7 +7940,7 @@ function Start-AWClean {
     if (@($rules | Where-Object { $_.Kind -eq 'RecycleBin' }).Count) { $warn += 'WARNING: the Recycle Bin will be emptied PERMANENTLY. Its items can no longer be restored (not even from Recovery > Recycle Bin).' }
     if (@($rules | Where-Object { $_.Id -eq 'MemDumps' }).Count) { $warn += 'WARNING: system memory dumps will be deleted. The Crashes tab can no longer analyze those past blue screens.' }
     $warnText = if ($warn.Count) { "`n`n" + ($warn -join "`n`n") } else { '' }
-    if (-not (Confirm-AW "AWiper will permanently delete the files matched by these rules$($where) (nothing goes to the Recycle Bin):`n`n$names$warnText`n`nFiles that are in use are skipped. Continue?")) { return }
+    if (-not (Confirm-AW "Computer Doctor will permanently delete the files matched by these rules$($where) (nothing goes to the Recycle Bin):`n`n$names$warnText`n`nFiles that are in use are skipped. Continue?")) { return }
     Set-AWCleanerBusy $true
     $ui.CleanSummary.Text = 'Cleaning...'
     $ui.CleanSubtext.Text = 'Removing files. Locked files are skipped automatically.'
@@ -7916,7 +8048,7 @@ function Set-AWMapCurrent($Node) {
 }
 
 function Add-AWTreeMapLevel($Node, [double]$X, [double]$Y, [double]$W, [double]$H, [int]$Depth) {
-    $rects = [AWiper.Treemap]::Layout($Node.Children, $X, $Y, $W, $H)
+    $rects = [ComputerDoctor.Treemap]::Layout($Node.Children, $X, $Y, $W, $H)
     foreach ($r in $rects) {
         if ($script:MapElementCount -gt 4000) { return }
         if ($r.W -lt 3 -or $r.H -lt 3) { continue }
@@ -8005,7 +8137,7 @@ function Get-AWKindStats($ExtensionList) {
     $max = ($tot.Values | Measure-Object -Maximum).Maximum
     $plural = @{ Installer = 'Installers'; 'Disk image' = 'Disk images'; Archive = 'Archives'; Video = 'Videos'; Picture = 'Pictures'; Document = 'Documents' }
     foreach ($k in ($tot.Keys | Sort-Object { $tot[$_] } -Descending)) {
-        $x = New-Object AWiper.ExtStat
+        $x = New-Object ComputerDoctor.ExtStat
         $x.Extension = if ($plural[$k]) { $plural[$k] } else { $k }
         $x.Size = $tot[$k]; $x.Count = $cnt[$k]; $x.Percent = $tot[$k] * 100.0 / $all; $x.RelPercent = $tot[$k] * 100.0 / $max
         $x
@@ -8072,7 +8204,7 @@ function Start-AWMapScan([string]$Path) {
         }
     } catch { }
 
-    $script:Scanner = New-Object AWiper.DiskScanner
+    $script:Scanner = New-Object ComputerDoctor.DiskScanner
     $Sync.Scanning = $true
     $ui.MapScan.IsEnabled = $false; $ui.MapStop.IsEnabled = $true; $ui.LargeScan.IsEnabled = $false
     $ui.MapCanvas.Children.Clear(); $ui.MapHint.Visibility = 'Collapsed'
@@ -8109,7 +8241,7 @@ function Start-AWRemoteMapScan([string]$Path) {
     $script:ScanExpected = 0
     if ($Path.Length -le 3) { $d = $script:RemoteDrives | Where-Object { $_.Letter -eq $drive } | Select-Object -First 1; if ($d) { $script:ScanExpected = $d.Used } }
     $ui.MapKindList.ItemsSource = $null
-    $script:Scanner = New-Object AWiper.DiskScanner
+    $script:Scanner = New-Object ComputerDoctor.DiskScanner
     $script:ScanRemote = [pscustomobject]@{ Host = $t.Host; ComputerName = $t.ComputerName; Via = 'share' }
     $Sync.Scanning = $true; $Sync.ScanVia = 'Connecting'
     $ui.MapScan.IsEnabled = $false; $ui.MapStop.IsEnabled = $true; $ui.LargeScan.IsEnabled = $false
@@ -8125,7 +8257,7 @@ function Start-AWRemoteMapScan([string]$Path) {
             if ($Target.Credential) {
                 $c = $Target.Credential.GetNetworkCredential()
                 $u = if ($c.Domain) { "$($c.Domain)\$($c.UserName)" } else { $c.UserName }
-                $rc = [AWiper.Native]::ConnectShare($share, $u, $c.Password)
+                $rc = [ComputerDoctor.Native]::ConnectShare($share, $u, $c.Password)
                 if ($rc -and $rc -ne 1219) { Write-WLog "Could not connect to $share (error $rc) - scanning over WinRM instead" 'WARN' }
             }
             $ok = [IO.Directory]::Exists($unc)
@@ -8135,8 +8267,8 @@ function Start-AWRemoteMapScan([string]$Path) {
         $Sync.ScanVia = 'WinRM'; $Sync.Status = "Scanning $LocalPath on $($Target.ComputerName) over WinRM (no live progress; large drives take a few minutes)..."
         $text = Invoke-WTarget {
             param($Src, $P)
-            if (-not ('AWiper.DiskScanner' -as [type])) { Add-Type -TypeDefinition $Src }
-            $s = New-Object AWiper.DiskScanner
+            if (-not ('ComputerDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $Src }
+            $s = New-Object ComputerDoctor.DiskScanner
             [void]$s.Scan($P)
             $s.Export([Math]::Max(1MB, [long]($s.Root.Size / 40000)))
         } -ArgumentList $CsSrc, $LocalPath
@@ -8146,7 +8278,7 @@ function Start-AWRemoteMapScan([string]$Path) {
         $r = @($Result | Where-Object { $_ -and $_.Via }) | Select-Object -Last 1
         if ($r.Via -eq 'WinRM') {
             if ($r.Text) {
-                $script:Scanner = [AWiper.DiskScanner]::Import($r.Text)
+                $script:Scanner = [ComputerDoctor.DiskScanner]::Import($r.Text)
                 # Paths come back in the remote PC's own form (C:\...).
                 $script:ScanRemote.Via = 'WinRM'
             } else { $script:Scanner = $null }
@@ -8215,7 +8347,7 @@ function Send-AWToRecycle([string]$Path) {
 function Remove-AWMapNodeToRecycle($Node) {
     if (-not $Node -or $Node.IsGroup -or -not $Node.Parent) { return }
     if ($script:ScanRemote) {
-        if (Test-AWProtectedRemotePath $Node.FullPath) { Show-AWMessage "AWiper won't remove protected system locations:`n$($Node.FullPath)" 'Warning'; return }
+        if (Test-AWProtectedRemotePath $Node.FullPath) { Show-AWMessage "Computer Doctor won't remove protected system locations:`n$($Node.FullPath)" 'Warning'; return }
         if (-not (Confirm-AW ("PERMANENTLY delete this {0} on {1}?`n`n{2}`n{3}`n`nFiles on another PC don't go to a Recycle Bin - this can't be undone." -f $Node.Kind.ToLower(), $script:ScanRemote.ComputerName, $Node.FullPath, $Node.SizeText))) { return }
         $script:PendingMapNode = $Node
         Remove-AWRemoteScanItems @($Node.FullPath) {
@@ -8225,7 +8357,7 @@ function Remove-AWMapNodeToRecycle($Node) {
         }
         return
     }
-    if (Test-AWProtectedPath $Node.FullPath) { Show-AWMessage "AWiper won't remove protected system locations:`n$($Node.FullPath)" 'Warning'; return }
+    if (Test-AWProtectedPath $Node.FullPath) { Show-AWMessage "Computer Doctor won't remove protected system locations:`n$($Node.FullPath)" 'Warning'; return }
     if (-not (Confirm-AW ("Send this {0} to the Recycle Bin?`n`n{1}`n{2}" -f $Node.Kind.ToLower(), $Node.FullPath, $Node.SizeText))) { return }
     try {
         Send-AWToRecycle $Node.FullPath
@@ -8399,7 +8531,7 @@ function Build-AWOldFolderMenu {
         $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
         $dlg.Description = 'Choose another folder to look for old files in'
         if ($dlg.ShowDialog() -eq 'OK' -and $script:State.OldFolders -notcontains $dlg.SelectedPath) {
-            if (Test-AWProtectedPath $dlg.SelectedPath) { Show-AWMessage "AWiper won't look for old files in system locations:`n$($dlg.SelectedPath)" 'Warning'; return }
+            if (Test-AWProtectedPath $dlg.SelectedPath) { Show-AWMessage "Computer Doctor won't look for old files in system locations:`n$($dlg.SelectedPath)" 'Warning'; return }
             $script:State.OldFolders = @($script:State.OldFolders) + $dlg.SelectedPath
             Save-AWState; Update-AWOldFolderButton; Build-AWOldFolderMenu
         }
@@ -8424,7 +8556,7 @@ $ui.OldFind.Add_Click({
         $script:OldFiles.Clear(); $script:OldSearched = $true
         $ticked = 0
         foreach ($x in @($r | Sort-Object Size -Descending)) {
-            $fe = New-Object AWiper.FileEntry
+            $fe = New-Object ComputerDoctor.FileEntry
             $fe.Name = $x.Name; $fe.FullPath = $x.Path; $fe.Folder = $x.Folder; $fe.Size = $x.Size; $fe.Extension = $x.Extension; $fe.Modified = $x.Modified
             $fe.Status = '{0}{1} - {2}' -f $x.Kind, $(if ($x.Extracted) { ' (already extracted)' } else { '' }), $x.Root
             # Only the obvious leftovers are pre-ticked: installers and disk images in Downloads, and archives already extracted.
@@ -8453,7 +8585,7 @@ $ui.DupeFind.Add_Click({
     $ui.DupeFind.IsEnabled = $false; $ui.DupeStop.IsEnabled = $true
     $Sync.DupeCancel = $false
     if ($ui.DupeExact.IsChecked) {
-        $script:Dupes = New-Object AWiper.DuplicateFinder
+        $script:Dupes = New-Object ComputerDoctor.DuplicateFinder
         $script:DupeRunning = $true
         Start-AWTask -Name "Finding duplicates in $path" -Arguments @{ Finder = $script:Dupes; Root = $path } -Work { $Finder.Scan($Root, 1024) } -OnComplete {
             param($r)
@@ -8491,7 +8623,7 @@ $ui.DupeFind.Add_Click({
                     $hashes.Add($h); $keep.Add($f)
                 } catch { }
             }
-            $groups = [AWiper.PhotoMatch]::Group($hashes.ToArray(), 8)
+            $groups = [ComputerDoctor.PhotoMatch]::Group($hashes.ToArray(), 8)
             $out = New-Object System.Collections.Generic.List[object]
             $n = 0
             foreach ($grp in @(0..($keep.Count - 1) | Where-Object { $keep.Count } | Group-Object { $groups[$_] } | Where-Object Count -gt 1)) {
@@ -8505,7 +8637,7 @@ $ui.DupeFind.Add_Click({
             $r = @($r)[0]
             if (-not $r) { $script:DupeNote = 'Search failed - see the log'; Update-AWLargeList; return }
             foreach ($x in $r.Files) {
-                $fe = New-Object AWiper.FileEntry
+                $fe = New-Object ComputerDoctor.FileEntry
                 $fe.Name = $x.Name; $fe.FullPath = $x.Path; $fe.Folder = $x.Folder; $fe.Size = $x.Size; $fe.Extension = $x.Extension; $fe.Modified = $x.Modified; $fe.Status = $x.Group
                 $script:DupeFiles.Add($fe)
             }
@@ -8582,7 +8714,7 @@ $ui.LargeExport.Add_Click({
     if (-not $src -or -not $src.Count) { Show-AWMessage 'Nothing to export yet.'; return }
     $dlg = New-Object Microsoft.Win32.SaveFileDialog
     $dlg.Filter = 'CSV file (*.csv)|*.csv'
-    $dlg.FileName = 'AWiper-{0}-{1:yyyyMMdd-HHmm}.csv' -f @{ Largest = 'LargeFiles'; Old = 'OldFiles'; Dupes = 'Duplicates' }[$script:LargeTab], (Get-Date)
+    $dlg.FileName = 'ComputerDoctor-{0}-{1:yyyyMMdd-HHmm}.csv' -f @{ Largest = 'LargeFiles'; Old = 'OldFiles'; Dupes = 'Duplicates' }[$script:LargeTab], (Get-Date)
     if ($dlg.ShowDialog($window)) {
         $src | Select-Object Name, Size, SizeText, Extension, ModifiedText, Status, FullPath |
             Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding UTF8
@@ -8595,7 +8727,7 @@ $ui.LargeExport.Add_Click({
 #region ---------------------------------------------------------------- Startup manager
 # The list is read and changed by Get-WStartupItems / Set-WStartupState in the worker library, so it
 # works on a remote PC too. There, only all-users entries are shown: "current user" over WinRM would
-# be the admin account AWiper connected with, not the person who uses that PC.
+# be the admin account Computer Doctor connected with, not the person who uses that PC.
 function Update-AWStartupList {
     $remote = Test-AWRemote
     $ui.StartupInfo.Text = 'Reading startup entries...'
@@ -8607,7 +8739,7 @@ function Update-AWStartupList {
         $ui.StartupList.ItemsSource = $items
         $on = @($items | Where-Object { $_.Enabled }).Count
         $ui.StartupInfo.Text = "$($items.Count) startup entries, $on enabled. Disabled items stay installed, they just won't launch at sign-in." +
-            $(if (Test-AWRemote) { " Showing entries for all users on $($script:Target.ComputerName); each user's own entries are only listed when AWiper runs on that PC." } elseif (-not $script:IsAdmin) { ' All-users entries need admin rights to change.' } else { '' })
+            $(if (Test-AWRemote) { " Showing entries for all users on $($script:Target.ComputerName); each user's own entries are only listed when Computer Doctor runs on that PC." } elseif (-not $script:IsAdmin) { ' All-users entries need admin rights to change.' } else { '' })
     }
 }
 
@@ -8770,7 +8902,7 @@ function Update-AWProgramList {
         foreach ($r in $raw) {
             [pscustomobject]@{
                 Name = $r.Name; Publisher = $r.Publisher; Version = $r.Version; Installed = $r.Installed
-                SizeBytes = [long]$r.SizeBytes; SizeText = $(if ($r.SizeBytes) { [AWiper.Fmt]::Size([long]$r.SizeBytes) } else { '' })
+                SizeBytes = [long]$r.SizeBytes; SizeText = $(if ($r.SizeBytes) { [ComputerDoctor.Fmt]::Size([long]$r.SizeBytes) } else { '' })
                 Scope = $r.Scope; Uninstall = $r.Uninstall; Location = $r.Location
             }
         }
@@ -8815,9 +8947,9 @@ function Restart-AWExplorer {
     Write-AWLog 'Explorer restarted'; Set-AWStatus 'Explorer restarted'
 }
 
-function Start-AWRestorePoint([string]$Description = 'AWiper checkpoint') {
+function Start-AWRestorePoint([string]$Description = 'Computer Doctor checkpoint') {
     if (-not (Test-AWCanAdmin)) { Show-AWMessage 'Creating a restore point needs administrator rights.'; return }
-    if (-not $Description) { $Description = 'AWiper checkpoint' }
+    if (-not $Description) { $Description = 'Computer Doctor checkpoint' }
     Start-AWTask -Name 'Create restore point' -Arguments @{ Desc = $Description } -Work {
         $Sync.Status = 'Creating System Restore point...'
         try { [bool](@(Invoke-WTarget { param($d) New-WRestorePoint $d } -ArgumentList @($Desc)) | Select-Object -Last 1) }
@@ -8834,7 +8966,7 @@ function Start-AWRestorePoint([string]$Description = 'AWiper checkpoint') {
 # DISM repair or .NET 3.5 install from Windows media in the Resources folder (local PC, no internet).
 function Start-AWOfflineRepair([string]$Kind, $Media) {
     $what = if ($Kind -eq 'NetFx3') { 'Install .NET Framework 3.5' } else { 'Repair the Windows image' }
-    if (-not (Confirm-AW "$what using $($Media.Name) from the Resources folder?`n`nNo internet is used. AWiper picks the image that matches this PC's edition and warns if the media is older than this PC's updates. This can take 10-30 minutes.")) { return }
+    if (-not (Confirm-AW "$what using $($Media.Name) from the Resources folder?`n`nNo internet is used. Computer Doctor picks the image that matches this PC's edition and warns if the media is older than this PC's updates. This can take 10-30 minutes.")) { return }
     Write-AWAction $(if ($Kind -eq 'NetFx3') { 'NetFx3Offline' } else { 'DismRepairOffline' }) @($Media.Path) @{} 'Started'
     $path = $Media.Path -replace "'", "''"
     $step = if ($Kind -eq 'NetFx3') {
@@ -8925,7 +9057,7 @@ function Update-AWAppList {
                 foreach ($x in $Protected) { if ($p.Name -like $x) { $prot = $true; break } }
                 if ($prot) { continue }
             }
-            $e = New-Object AWiper.AppEntry
+            $e = New-Object ComputerDoctor.AppEntry
             $e.Package = $p.Name; $e.FullName = $p.FullName; $e.Version = $p.Version; $e.Publisher = $p.Publisher; $e.Provisioned = $p.Prov
             if ($match) { $e.Name = $match.Name; $e.Category = $match.Category; $e.Recommended = $match.Recommended; $e.Note = $match.Note }
             else { $e.Name = $p.Name -replace '^[^.]+\.(?=.)', ''; $e.Category = 'Other'; $e.Note = "Version $($p.Version)" }
@@ -9071,7 +9203,7 @@ function Update-AWRebloatView {
     $q = $ui.RebloatSearch.Text.Trim()
     $items = @(if ($q) { $script:RebloatApps | Where-Object { $_.Name -like "*$q*" -or $_.Package -like "*$q*" } } else { $script:RebloatApps })
     $ui.RebloatList.ItemsSource = $items
-    $ui.RebloatInfo.Text = if ($script:RebloatApps.Count) { '{0} app(s) can be put back' -f $items.Count } else { 'Every app AWiper knows about is installed.' }
+    $ui.RebloatInfo.Text = if ($script:RebloatApps.Count) { '{0} app(s) can be put back' -f $items.Count } else { 'Every app Computer Doctor knows about is installed.' }
     if ((Test-AWOffline) -and $script:RebloatApps.Count) {
         $ui.RebloatInfo.Text += ' - offline: only apps marked "Windows copy" or "Resources" can come back now'
     }
@@ -9118,7 +9250,7 @@ function Update-AWRebloatList {
             $pkg = @($disk.Keys | Where-Object { $_ -like $c.Pattern }) | Select-Object -First 1
             $sid = $StoreIds[$c.Pattern]
             if (-not $pkg -and $Retired -contains $c.Pattern) { continue }
-            $e = New-Object AWiper.AppEntry
+            $e = New-Object ComputerDoctor.AppEntry
             $e.Name = $c.Name; $e.Category = $c.Category; $e.Note = $c.Note; $e.StoreId = $sid
             $e.Package = if ($pkg) { $pkg } else { $c.Pattern }
             # A package staged by Fetch in Resources\appx\<name>\ (bundle + Dependencies) works without internet.
@@ -9135,7 +9267,7 @@ function Update-AWRebloatList {
         }
     } -OnComplete {
         param($Result)
-        $script:RebloatApps = @($Result | Where-Object { $_ -is [AWiper.AppEntry] } | Sort-Object Category, Name)
+        $script:RebloatApps = @($Result | Where-Object { $_ -is [ComputerDoctor.AppEntry] } | Sort-Object Category, Name)
         $ui.RebloatInstall.IsEnabled = $true
         Update-AWRebloatView
         if (-not $script:IsAdmin -and $script:RebloatApps.Count) { $ui.RebloatInfo.Text += ' - run as admin to also use copies already on disk' }
@@ -9148,7 +9280,7 @@ function Start-AWRebloat {
     if (Test-AWOffline) {
         $net = @($sel | Where-Object { $_.Source -notin 'Windows copy', 'Resources' })
         if ($net.Count) {
-            if ($net.Count -eq $sel.Count) { Show-AWMessage "These apps can only come back from the Microsoft Store, and this PC is offline.`n`nConnect to the internet (or turn off offline mode), or run AWiper as admin to find copies still on disk."; return }
+            if ($net.Count -eq $sel.Count) { Show-AWMessage "These apps can only come back from the Microsoft Store, and this PC is offline.`n`nConnect to the internet (or turn off offline mode), or run Computer Doctor as admin to find copies still on disk."; return }
             Write-AWLog "Offline: skipping $($net.Count) app(s) that need the Microsoft Store" 'WARN'
             $sel = @($sel | Where-Object { $_.Source -in 'Windows copy', 'Resources' })
         }
@@ -9263,8 +9395,8 @@ $ui.RebloatRevert.Add_Click({
 $script:ConnPending = $null
 $script:ConnLoadedSaved = $null
 
-function Get-AWCredTarget([string]$TargetHost) { 'AWiper:' + $TargetHost.ToLowerInvariant() }
-function Get-AWSavedCred([string]$TargetHost) { try { [AWiper.CredMan]::Read((Get-AWCredTarget $TargetHost)) } catch { $null } }
+function Get-AWCredTarget([string]$TargetHost) { [ComputerDoctor.CredMan]::Prefix + $TargetHost.ToLowerInvariant() }
+function Get-AWSavedCred([string]$TargetHost) { try { [ComputerDoctor.CredMan]::ReadHost($TargetHost) } catch { $null } }
 
 # Short names get the domain appended; IPs and FQDNs are used as typed.
 function Resolve-AWHost {
@@ -9288,7 +9420,7 @@ function Show-AWConnMsg([string]$Text, [bool]$Trust = $false) {
 function Update-AWRecentChips {
     $ui.ConnRecent.Children.Clear()
     $saved = @()
-    try { $saved = @([AWiper.CredMan]::List('AWiper:*') | ForEach-Object { $_.Substring(7) }) } catch { }
+    try { $saved = @([ComputerDoctor.CredMan]::List([ComputerDoctor.CredMan]::Prefix + '*') | ForEach-Object { $_.Substring([ComputerDoctor.CredMan]::Prefix.Length) }) } catch { }
     $hosts = @(@($script:State.RecentTargets) + $saved | Where-Object { $_ } | Select-Object -Unique | Select-Object -First 8)
     foreach ($h in $hosts) {
         $b = New-Object System.Windows.Controls.Button
@@ -9351,13 +9483,13 @@ function Update-AWTargetUI {
         $ui.TargetIcon.Foreground = $script:Res.Purple
         $ui.TargetBtn.BorderBrush = $script:Res.Purple
         $ui.TargetBtn.ToolTip = "Working on $($script:Target.ComputerName) ($($script:Target.OS)) as $($script:Target.User)`nClick to change"
-        $window.Title = "AWiper - $($script:Target.ComputerName)"
+        $window.Title = "Computer Doctor - $($script:Target.ComputerName)"
     } else {
         $ui.TargetText.Text = 'This PC'
         $ui.TargetIcon.Foreground = $script:Res.Teal
         $ui.TargetBtn.ClearValue([System.Windows.Controls.Control]::BorderBrushProperty)
-        $ui.TargetBtn.ToolTip = 'Choose which computer AWiper works on'
-        $window.Title = 'AWiper'
+        $ui.TargetBtn.ToolTip = 'Choose which computer Computer Doctor works on'
+        $window.Title = 'Computer Doctor'
     }
 }
 
@@ -9454,7 +9586,7 @@ function Complete-AWConnect($Result) {
     $info = $res.Info
     if ($pend.Save) {
         try {
-            [AWiper.CredMan]::Write((Get-AWCredTarget $pend.Host), $pend.Credential.UserName, $ui.ConnPass.Password)
+            [ComputerDoctor.CredMan]::Write((Get-AWCredTarget $pend.Host), $pend.Credential.UserName, $ui.ConnPass.Password)
             Write-AWLog "Saved credentials for $($pend.Host) to Windows Credential Manager"
         } catch { Write-AWLog "Could not save credentials: $($_.Exception.Message)" 'WARN' }
     }
@@ -9484,7 +9616,8 @@ foreach ($c in @($ui.ConnHost, $ui.ConnDomain, $ui.ConnUser, $ui.ConnPass)) {
 $ui.ConnForget.Add_Click({
     $h = Resolve-AWHost
     if ($h -and (Confirm-AW "Remove the saved credentials for $h from Windows Credential Manager?")) {
-        [void][AWiper.CredMan]::Delete((Get-AWCredTarget $h))
+        [void][ComputerDoctor.CredMan]::Delete((Get-AWCredTarget $h))
+        [void][ComputerDoctor.CredMan]::Delete([ComputerDoctor.CredMan]::OldPrefix + $h.ToLowerInvariant())   # saved before the rename
         Write-AWLog "Removed saved credentials for $h"
         $ui.ConnSave.IsChecked = $false
         Update-AWConnSaved; Update-AWRecentChips
@@ -9492,7 +9625,7 @@ $ui.ConnForget.Add_Click({
 })
 $ui.ConnTrust.Add_Click({
     $h = Resolve-AWHost
-    if (-not $script:IsAdmin) { Show-AWConnMsg 'Changing TrustedHosts needs AWiper to run as administrator. Use "Restart as admin", then try again.'; return }
+    if (-not $script:IsAdmin) { Show-AWConnMsg 'Changing TrustedHosts needs Computer Doctor to run as administrator. Use "Restart as admin", then try again.'; return }
     if (-not (Confirm-AW "Add $h to this PC's WinRM TrustedHosts list?`n`nThis lets PowerShell remoting connect to it with a username and password (NTLM). Only do this for computers you trust.")) { return }
     try {
         if ((Get-Service WinRM).Status -ne 'Running') { Start-Service WinRM -ErrorAction Stop }
@@ -9560,59 +9693,59 @@ function New-AWToolCard {
 
 function Get-AWWhere { if (Test-AWRemote) { " on $($script:Target.ComputerName)" } else { '' } }
 
-# Copies AWiper and a profile to an admin-only folder and schedules it as SYSTEM.
+# Copies Computer Doctor and a profile to an admin-only folder and schedules it as SYSTEM.
 # (A SYSTEM task must never run a script that ordinary users can edit.)
 function New-AWScheduledMaintenance {
     if (-not $script:IsAdmin) { Show-AWMessage 'Scheduling maintenance needs administrator rights.'; return }
-    $existing = Get-ScheduledTask -TaskName 'AWiper Maintenance' -ErrorAction SilentlyContinue
+    $existing = Get-ScheduledTask -TaskName 'ComputerDoctor Maintenance' -ErrorAction SilentlyContinue
     if ($existing) {
-        $ans = [System.Windows.MessageBox]::Show($window, "Scheduled maintenance is already set up.`n`nYes = replace it with a new schedule`nNo = remove it`nCancel = keep it", 'AWiper', 'YesNoCancel', 'Question')
+        $ans = [System.Windows.MessageBox]::Show($window, "Scheduled maintenance is already set up.`n`nYes = replace it with a new schedule`nNo = remove it`nCancel = keep it", 'Computer Doctor', 'YesNoCancel', 'Question')
         if ($ans -eq 'Cancel') { return }
         if ($ans -eq 'No') {
-            Unregister-ScheduledTask -TaskName 'AWiper Maintenance' -Confirm:$false
+            Unregister-ScheduledTask -TaskName 'ComputerDoctor Maintenance' -Confirm:$false
             Write-AWAction 'ScheduledMaintenance' @('removed') @{} 'Done'; Write-AWLog 'Scheduled maintenance removed'; Initialize-AWTools; return
         }
     }
-    $dir = Join-Path $env:ProgramData 'AWiper\Scheduled'
+    $dir = Join-Path $env:ProgramData 'ComputerDoctor\Scheduled'
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     $profileDest = Join-Path $dir 'maintenance.json'
     if (Confirm-AW "Use your own profile file?`n`nYes = choose a JSON profile`nNo = use the default: restore point, default cleaning rules and a health check") {
-        $dlg = New-Object System.Windows.Forms.OpenFileDialog; $dlg.Filter = 'AWiper profile (*.json)|*.json'
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog; $dlg.Filter = 'Computer Doctor profile (*.json)|*.json'
         if ($dlg.ShowDialog() -ne 'OK') { return }
         try { [void](Read-AWConfig $dlg.FileName) } catch { Show-AWMessage "That profile can't be read: $($_.Exception.Message)" 'Error'; return }
         Copy-Item -LiteralPath $dlg.FileName -Destination $profileDest -Force
     } else {
-        ConvertTo-Json -InputObject ([ordered]@{ RestorePoint = 'AWiper scheduled maintenance'; Clean = @('Default'); HealthCheck = $true }) | Set-Content -LiteralPath $profileDest -Encoding UTF8
+        ConvertTo-Json -InputObject ([ordered]@{ RestorePoint = 'Computer Doctor scheduled maintenance'; Clean = @('Default'); HealthCheck = $true }) | Set-Content -LiteralPath $profileDest -Encoding UTF8
     }
-    $when = [Microsoft.VisualBasic.Interaction]::InputBox("When should it run? Examples: 'Daily 19:00', 'Sunday 03:00', 'Weekly 02:30' (= Sunday).", 'AWiper - Scheduled maintenance', 'Sunday 03:00')
+    $when = [Microsoft.VisualBasic.Interaction]::InputBox("When should it run? Examples: 'Daily 19:00', 'Sunday 03:00', 'Weekly 02:30' (= Sunday).", 'Computer Doctor - Scheduled maintenance', 'Sunday 03:00')
     if ($when -notmatch '^\s*(Daily|Weekly|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+([01]?\d|2[0-3]):([0-5]\d)\s*$') { if ($when) { Show-AWMessage 'Use a form like "Daily 19:00" or "Sunday 03:00".' }; return }
     $day = $Matches[1]; $at = [datetime]::ParseExact("$($Matches[2]):$($Matches[3])", 'H:mm', $null)
-    $results = Join-Path $env:ProgramData 'AWiper\Results'
+    $results = Join-Path $env:ProgramData 'ComputerDoctor\Results'
     $dlg2 = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg2.Description = 'Where should results go? Choose a shared folder to collect them centrally, or cancel to keep them in ProgramData\AWiper\Results.'
+    $dlg2.Description = 'Where should results go? Choose a shared folder to collect them centrally, or cancel to keep them in ProgramData\ComputerDoctor\Results.'
     if ($dlg2.ShowDialog() -eq 'OK') { $results = $dlg2.SelectedPath }
     New-Item -ItemType Directory -Path $results -Force -ErrorAction SilentlyContinue | Out-Null
 
-    Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $dir 'AWiper.ps1') -Force
+    Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $dir 'ComputerDoctor.ps1') -Force
     # Admins and SYSTEM full control, users read-only, no inherited write access.
     & icacls.exe $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' 2>&1 | Out-Null
     $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $dir 'AWiper.ps1')`" -Config `"$profileDest`" -Yes -Format Json -OutFile `"$(Join-Path $results '{computer}-{date}.json')`""
+    $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $dir 'ComputerDoctor.ps1')`" -Config `"$profileDest`" -Yes -Format Json -OutFile `"$(Join-Path $results '{computer}-{date}.json')`""
     $trigger = if ($day -eq 'Daily') { New-ScheduledTaskTrigger -Daily -At $at } else { New-ScheduledTaskTrigger -Weekly -DaysOfWeek $(if ($day -eq 'Weekly') { 'Sunday' } else { $day }) -At $at }
     try {
-        Register-ScheduledTask -TaskName 'AWiper Maintenance' -Action (New-ScheduledTaskAction -Execute $exe -Argument $arg) -Trigger $trigger `
+        Register-ScheduledTask -TaskName 'ComputerDoctor Maintenance' -Action (New-ScheduledTaskAction -Execute $exe -Argument $arg) -Trigger $trigger `
             -Principal (New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest) `
-            -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)) -Description 'AWiper scheduled maintenance' -Force | Out-Null
+            -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)) -Description 'Computer Doctor scheduled maintenance' -Force | Out-Null
         Write-AWAction 'ScheduledMaintenance' @("$day $($at.ToString('HH:mm'))") @{ Results = $results } 'Done'
         Write-AWLog "Scheduled maintenance: $day at $($at.ToString('HH:mm')), results to $results"
-        Show-AWMessage "Scheduled: $day at $($at.ToString('HH:mm')).`n`nAWiper and the profile were copied to $dir (admins only can change them). Results are saved to $results as <computer>-<date>.json."
+        Show-AWMessage "Scheduled: $day at $($at.ToString('HH:mm')).`n`nComputer Doctor and the profile were copied to $dir (admins only can change them). Results are saved to $results as <computer>-<date>.json."
     } catch { Show-AWMessage "Could not schedule it: $($_.Exception.Message)" 'Error' }
     Initialize-AWTools
 }
 
 function Start-AWFleetInventory {
     $def = if ($script:State.FleetHosts) { $script:State.FleetHosts } else { (@($env:COMPUTERNAME) + @($script:State.RecentTargets)) -join ', ' }
-    $in = [Microsoft.VisualBasic.Interaction]::InputBox("Computers to inventory (names or addresses, separated by commas). Credentials saved in Credential Manager are used where present; otherwise your current sign-in.", 'AWiper - Fleet inventory', $def)
+    $in = [Microsoft.VisualBasic.Interaction]::InputBox("Computers to inventory (names or addresses, separated by commas). Credentials saved in Credential Manager are used where present; otherwise your current sign-in.", 'Computer Doctor - Fleet inventory', $def)
     $hosts = @($in -split '[,;\s]+' | Where-Object { $_ } | Select-Object -Unique)
     if (-not $hosts.Count) { return }
     $script:State.FleetHosts = $hosts -join ', '; Save-AWState
@@ -9644,16 +9777,16 @@ function Initialize-AWTools {
         $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
         $dlg.Description = 'Choose where to create the Resources folder (a USB stick works well)'
         if ($dlg.ShowDialog() -ne 'OK') { return }
-        $root = Join-Path $dlg.SelectedPath 'AWiper\Resources'
+        $root = Join-Path $dlg.SelectedPath 'ComputerDoctor\Resources'
         if ((Split-Path $dlg.SelectedPath -Leaf) -eq 'Resources') { $root = $dlg.SelectedPath }
         New-AWResourceLayout $root
         $script:State.ResourcesPath = $root; Save-AWState
         Write-AWLog "Created Resources folder at $root"
         Initialize-AWTools; Open-AWExplorer $root
     }
-    New-AWToolCard ([string][char]0xE838) 'Use another folder' 'Point AWiper at a Resources folder somewhere else, such as a network share or a different USB stick.' 'Choose...' $false {
+    New-AWToolCard ([string][char]0xE838) 'Use another folder' 'Point Computer Doctor at a Resources folder somewhere else, such as a network share or a different USB stick.' 'Choose...' $false {
         $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-        $dlg.Description = 'Choose an AWiper Resources folder'
+        $dlg.Description = 'Choose a Computer Doctor Resources folder'
         if ($dlg.ShowDialog() -ne 'OK') { return }
         $script:State.ResourcesPath = $dlg.SelectedPath; Save-AWState
         Write-AWLog "Resources folder set to $($dlg.SelectedPath)"
@@ -9699,7 +9832,7 @@ function Initialize-AWTools {
 
     # ---------------- Automation
     Add-AWToolSection 'Automation'
-    $mt = Get-ScheduledTask -TaskName 'AWiper Maintenance' -ErrorAction SilentlyContinue
+    $mt = Get-ScheduledTask -TaskName 'ComputerDoctor Maintenance' -ErrorAction SilentlyContinue
     $mtDesc = if ($mt) { "Scheduled: $(@($mt.Triggers | ForEach-Object { if ($_.DaysOfWeek) { 'weekly' } else { 'daily' } })[0]) at $(([datetime]@($mt.Triggers)[0].StartBoundary).ToString('HH:mm')), as SYSTEM. Click to change or remove." }
               else { 'Runs a maintenance profile (clean, tweaks, health check...) daily or weekly as SYSTEM and saves the results - e.g. to a shared folder.' }
     New-AWToolCard ([string][char]0xE787) 'Scheduled maintenance' $mtDesc $(if ($mt) { 'Change...' } else { 'Set up...' }) $true {
@@ -9743,7 +9876,7 @@ function Initialize-AWTools {
 
     New-AWToolCard ([string][char]0xE74D) 'Empty Recycle Bin' 'Permanently removes everything in the Recycle Bin on all drives.' 'Empty' $false {
         if (Confirm-AW 'Permanently empty the Recycle Bin on all drives?') {
-            [void][AWiper.Native]::SHEmptyRecycleBin([IntPtr]::Zero, $null, 7)
+            [void][ComputerDoctor.Native]::SHEmptyRecycleBin([IntPtr]::Zero, $null, 7)
             Write-AWLog 'Recycle Bin emptied'; Set-AWStatus 'Recycle Bin emptied'; Update-AWDashboard
         }
     } -Accent 'Purple'
@@ -9840,7 +9973,7 @@ function Initialize-AWTools {
         Start-AWCommandTask 'Disable hibernation' { & powercfg.exe /hibernate off 2>&1; "AWEXIT $LASTEXITCODE" }
     } -Remote $true
 
-    New-AWToolCard ([string][char]0xE7C3) 'Windows Disk Cleanup' 'Opens the built-in Disk Cleanup for anything AWiper does not cover, like old Windows installations.' 'Open' $false {
+    New-AWToolCard ([string][char]0xE7C3) 'Windows Disk Cleanup' 'Opens the built-in Disk Cleanup for anything Computer Doctor does not cover, like old Windows installations.' 'Open' $false {
         Start-Process cleanmgr.exe
     }
 
@@ -9869,7 +10002,7 @@ function Build-AWDriverEntries {
     $byHw = @{}
     $list = New-Object System.Collections.Generic.List[object]
     foreach ($d in $script:DrvInv.Drivers) {
-        $e = New-Object AWiper.DriverEntry
+        $e = New-Object ComputerDoctor.DriverEntry
         $e.Name = $d.Name; $e.Class = $d.Class; $e.Provider = $d.Provider; $e.Version = $d.Version; $e.Date = $d.Date
         $e.Inf = $d.Inf; $e.DeviceId = $d.DeviceId; $e.ErrorCode = $d.ErrorCode
         $e.HardwareId = (@($d.HardwareIds) | Select-Object -First 1)
@@ -9901,7 +10034,7 @@ function Build-AWDriverEntries {
                 } elseif (-not $e.UpdateText) { $e.UpdateText = "Windows Update offers a $when driver (not newer)" }
             }
         } else {
-            $e = New-Object AWiper.DriverEntry
+            $e = New-Object ComputerDoctor.DriverEntry
             $e.Name = $(if ($u.Model) { $u.Model } else { $u.Title }); $e.Class = $u.Class; $e.Provider = $u.Provider
             $v = Resolve-AWDriverVendor $u.Provider @($u.HardwareId)
             $e.Vendor = $v.Name; $e.VendorUrl = $v.Url; $e.HardwareId = $u.HardwareId
@@ -10031,7 +10164,7 @@ $ui.DrvVendor.Add_Click({
     if (Test-AWOffline) { Show-AWMessage 'This PC is offline. Use "Copy hardware ID" and look the driver up on a connected PC.'; return }
     if ($e.VendorUrl) { Start-Process $e.VendorUrl }
     elseif ($e.IsMicrosoft) { Show-AWMessage "$($e.Name) uses a driver built into Windows; it's updated by Windows Update. Use 'Search Update Catalog' for alternatives." }
-    else { Show-AWMessage "AWiper doesn't know $($e.Vendor)'s download page. Try the $($script:DrvOemInfo.Maker) driver page or 'Search Update Catalog'." }
+    else { Show-AWMessage "Computer Doctor doesn't know $($e.Vendor)'s download page. Try the $($script:DrvOemInfo.Maker) driver page or 'Search Update Catalog'." }
 })
 $ui.DrvCatalog.Add_Click({
     $e = $ui.DrvList.SelectedItem
@@ -10176,7 +10309,7 @@ $ui.BiosBitlocker.Add_Click({
 function Export-AWBios {
     $dlg = New-Object Microsoft.Win32.SaveFileDialog
     $who = if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME }
-    $dlg.FileName = 'AWiper-bios-{0}-{1:yyyyMMdd}' -f $who, (Get-Date)
+    $dlg.FileName = 'ComputerDoctor-bios-{0}-{1:yyyyMMdd}' -f $who, (Get-Date)
     $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'
     if (-not $dlg.ShowDialog($window)) { return }
     $rows = $script:BiosRows | Select-Object Section, Name, Value, Note
@@ -10193,7 +10326,7 @@ $ui.BiosRestart.Add_Click({
     if (-not (Confirm-AW "Restart this PC into its BIOS / UEFI setup now?`n`nSave your work first - open apps will be closed. In setup, use the maker's 'Exit without saving' option if you only want to look.")) { return }
     Write-AWAction 'RestartToFirmware' @($env:COMPUTERNAME) @{} 'Started'
     Update-AWLogView
-    try { & shutdown.exe /r /fw /t 5 /c 'AWiper: restarting into BIOS setup' 2>&1 | Out-Null; if ($LASTEXITCODE) { throw "shutdown.exe exit code $LASTEXITCODE" } }
+    try { & shutdown.exe /r /fw /t 5 /c 'Computer Doctor: restarting into BIOS setup' 2>&1 | Out-Null; if ($LASTEXITCODE) { throw "shutdown.exe exit code $LASTEXITCODE" } }
     catch { Show-AWMessage "Could not restart into setup: $($_.Exception.Message)" 'Error' }
 })
 #endregion
@@ -10304,7 +10437,7 @@ function Start-AWHealthCheck {
 function Save-AWHealthReport {
     $dlg = New-Object Microsoft.Win32.SaveFileDialog
     $who = if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME }
-    $dlg.FileName = 'AWiper-health-{0}-{1:yyyyMMdd-HHmm}' -f $who, (Get-Date)
+    $dlg.FileName = 'ComputerDoctor-health-{0}-{1:yyyyMMdd-HHmm}' -f $who, (Get-Date)
     $dlg.Filter = 'Web page (*.html)|*.html|JSON (*.json)|*.json'
     if (-not $dlg.ShowDialog($window)) { return }
     if ($dlg.FileName -like '*.json') {
@@ -10316,7 +10449,7 @@ function Save-AWHealthReport {
         @"
 <!doctype html><html><head><meta charset="utf-8"><title>Health check - $(& $enc $who)</title>
 <style>body{font-family:Segoe UI,sans-serif;margin:32px;color:#1c2140}table{border-collapse:collapse;width:100%}td,th{padding:8px 10px;border-bottom:1px solid #dde;text-align:left;vertical-align:top}th{color:#667}</style></head>
-<body><h1>Health check - $(& $enc $who)</h1><p>Checked $($script:HealthChecked.ToString('f')) by AWiper $script:AppVersion. "N/A" means the data isn't available on this hardware - it is not counted as healthy.</p>
+<body><h1>Health check - $(& $enc $who)</h1><p>Checked $($script:HealthChecked.ToString('f')) by Computer Doctor $script:AppVersion. "N/A" means the data isn't available on this hardware - it is not counted as healthy.</p>
 <table><tr><th>Status</th><th>Check</th><th>Details</th></tr>
 $($rows -join "`n")
 </table></body></html>
@@ -10401,14 +10534,14 @@ function Start-AWSecurityCheck {
         param($Result)
         $order = @{ Problem = 0; Warning = 1; Info = 2; NA = 3; Good = 4 }
         $items = @($Result | Where-Object { $_ -and $_.Name } | Sort-Object { $order[[string]$_.Status] } | ForEach-Object {
-            $s = New-Object AWiper.SecItem
+            $s = New-Object ComputerDoctor.SecItem
             $s.Id = $_.Id; $s.Name = $_.Name; $s.Status = $_.Status; $s.Detail = $_.Detail; $s.Fix = $_.Fix; $s.Policy = [bool]$_.Policy
             $s.IsChecked = $s.CanFix -and $s.Status -eq 'Problem'
             $s
         })
         $ui.SecList.ItemsSource = $items
         $p = @($items | Where-Object { $_.Status -eq 'Problem' }).Count; $w = @($items | Where-Object { $_.Status -eq 'Warning' }).Count
-        $ui.SecInfo.Text = "$p problem(s), $w warning(s), $(@($items | Where-Object { $_.CanFix }).Count) item(s) AWiper can fix."
+        $ui.SecInfo.Text = "$p problem(s), $w warning(s), $(@($items | Where-Object { $_.CanFix }).Count) item(s) Computer Doctor can fix."
         $ui.SecFix.IsEnabled = (Test-AWCanAdmin)
     }
 }
@@ -10454,7 +10587,7 @@ function Start-AWPrivacyCheck {
 
 function New-AWSupportBundle {
     $dlg = New-Object Microsoft.Win32.SaveFileDialog
-    $dlg.FileName = 'AWiper-support-{0}-{1:yyyyMMdd-HHmm}.zip' -f $env:COMPUTERNAME, (Get-Date)
+    $dlg.FileName = 'ComputerDoctor-support-{0}-{1:yyyyMMdd-HHmm}.zip' -f $env:COMPUTERNAME, (Get-Date)
     $dlg.Filter = 'Zip file (*.zip)|*.zip'
     $dlg.InitialDirectory = [Environment]::GetFolderPath('Desktop')
     if (-not $dlg.ShowDialog($window)) { return }
@@ -10463,7 +10596,7 @@ function New-AWSupportBundle {
     $saved = $script:Target; $script:Target = $null
     try {
         Start-AWTask -Name 'Create support bundle' -Arguments @{ Zip = $zip; Health = @($script:HealthResults); Version = $script:AppVersion; LogFile = $script:LogFile } -Work {
-            $dir = Join-Path ([IO.Path]::GetTempPath()) ('AWiper-support-' + [guid]::NewGuid().ToString('N'))
+            $dir = Join-Path ([IO.Path]::GetTempPath()) ('ComputerDoctor-support-' + [guid]::NewGuid().ToString('N'))
             New-Item -ItemType Directory -Path $dir | Out-Null
             $q = '*[System[TimeCreated[timediff(@SystemTime) <= 604800000]]]'
             foreach ($log in 'System', 'Application') {
@@ -10479,8 +10612,8 @@ function New-AWSupportBundle {
             ConvertTo-Json -InputObject @(Get-WEventTriage 30) -Depth 4 | Out-File (Join-Path $dir 'events-triage.json') -Encoding UTF8
             Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
                 Where-Object DisplayName | Select-Object DisplayName, DisplayVersion, Publisher, InstallDate | Export-Csv (Join-Path $dir 'programs.csv') -NoTypeInformation -Encoding UTF8
-            if (Test-Path -LiteralPath $LogFile) { Get-Content -LiteralPath $LogFile -Tail 2000 | Out-File (Join-Path $dir 'AWiper.log') -Encoding UTF8 }
-            "Created by AWiper $Version on $(Get-Date -Format o) for $env:COMPUTERNAME. Contains the last 7 days of System/Application events, system and network info, drivers, installed programs and AWiper's health and event reports. Review before sharing - it includes your computer and user names." |
+            if (Test-Path -LiteralPath $LogFile) { Get-Content -LiteralPath $LogFile -Tail 2000 | Out-File (Join-Path $dir 'ComputerDoctor.log') -Encoding UTF8 }
+            "Created by Computer Doctor $Version on $(Get-Date -Format o) for $env:COMPUTERNAME. Contains the last 7 days of System/Application events, system and network info, drivers, installed programs and Computer Doctor's health and event reports. Review before sharing - it includes your computer and user names." |
                 Out-File (Join-Path $dir 'README.txt') -Encoding UTF8
             if (Test-Path -LiteralPath $Zip) { Remove-Item -LiteralPath $Zip -Force }
             Compress-Archive -Path (Join-Path $dir '*') -DestinationPath $Zip
@@ -10551,7 +10684,7 @@ function Get-AWUpdateFiles([string]$KB) {
 
 function Show-AWUpdateList {
     $rows = foreach ($u in @($script:WuMissing)) {
-        $r = New-Object AWiper.AdminRow
+        $r = New-Object ComputerDoctor.AdminRow
         $r.Key = $u.KB; $r.Name = $u.Title; $r.Kind = $u.Severity; $r.Size = [long]($u.SizeMB * 1MB)
         $files = if ($u.KB -and (Get-AWUpdateFolder)) { @(Get-AWUpdateFiles $u.KB) } else { @() }
         $r.Status = if ($files.Count) { "Yes ($($files.Count) file(s))" } else { '' }
@@ -10626,7 +10759,7 @@ function Export-AWNeedsList {
             if ($f) {
                 Write-AWAction 'ExportNeedsList' @($f) @{} 'Done'
                 $hint = if ($null -eq $script:WuMissing) { "`n`nTip: run an update scan first so missing updates are included." } else { '' }
-                Show-AWMessage "Saved $f.`n`nTake the Resources folder to a PC with internet, open AWiper there and use Tools > Fetch downloads (or run AWiper.ps1 -Fetch). Then bring it back and install.$hint"
+                Show-AWMessage "Saved $f.`n`nTake the Resources folder to a PC with internet, open Computer Doctor there and use Tools > Fetch downloads (or run ComputerDoctor.ps1 -Fetch). Then bring it back and install.$hint"
             }
         }
     } finally { $script:Target = $saved }
@@ -10722,13 +10855,13 @@ $ui.CrashFix.Add_Click({ Invoke-AWCrashFix })
 $ui.CrashFolder.Add_Click({ $d = Join-Path $env:SystemRoot 'Minidump'; if (Test-Path -LiteralPath $d) { Open-AWExplorer $d } else { Show-AWMessage 'There is no Minidump folder - Windows has not saved small crash dumps on this PC.' } })
 $ui.SleepRefresh.Add_Click({ Start-AWSleepInfo })
 $ui.SleepBattery.Add_Click({
-    $f = Join-Path ([IO.Path]::GetTempPath()) 'awiper-battery-report.html'
+    $f = Join-Path ([IO.Path]::GetTempPath()) 'computerdoctor-battery-report.html'
     & powercfg.exe /batteryreport /output $f 2>&1 | Out-Null
     if (Test-Path -LiteralPath $f) { Start-Process $f } else { Show-AWMessage 'No battery report - this PC may not have a battery.' }
 })
 $ui.SleepStudy.Add_Click({
     if (-not $script:IsAdmin) { Show-AWMessage 'The sleep study needs administrator rights.'; return }
-    $f = Join-Path ([IO.Path]::GetTempPath()) 'awiper-sleepstudy.html'
+    $f = Join-Path ([IO.Path]::GetTempPath()) 'computerdoctor-sleepstudy.html'
     & powercfg.exe /sleepstudy /output $f 2>&1 | Out-Null
     if (Test-Path -LiteralPath $f) { Start-Process $f } else { Show-AWMessage 'No sleep study is available - it only exists on PCs that use Modern Standby.' }
 })
@@ -10768,7 +10901,7 @@ function Start-AWProfiles {
     Start-AWTask -Name 'Read user profiles' -Work { Invoke-WTarget { Get-WUserProfiles $true } } -OnComplete {
         param($Result)
         $rows = @($Result | Where-Object { $_ -and $_.Sid } | ForEach-Object {
-            $r = New-Object AWiper.AdminRow
+            $r = New-Object ComputerDoctor.AdminRow
             $r.Name = $_.User; $r.Key = $_.Sid; $r.Path = $_.Path; $r.Size = [long]$_.SizeBytes
             $r.When = if ($_.LastUsed) { [datetime]$_.LastUsed } else { [datetime]::MinValue }
             $r.Status = (@($(if ($_.Loaded) { 'In use' }), $_.Flags) | Where-Object { $_ }) -join ', '
@@ -10786,7 +10919,7 @@ function Remove-AWProfiles {
     if (-not $sel.Count) { Show-AWMessage 'Check the profiles to remove first (profiles in use cannot be removed).'; return }
     [long]$tot = 0; foreach ($r in $sel) { $tot += $r.Size }
     $list = ($sel | ForEach-Object { "  - $($_.Name)  ($($_.SizeText), last used $($_.WhenText))" }) -join "`n"
-    $typed = [Microsoft.VisualBasic.Interaction]::InputBox("This PERMANENTLY deletes these profiles$(Get-AWWhere) - their documents, desktop and settings on this PC ($(Format-AWSize $tot)). It cannot be undone.`n`n$list`n`nType DELETE to confirm.", 'AWiper - Remove profiles', '')
+    $typed = [Microsoft.VisualBasic.Interaction]::InputBox("This PERMANENTLY deletes these profiles$(Get-AWWhere) - their documents, desktop and settings on this PC ($(Format-AWSize $tot)). It cannot be undone.`n`n$list`n`nType DELETE to confirm.", 'Computer Doctor - Remove profiles', '')
     if ($typed -cne 'DELETE') { Set-AWStatus 'Profile removal cancelled'; return }
     Write-AWAction 'RemoveProfiles' ($sel | ForEach-Object { "$($_.Name) ($($_.Key))" }) @{ Bytes = $tot } 'Started'
     Start-AWTask -Name 'Remove profiles' -Arguments @{ Sids = @($sel | ForEach-Object Key) } -Work {
@@ -10800,7 +10933,7 @@ function Start-AWPrinters {
     Start-AWTask -Name 'Read printers' -Work { Invoke-WTarget { Get-WPrinterInfo } } -OnComplete {
         param($Result)
         $rows = @($Result | Where-Object { $_ -and $_.Name } | ForEach-Object {
-            $r = New-Object AWiper.AdminRow; $r.Kind = $_.Kind; $r.Name = $_.Name; $r.Status = $_.Status; $r.Detail = $_.Detail; $r.CanCheck = $true; $r
+            $r = New-Object ComputerDoctor.AdminRow; $r.Kind = $_.Kind; $r.Name = $_.Name; $r.Status = $_.Status; $r.Detail = $_.Detail; $r.CanCheck = $true; $r
         })
         $ui.PrnList.ItemsSource = $rows
         $unused = @($rows | Where-Object { $_.Status -eq 'Not used by any printer' }).Count
@@ -10821,12 +10954,12 @@ function Remove-AWPrinterItems {
 }
 
 function Add-AWPrinterByIp {
-    $ip = [Microsoft.VisualBasic.Interaction]::InputBox('Printer IP address (it must accept standard TCP/IP printing on port 9100):', 'AWiper - Add printer', '')
+    $ip = [Microsoft.VisualBasic.Interaction]::InputBox('Printer IP address (it must accept standard TCP/IP printing on port 9100):', 'Computer Doctor - Add printer', '')
     if (-not $ip) { return }
     if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -and $ip -notmatch '^[A-Za-z0-9.-]+$') { Show-AWMessage 'That is not a valid address.'; return }
-    $name = [Microsoft.VisualBasic.Interaction]::InputBox('Name for the printer:', 'AWiper - Add printer', "Printer at $ip")
+    $name = [Microsoft.VisualBasic.Interaction]::InputBox('Name for the printer:', 'Computer Doctor - Add printer', "Printer at $ip")
     if (-not $name) { return }
-    $drv = [Microsoft.VisualBasic.Interaction]::InputBox("Driver to use. 'Microsoft PCL6 Class Driver' works with most office printers; for PostScript printers use 'Microsoft PS Class Driver'. Any installed driver name works.", 'AWiper - Add printer', 'Microsoft PCL6 Class Driver')
+    $drv = [Microsoft.VisualBasic.Interaction]::InputBox("Driver to use. 'Microsoft PCL6 Class Driver' works with most office printers; for PostScript printers use 'Microsoft PS Class Driver'. Any installed driver name works.", 'Computer Doctor - Add printer', 'Microsoft PCL6 Class Driver')
     if (-not $drv) { return }
     Write-AWAction 'AddPrinter' @("$name ($ip)") @{ Driver = $drv } 'Started'
     Start-AWTask -Name 'Add printer' -Arguments @{ Ip = $ip; Name = $name; Drv = $drv } -Work {
@@ -10839,8 +10972,8 @@ function Start-AWHelpdesk {
     Start-AWTask -Name 'Read sessions and processes' -Work { [pscustomobject]@{ S = @(Invoke-WTarget { Get-WSessions }); P = @(Invoke-WTarget { Get-WTopProcesses }) } } -OnComplete {
         param($Result)
         $x = @($Result | Where-Object { $_ -and $null -ne $_.S }) | Select-Object -Last 1
-        $ui.HdSessions.ItemsSource = @($x.S | ForEach-Object { $r = New-Object AWiper.AdminRow; $r.Name = $_.User; $r.Kind = $_.Session; $r.Key = [string]$_.Id; $r.Status = $_.State; $r.Detail = (@($_.Idle, $_.Logon) | Where-Object { $_ }) -join ' / '; $r })
-        $ui.HdProcs.ItemsSource = @($x.P | ForEach-Object { $r = New-Object AWiper.AdminRow; $r.Name = $_.Name; $r.Key = [string]$_.Id; $r.Size = [long]$_.MemMB * 1MB; $r.Detail = "$($_.CpuSec) s"; $r.Status = $(if ($_.Responding) { 'Running' } else { 'Not responding' }); $r })
+        $ui.HdSessions.ItemsSource = @($x.S | ForEach-Object { $r = New-Object ComputerDoctor.AdminRow; $r.Name = $_.User; $r.Kind = $_.Session; $r.Key = [string]$_.Id; $r.Status = $_.State; $r.Detail = (@($_.Idle, $_.Logon) | Where-Object { $_ }) -join ' / '; $r })
+        $ui.HdProcs.ItemsSource = @($x.P | ForEach-Object { $r = New-Object ComputerDoctor.AdminRow; $r.Name = $_.Name; $r.Key = [string]$_.Id; $r.Size = [long]$_.MemMB * 1MB; $r.Detail = "$($_.CpuSec) s"; $r.Status = $(if ($_.Responding) { 'Running' } else { 'Not responding' }); $r })
     }
 }
 
@@ -10867,7 +11000,7 @@ function Start-AWSoftwarePush {
         Start-AWTask -Name 'Software push' -Arguments @{ Hosts = $hosts; File = $file; A = $args2 } -Work { Invoke-WSoftwarePush $Hosts $File $A } -OnComplete {
             param($Result)
             $ui.SwRun.IsEnabled = $true
-            $rows = @($Result | Where-Object { $_ -and $_.Computer } | ForEach-Object { $r = New-Object AWiper.AdminRow; $r.Name = $_.Computer; $r.Status = $_.Result; $r.Key = [string]$_.Code; $r.Detail = $_.Log; $r })
+            $rows = @($Result | Where-Object { $_ -and $_.Computer } | ForEach-Object { $r = New-Object ComputerDoctor.AdminRow; $r.Name = $_.Computer; $r.Status = $_.Result; $r.Key = [string]$_.Code; $r.Detail = $_.Log; $r })
             $ui.SwResults.ItemsSource = $rows
             $ok = @($Result | Where-Object { $_.Ok }).Count
             Write-AWAction 'SoftwarePush' @("$ok of $($rows.Count) succeeded") @{} $(if ($ok -eq $rows.Count) { 'Done' } else { 'Partly failed' })
@@ -10890,7 +11023,7 @@ function Start-AWBaselineAudit {
     $ui.BlInfo.Text = "Auditing against $([IO.Path]::GetFileName($f))..."
     $ui.BlRun.IsEnabled = $false
     Start-AWTask -Name 'Baseline audit' -Arguments @{ Csv = $text } -Work {
-        Invoke-WTarget { param($t) $p = Join-Path ([IO.Path]::GetTempPath()) ('awiper-baseline-{0}.csv' -f [guid]::NewGuid().ToString('N')); Set-Content -LiteralPath $p -Value $t -Encoding UTF8; try { Invoke-WBaselineAudit $p } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } } -ArgumentList @($Csv)
+        Invoke-WTarget { param($t) $p = Join-Path ([IO.Path]::GetTempPath()) ('computerdoctor-baseline-{0}.csv' -f [guid]::NewGuid().ToString('N')); Set-Content -LiteralPath $p -Value $t -Encoding UTF8; try { Invoke-WBaselineAudit $p } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } } -ArgumentList @($Csv)
     } -OnComplete {
         param($Result)
         $ui.BlRun.IsEnabled = $true
@@ -10898,7 +11031,7 @@ function Start-AWBaselineAudit {
         $g = @{}; foreach ($x in $script:BlResults) { $g[$x.Result] = 1 + [int]$g[$x.Result] }
         $scored = [int]$g['Passed'] + [int]$g['Failed']
         $pct = if ($scored) { [Math]::Round(100.0 * [int]$g['Passed'] / $scored) } else { 0 }
-        $ui.BlInfo.Text = "$pct% compliant: $([int]$g['Passed']) passed, $([int]$g['Failed']) failed" + $(if ($g['Needs admin']) { ", $($g['Needs admin']) need admin" } else { '' }) + $(if ($g['Not supported']) { ", $($g['Not supported']) not supported by AWiper" } else { '' }) + '. Audit only - nothing was changed.'
+        $ui.BlInfo.Text = "$pct% compliant: $([int]$g['Passed']) passed, $([int]$g['Failed']) failed" + $(if ($g['Needs admin']) { ", $($g['Needs admin']) need admin" } else { '' }) + $(if ($g['Not supported']) { ", $($g['Not supported']) not supported by Computer Doctor" } else { '' }) + '. Audit only - nothing was changed.'
         $ui.BlExport.IsEnabled = $true
         Update-AWBaselineView
         Write-AWAction 'BaselineAudit' @($ui.BlFile.Text) @{ Passed = [int]$g['Passed']; Failed = [int]$g['Failed'] } 'Done'
@@ -10951,7 +11084,7 @@ $ui.HdKill.Add_Click({
     Invoke-AWHelpCommand "End $($p.Name)" { param($id) Stop-Process -Id $id -Force -ErrorAction Stop; Write-WLog "Ended process $id" } @([int]$p.Key)
 })
 $ui.HdMessage.Add_Click({
-    $m = [Microsoft.VisualBasic.Interaction]::InputBox("Message to show to everyone signed in$(Get-AWWhere):", 'AWiper - Send message', '')
+    $m = [Microsoft.VisualBasic.Interaction]::InputBox("Message to show to everyone signed in$(Get-AWWhere):", 'Computer Doctor - Send message', '')
     if (-not $m) { return }
     Invoke-AWHelpCommand 'Send message' { param($t) if (Get-Command msg.exe -ErrorAction SilentlyContinue) { & msg.exe * /time:300 $t; Write-WLog 'Message sent' } else { Write-WLog 'msg.exe is not available on this edition of Windows (Home)' 'WARN' } } @($m)
 })
@@ -10962,9 +11095,9 @@ $ui.HdLogoff.Add_Click({
     Invoke-AWHelpCommand "Sign out $($s.Name)" { param($id) if (Get-Command logoff.exe -ErrorAction SilentlyContinue) { & logoff.exe $id; Write-WLog "Signed out session $id" } else { Write-WLog 'logoff.exe is not available on this edition of Windows' 'WARN' } } @([int]$s.Key)
 })
 $ui.HdRestart.Add_Click({
-    $mins = [Microsoft.VisualBasic.Interaction]::InputBox("Restart$(Get-AWWhere) in how many minutes? Signed-in users see a countdown with your message.", 'AWiper - Restart', '5')
+    $mins = [Microsoft.VisualBasic.Interaction]::InputBox("Restart$(Get-AWWhere) in how many minutes? Signed-in users see a countdown with your message.", 'Computer Doctor - Restart', '5')
     $n = 0; if (-not [int]::TryParse($mins, [ref]$n) -or $n -lt 0) { return }
-    $msg = [Microsoft.VisualBasic.Interaction]::InputBox('Message for the user:', 'AWiper - Restart', 'IT is restarting this PC to finish maintenance. Please save your work.')
+    $msg = [Microsoft.VisualBasic.Interaction]::InputBox('Message for the user:', 'Computer Doctor - Restart', 'IT is restarting this PC to finish maintenance. Please save your work.')
     Invoke-AWHelpCommand 'Scheduled restart' { param($s, $m) & shutdown.exe /r /t $s /c $m /d p:4:1; Write-WLog "Restart scheduled in $s s" } @(($n * 60), $msg)
 })
 $ui.HdCancel.Add_Click({ Invoke-AWHelpCommand 'Cancel restart' { & shutdown.exe /a 2>&1 | Out-Null; Write-WLog 'Pending restart cancelled' } })
@@ -10999,7 +11132,7 @@ $ui.BlRun.Add_Click({ Start-AWBaselineAudit })
 $ui.BlFailed.Add_Checked({ Update-AWBaselineView }); $ui.BlFailed.Add_Unchecked({ Update-AWBaselineView })
 $ui.BlExport.Add_Click({
     $dlg = New-Object Microsoft.Win32.SaveFileDialog
-    $dlg.FileName = 'AWiper-baseline-{0}-{1:yyyyMMdd}.csv' -f $(if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME }), (Get-Date)
+    $dlg.FileName = 'ComputerDoctor-baseline-{0}-{1:yyyyMMdd}.csv' -f $(if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME }), (Get-Date)
     $dlg.Filter = 'CSV (*.csv)|*.csv'
     if ($dlg.ShowDialog($window)) { $script:BlResults | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding UTF8; Write-AWLog "Baseline results exported to $($dlg.FileName)" }
 })
@@ -11022,7 +11155,7 @@ $ui.LanRun.Add_Click({
     if (-not $h) { Show-AWMessage 'Enter the other PC.'; return }
     $ui.LanResult.Text = "Testing with $h (copies 256 MB each way)..."
     $cred = $null
-    $saved = try { [AWiper.CredMan]::Read('AWiper:' + $h.ToLowerInvariant()) } catch { $null }
+    $saved = try { [ComputerDoctor.CredMan]::ReadHost($h) } catch { $null }
     if ($saved) { $cred = New-Object System.Management.Automation.PSCredential($saved[0], (ConvertTo-SecureString $saved[1] -AsPlainText -Force)) }
     $st = $script:Target; $script:Target = $null
     try {
@@ -11038,7 +11171,7 @@ $ui.LanRun.Add_Click({
 #region ---------------------------------------------------------------- Online / offline status
 function Update-AWNetUI {
     if ($script:ForceOffline) { $ui.NetText.Text = 'Offline mode'; $ui.NetIcon.Text = [string][char]0xE709; $ui.NetIcon.Foreground = $script:Res.Amber
-        $ui.NetBtn.ToolTip = 'Offline mode is on: AWiper never uses the internet and uses your Resources folder instead. Click to turn it off.' }
+        $ui.NetBtn.ToolTip = 'Offline mode is on: Computer Doctor never uses the internet and uses your Resources folder instead. Click to turn it off.' }
     elseif ($script:Online -eq $true) { $ui.NetText.Text = 'Online'; $ui.NetIcon.Text = [string][char]0xE774; $ui.NetIcon.Foreground = $script:Res.Success
         $ui.NetBtn.ToolTip = 'Internet is available. Click to switch to offline mode.' }
     elseif ($script:Online -eq $false) { $ui.NetText.Text = 'No internet'; $ui.NetIcon.Text = [string][char]0xE7BA; $ui.NetIcon.Foreground = $script:Res.Amber
@@ -11137,7 +11270,7 @@ function Get-AWDriveVerdict($d) {
         return @{ Level = 'Bad'; Short = 'Unlikely'; Text = "$($d.Drive) is an SSD$trimNote. Windows tells the drive to erase deleted data, usually within minutes, so a deep scan rarely finds anything. Check the Recycle Bin and previous versions first." }
     }
     if ($d.Media -eq 'HDD') { return @{ Level = 'Good'; Short = 'Good chance'; Text = "$($d.Drive) is a hard disk. Deleted files stay recoverable until their space is reused, so stop writing to it." } }
-    @{ Level = 'Fair'; Short = 'Unknown'; Text = "AWiper couldn't tell what kind of disk $($d.Drive) is, so recovery may or may not work." }
+    @{ Level = 'Fair'; Short = 'Unknown'; Text = "Computer Doctor couldn't tell what kind of disk $($d.Drive) is, so recovery may or may not work." }
 }
 
 function Get-AWVerdictColors([string]$Level) {
@@ -11200,7 +11333,7 @@ function Update-AWBinList {
     $ui.BinInfo.Text = 'Reading Recycle Bins...'
     Start-AWTask -Name 'Read Recycle Bin' -Work {
         foreach ($r in (Invoke-WTarget { Get-WRecycleItems })) {
-            $e = New-Object AWiper.RecycleEntry
+            $e = New-Object ComputerDoctor.RecycleEntry
             $e.OriginalPath = [string]$r.OriginalPath; $e.IPath = [string]$r.IPath; $e.RPath = [string]$r.RPath
             $e.Name = Split-Path $e.OriginalPath -Leaf; $e.Folder = Split-Path $e.OriginalPath -Parent
             $e.Size = [long]$r.Size; $e.Deleted = [datetime]$r.Deleted; $e.IsDir = [bool]$r.IsDir; $e.Owner = [string]$r.Owner
@@ -11254,7 +11387,7 @@ function Get-AWUniquePath([string]$Path, [string]$Suffix = 'restored') {
     $p
 }
 
-# Snapshots are opened through directory symlinks under %LOCALAPPDATA%\AWiper\Snapshots.
+# Snapshots are opened through directory symlinks under %LOCALAPPDATA%\ComputerDoctor\Snapshots.
 # Only the links are ever removed (non-recursive delete of a reparse point), never their contents.
 function Dismount-AWShadows {
     if (-not (Test-Path -LiteralPath $script:SnapRoot)) { return }
@@ -11332,7 +11465,7 @@ function Start-AWShadowFind {
             if (-not [System.IO.File]::Exists($live)) { $status = 'Deleted' }
             elseif ($Changed -and [System.IO.File]::GetLastWriteTimeUtc($live) -ne $f.LastWriteTimeUtc) { $status = 'Changed' }
             if (-not $status) { continue }
-            $e = New-Object AWiper.FileEntry
+            $e = New-Object ComputerDoctor.FileEntry
             $e.Name = $f.Name; $e.FullPath = $f.FullName; $e.Folder = Split-Path $live -Parent; $e.Size = $f.Length
             $e.Modified = $f.LastWriteTime; $e.Extension = $f.Extension; $e.Status = $status; $e.IsChecked = ($status -eq 'Deleted')
             $e
@@ -11342,7 +11475,7 @@ function Start-AWShadowFind {
         Write-WLog "Snapshot compare: $seen file(s) checked, $found difference(s)"
     } -OnComplete {
         param($Result)
-        $items = @($Result | Where-Object { $_ -is [AWiper.FileEntry] } | Sort-Object Folder, Name)
+        $items = @($Result | Where-Object { $_ -is [ComputerDoctor.FileEntry] } | Sort-Object Folder, Name)
         $ui.ShadowResults.ItemsSource = $items
         $del = @($items | Where-Object { $_.Status -eq 'Deleted' }).Count
         $ui.ShadowInfo.Text = if ($items.Count) { "$del deleted, $($items.Count - $del) changed since the snapshot." } else { 'Nothing is missing - every file in the snapshot still exists here.' }
@@ -11433,8 +11566,8 @@ function Test-AWUndelDest {
     if ($dest -notmatch '^[A-Za-z]:\\' -and $dest -notmatch '^\\\\') { return 'Enter a full path, like E:\Recovered.' }
     $u = $script:Undelete
     if ($u -and -not $u.IsImage) {
-        $sv = [AWiper.Native]::VolumeId("$($u.Source)\")
-        $dv = [AWiper.Native]::VolumeId($dest)
+        $sv = [ComputerDoctor.Native]::VolumeId("$($u.Source)\")
+        $dv = [ComputerDoctor.Native]::VolumeId($dest)
         if ($sv -and $dv -and $sv -eq $dv) { return "That folder is on $($u.Source), the drive being recovered. Writing there can overwrite the very files you want back - pick a folder on a different drive." }
     }
     ''
@@ -11461,7 +11594,7 @@ function Update-AWUndelView {
 function Start-AWUndelScan([string]$Source) {
     if ($script:UndelRunning -or -not $Source) { return }
     if ($script:Undelete) { $script:Undelete.Dispose(); $script:Undelete = $null }
-    $u = New-Object AWiper.NtfsUndelete $Source
+    $u = New-Object ComputerDoctor.NtfsUndelete $Source
     $script:Undelete = $u
     $script:UndelRunning = $true
     $ui.UndelList.ItemsSource = $null; $ui.UndelInfo.Text = ''
@@ -11638,8 +11771,8 @@ function Update-AWDeep {
     if ($dest) {
         if ($dest -notmatch '^[A-Za-z]:\\?' -and $dest -notmatch '^\\\\') { $msg = 'Enter a full path, like E:\Recovered.'; $ok = $false }
         elseif ($src) {
-            $sv = [AWiper.Native]::VolumeId("$($src.Drive)\")
-            $dv = [AWiper.Native]::VolumeId($dest)
+            $sv = [ComputerDoctor.Native]::VolumeId("$($src.Drive)\")
+            $dv = [ComputerDoctor.Native]::VolumeId($dest)
             if ($sv -and $dv -and $sv -eq $dv) { $msg = "That folder is on $($src.Drive), the drive you're scanning. Saving there could overwrite the files you're trying to get back. Pick a folder on a different drive."; $ok = $false }
         }
     } else { $ok = $false }
@@ -11761,7 +11894,7 @@ function Remove-AWRestorePoints {
     if (-not (Confirm-AW "Permanently delete $($sel.Count) restore point(s)?`n`n$names`n`nYou won't be able to roll back to them, and their previous versions of files go too.")) { return }
     $ok = 0
     foreach ($p in $sel) {
-        $rc = [AWiper.Native]::SRRemoveRestorePoint($p.Sequence)
+        $rc = [ComputerDoctor.Native]::SRRemoveRestorePoint($p.Sequence)
         if ($rc -eq 0) { $ok++; Write-AWLog "Deleted restore point #$($p.Sequence) ($($p.Description))" }
         else { Write-AWLog "Could not delete restore point #$($p.Sequence) (error $rc)" 'ERROR' }
     }
@@ -11816,12 +11949,12 @@ function Update-AWBackupDestInfo {
     if ($b.Dest) {
         if (-not (Test-Path -LiteralPath $b.Dest)) { $msg = 'The backup drive is not connected right now.'; $color = $script:Res.Amber }
         else {
-            $vid = [AWiper.Native]::VolumeId($b.Dest)
+            $vid = [ComputerDoctor.Native]::VolumeId($b.Dest)
             $drv = try { New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($b.Dest)) } catch { $null }
             $free = if ($drv -and $drv.IsReady) { "$(Format-AWSize $drv.AvailableFreeSpace) free" + $(if ($drv.VolumeLabel) { " on $($drv.VolumeLabel)" } else { '' }) } else { '' }
             if ($b.DestVolumeId -and $vid -ne $b.DestVolumeId) { $msg = 'A different drive is using this letter now - choose the backup drive again.'; $color = $script:Res.Danger }
-            elseif (@($b.Sources | Where-Object { [AWiper.Native]::VolumeId($_) -eq $vid }).Count) { $msg = "$free. Warning: some folders are on this same drive - a backup there won't survive the drive failing."; $color = $script:Res.Amber }
-            else { $msg = "$free. Backups go to AWiper-Backup\$env:COMPUTERNAME there."; $color = $script:Res.Success }
+            elseif (@($b.Sources | Where-Object { [ComputerDoctor.Native]::VolumeId($_) -eq $vid }).Count) { $msg = "$free. Warning: some folders are on this same drive - a backup there won't survive the drive failing."; $color = $script:Res.Amber }
+            else { $msg = "$free. Backups go to ComputerDoctor-Backup\$env:COMPUTERNAME there."; $color = $script:Res.Success }
         }
     }
     $ui.BkDestInfo.Text = $msg; $ui.BkDestInfo.Foreground = $color
@@ -11835,18 +11968,18 @@ function Save-AWBackupJob([switch]$Quiet) {
     if ($ui.BkDaily.IsChecked -and $time -notmatch '^([01]?\d|2[0-3]):[0-5]\d$') { Show-AWMessage 'Enter the time as HH:mm, e.g. 19:00.'; return $false }
     $b.Keep = $keep; $b.Time = $time; $b.Daily = [bool]$ui.BkDaily.IsChecked
     Save-AWState
-    $task = Get-ScheduledTask -TaskName 'AWiper Backup' -ErrorAction SilentlyContinue
+    $task = Get-ScheduledTask -TaskName 'ComputerDoctor Backup' -ErrorAction SilentlyContinue
     try {
         if ($b.Daily -and @($b.Sources).Count -and $b.Dest) {
             $exe = (Get-Process -Id $PID).Path
             $action = New-ScheduledTaskAction -Execute $exe -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Backup -Yes"
             $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]::ParseExact($time, 'H:mm', $null))
             $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 6)
-            Register-ScheduledTask -TaskName 'AWiper Backup' -Action $action -Trigger $trigger -Settings $settings -Description 'Folder backup set up in AWiper (Recovery > Backup).' -Force | Out-Null
+            Register-ScheduledTask -TaskName 'ComputerDoctor Backup' -Action $action -Trigger $trigger -Settings $settings -Description 'Folder backup set up in Computer Doctor (Recovery > Backup).' -Force | Out-Null
             Write-AWLog "Daily backup scheduled at $time"
             Write-AWAction 'BackupSchedule' @("daily $time") @{} 'Done'
         } elseif ($task) {
-            Unregister-ScheduledTask -TaskName 'AWiper Backup' -Confirm:$false
+            Unregister-ScheduledTask -TaskName 'ComputerDoctor Backup' -Confirm:$false
             Write-AWLog 'Daily backup schedule removed'
             Write-AWAction 'BackupSchedule' @('removed') @{} 'Done'
         }
@@ -11907,13 +12040,15 @@ $ui.BkBrowse.Add_Click({
     $dlg.ShowNewFolderButton = $true
     if ($dlg.ShowDialog() -ne 'OK') { return }
     $script:State.Backup.Dest = $dlg.SelectedPath
-    $script:State.Backup.DestVolumeId = [AWiper.Native]::VolumeId($dlg.SelectedPath)
+    $script:State.Backup.DestVolumeId = [ComputerDoctor.Native]::VolumeId($dlg.SelectedPath)
     Save-AWState; Update-AWBackupUI
 })
 $ui.BkSave.Add_Click({ [void](Save-AWBackupJob) })
 $ui.BkRun.Add_Click({ Start-AWBackupNow })
 $ui.BkOpen.Add_Click({
-    $d = Join-Path ([string]$script:State.Backup.Dest) "AWiper-Backup\$env:COMPUTERNAME"
+    $d = Join-Path ([string]$script:State.Backup.Dest) "ComputerDoctor-Backup\$env:COMPUTERNAME"
+    # A backup made before the rename to Computer Doctor stays in AWiper-Backup until the next backup moves it.
+    if (-not (Test-Path -LiteralPath $d)) { $d = Join-Path ([string]$script:State.Backup.Dest) "AWiper-Backup\$env:COMPUTERNAME" }
     if ($script:State.Backup.Dest -and (Test-Path -LiteralPath $d)) { Open-AWExplorer $d } else { Show-AWMessage 'There is no backup on that drive yet.' }
 })
 
@@ -12067,7 +12202,7 @@ function Show-AWReadiness {
     } else { $lines += 'Run as administrator to read restore points.' }
     if (-not $remote) {
         $bk = $script:State.Backup
-        $lines += if ($bk.LastRun) { 'Last AWiper backup: {0} - {1}' -f ([datetime]$bk.LastRun).ToString('MMM d, yyyy h:mm tt'), $bk.LastResult } else { 'No AWiper folder backup set up - restore points do not include your files.' }
+        $lines += if ($bk.LastRun) { 'Last Computer Doctor backup: {0} - {1}' -f ([datetime]$bk.LastRun).ToString('MMM d, yyyy h:mm tt'), $bk.LastResult } else { 'No Computer Doctor folder backup set up - restore points do not include your files.' }
         if (-not $bk.LastRun -and $rpStatus -eq 'Good') { $rpStatus = 'Info' }
     }
     New-AWReadyRow $rpStatus 'Restore points and backup' $lines @(
@@ -12104,7 +12239,7 @@ function Save-AWBitLockerKey {
         $keys = @($Result | Where-Object { $_ -and $_.Password })
         if (-not $keys.Count) { Show-AWMessage 'Could not read the recovery key - see the Activity log.' 'Error'; return }
         $who = if (Test-AWRemote) { $script:Target.ComputerName } else { $env:COMPUTERNAME }
-        $text = "BitLocker recovery key(s) for $who`r`nSaved by AWiper on $((Get-Date).ToString('f'))`r`n`r`nIf the PC asks for a BitLocker recovery key, match the Key ID it shows with the one below and type the 48-digit recovery key.`r`n"
+        $text = "BitLocker recovery key(s) for $who`r`nSaved by Computer Doctor on $((Get-Date).ToString('f'))`r`n`r`nIf the PC asks for a BitLocker recovery key, match the Key ID it shows with the one below and type the 48-digit recovery key.`r`n"
         foreach ($k in $keys) { $text += "`r`nDrive:         $($k.Mount)`r`nKey ID:        $($k.Id)`r`nRecovery key:  $($k.Password)`r`n" }
         try {
             [IO.File]::WriteAllText($script:PendingKeyFile, $text)
@@ -12140,8 +12275,8 @@ function Backup-AWBitLockerKey([string]$To) {
 
 function Start-AWSecureBootUpdate {
     $sysVol = @($script:Ready.BL.Volumes | Where-Object { $_.Type -eq 'OperatingSystem' -and $_.State -in 'On', 'Encrypting' })
-    $msg = "Start the Secure Boot certificate update now?`n`nWindows adds Microsoft's 2023 certificates to the firmware and switches to the 2023-signed boot manager. It's the same update Windows rolls out on its own; it needs one or two restarts and can't be undone.`n`nIf the PC maker's firmware rejects it, Windows stops and AWiper will show that a BIOS update is needed."
-    if ($sysVol.Count) { $msg += "`n`nBitLocker is on. Make sure the recovery key is saved off this PC first - AWiper will suspend BitLocker for two restarts so the firmware change doesn't trigger a recovery prompt." }
+    $msg = "Start the Secure Boot certificate update now?`n`nWindows adds Microsoft's 2023 certificates to the firmware and switches to the 2023-signed boot manager. It's the same update Windows rolls out on its own; it needs one or two restarts and can't be undone.`n`nIf the PC maker's firmware rejects it, Windows stops and Computer Doctor will show that a BIOS update is needed."
+    if ($sysVol.Count) { $msg += "`n`nBitLocker is on. Make sure the recovery key is saved off this PC first - Computer Doctor will suspend BitLocker for two restarts so the firmware change doesn't trigger a recovery prompt." }
     if (-not (Confirm-AW $msg)) { return }
     if ($sysVol.Count -and -not (Confirm-AW 'Is the BitLocker recovery key saved somewhere other than this PC (Microsoft account, USB stick, paper or your organization)?')) {
         Show-AWMessage 'Save the recovery key first ("Save recovery key..." above), then start the update.'; return
@@ -12165,7 +12300,7 @@ function Restart-AWAdvancedStartup {
     if (-not (Confirm-AW "Restart into Advanced Startup now?`n`nSave your work first. From there you can use Startup Repair, System Restore, Safe Mode, UEFI settings or Reset this PC - or choose Continue to go back to Windows.")) { return }
     Write-AWAction 'RestartToAdvancedStartup' @($env:COMPUTERNAME) @{} 'Started'
     Update-AWLogView
-    try { & shutdown.exe /r /o /t 5 /c 'AWiper: restarting into Advanced Startup' 2>&1 | Out-Null; if ($LASTEXITCODE) { throw "shutdown.exe exit code $LASTEXITCODE" } }
+    try { & shutdown.exe /r /o /t 5 /c 'Computer Doctor: restarting into Advanced Startup' 2>&1 | Out-Null; if ($LASTEXITCODE) { throw "shutdown.exe exit code $LASTEXITCODE" } }
     catch { Show-AWMessage "Could not restart into Advanced Startup: $($_.Exception.Message)" 'Error' }
 }
 $ui.ReadyRefresh.Add_Click({ Update-AWReadiness })
@@ -12318,6 +12453,7 @@ Enable-AWSort $ui.ShadowResults @{ Name = 'Name'; Status = 'Status'; Size = 'Siz
 
 #region ---------------------------------------------------------------- Startup + run
 $window.Add_Loaded({
+    Move-AWOldRegistrations   # saved connections and scheduled tasks from when the app was called AWiper
     try {
         Update-AWDashboard
         Initialize-AWCleaner
@@ -12329,7 +12465,7 @@ $window.Add_Loaded({
         Start-AWNetCheck
     } catch { Write-AWLog "Startup: $($_.Exception.Message)" 'ERROR' }
     $script:Timer.Start()
-    Write-AWLog ("AWiper {0} started - {1} - PowerShell {2}" -f $script:AppVersion, $(if ($script:IsAdmin) { 'administrator' } else { 'standard user' }), $PSVersionTable.PSVersion)
+    Write-AWLog ("Computer Doctor {0} started - {1} - PowerShell {2}" -f $script:AppVersion, $(if ($script:IsAdmin) { 'administrator' } else { 'standard user' }), $PSVersionTable.PSVersion)
     if ($script:ElevationNote) { Write-AWLog $script:ElevationNote 'WARN' }
     $script:IdleStatus = if ($script:IsAdmin) { 'Ready - running as administrator' } else { 'Ready - standard permissions (admin-only items are disabled)' }
     Set-AWStatus $script:IdleStatus
@@ -12355,8 +12491,8 @@ try {
     [void]$window.ShowDialog()
 }
 catch {
-    $msg = "AWiper hit an error and has to close:`n`n$($_.Exception.Message)"
+    $msg = "Computer Doctor hit an error and has to close:`n`n$($_.Exception.Message)"
     try { Add-Content -LiteralPath $script:LogFile -Value ("{0:HH:mm:ss}  FATAL  {1}" -f (Get-Date), $_.Exception.ToString()) } catch { }
-    [void][System.Windows.MessageBox]::Show($msg, 'AWiper', 'OK', 'Error')
+    [void][System.Windows.MessageBox]::Show($msg, 'Computer Doctor', 'OK', 'Error')
 }
 #endregion

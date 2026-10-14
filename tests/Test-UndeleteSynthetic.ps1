@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    Builds a tiny synthetic NTFS volume image and runs AWiper's undelete engine against it.
+    Builds a tiny synthetic NTFS volume image and runs Computer Doctor's undelete engine against it.
     No admin rights needed. Checks detection, path rebuilding, ratings and byte-exact recovery.
 #>
 param(
-    [string]$Path = (Join-Path $PSScriptRoot '..\AWiper.ps1'),
-    [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) 'AWiperUndeleteTest')
+    [string]$Path = (Join-Path $PSScriptRoot '..\ComputerDoctor.ps1'),
+    [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) 'ComputerDoctorUndeleteTest')
 )
 if (-not (Test-Path $Work)) { New-Item -ItemType Directory -Path $Work | Out-Null }
 $ErrorActionPreference = 'Stop'
@@ -80,7 +80,7 @@ $imgPath = Join-Path $Work 'synthetic-ntfs.img'
 [IO.File]::WriteAllBytes($imgPath, $img)
 
 # ---- run the real scanner
-$u = New-Object AWiper.NtfsUndelete $imgPath
+$u = New-Object ComputerDoctor.NtfsUndelete $imgPath
 $u.Open(); $u.Scan()
 "Error: [$($u.Error)]  Completed: $($u.Completed)  Records: $($u.RecordsScanned)/$($u.RecordsTotal)  Deleted: $($u.DeletedFound)  Cluster: $($u.BytesPerCluster)"
 $m = 0; $all = $u.Filter('', 0, 100, [ref]$m)
